@@ -1,0 +1,218 @@
+<Window x:Class="RestoreDB.App.Views.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="RestoreDB — Diagnóstico e Reparo (Módulo de Faturamento)"
+        Height="720" Width="1120" MinHeight="560" MinWidth="900"
+        WindowStartupLocation="CenterScreen"
+        Background="{StaticResource WindowBackBrush}">
+
+    <Grid Margin="14">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" MinHeight="220" />
+            <RowDefinition Height="6" />
+            <RowDefinition Height="230" MinHeight="120" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <!-- ===== Barra superior ===== -->
+        <Border Grid.Row="0" Background="{StaticResource CardBrush}" BorderBrush="{StaticResource LineBrush}"
+                BorderThickness="1" CornerRadius="6" Padding="14,10" Margin="0,0,0,12">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0">
+                    <TextBlock Text="Bancos de dados do servidor" Style="{StaticResource HeaderText}" FontSize="17" />
+                    <TextBlock x:Name="ServerInfoText" Foreground="{StaticResource MutedTextBrush}" FontSize="12" Margin="0,2,0,0" />
+                </StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Button x:Name="RefreshButton" Content="Atualizar lista" Style="{StaticResource SecondaryButton}"
+                            Click="RefreshButton_Click" Margin="0,0,8,0" />
+                    <Button x:Name="ReconnectButton" Content="Trocar conexão" Style="{StaticResource SecondaryButton}"
+                            Click="ReconnectButton_Click" />
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- ===== Conteúdo: lista + painel de reparo ===== -->
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="390" />
+            </Grid.ColumnDefinitions>
+
+            <!-- Lista de bancos -->
+            <Border Grid.Column="0" Background="{StaticResource CardBrush}" BorderBrush="{StaticResource LineBrush}"
+                    BorderThickness="1" CornerRadius="6" Margin="0,0,12,0">
+                <DataGrid x:Name="DatabasesGrid" AutoGenerateColumns="False" IsReadOnly="True"
+                          HeadersVisibility="Column" GridLinesVisibility="Horizontal" BorderThickness="0"
+                          Background="Transparent" RowBackground="Transparent" AlternatingRowBackground="#F8FAFB"
+                          SelectionMode="Single" SelectionUnit="FullRow" CanUserAddRows="False"
+                          SelectionChanged="DatabasesGrid_SelectionChanged"
+                          HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
+                    <DataGrid.RowStyle>
+                        <Style TargetType="DataGridRow">
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding IsProblematic}" Value="True">
+                                    <Setter Property="Background" Value="#FCEAEA" />
+                                    <Setter Property="Foreground" Value="#9A1414" />
+                                    <Setter Property="FontWeight" Value="SemiBold" />
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </DataGrid.RowStyle>
+                    <DataGrid.Columns>
+                        <DataGridTextColumn Header="Banco" Binding="{Binding Name}" Width="220" />
+                        <DataGridTextColumn Header="Estado" Binding="{Binding StateDesc}" Width="160" />
+                        <DataGridTextColumn Header="Situação" Binding="{Binding StateFriendly}" Width="*" />
+                    </DataGrid.Columns>
+                </DataGrid>
+            </Border>
+
+            <!-- Painel de reparo -->
+            <Border Grid.Column="1" Background="{StaticResource CardBrush}" BorderBrush="{StaticResource LineBrush}"
+                    BorderThickness="1" CornerRadius="6" Padding="18">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel>
+                        <TextBlock Text="Detalhes e reparo" Style="{StaticResource HeaderText}" FontSize="16" Margin="0,0,0,12" />
+
+                        <!-- Sem seleção -->
+                        <TextBlock x:Name="NoSelectionText"
+                                   Text="Selecione um banco na lista para ver os detalhes."
+                                   Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap" />
+
+                        <!-- Detalhes -->
+                        <StackPanel x:Name="DetailsPanel" Visibility="Collapsed">
+                            <TextBlock x:Name="DbNameText" FontSize="18" FontWeight="Bold"
+                                       Foreground="{StaticResource PrimaryDarkBrush}" TextWrapping="Wrap" />
+
+                            <TextBlock Text="ESTADO ATUAL" Style="{StaticResource FieldLabel}" Margin="0,14,0,4" />
+                            <Border x:Name="StateBadge" CornerRadius="4" Padding="8,4" HorizontalAlignment="Left" Background="#E7F3EA">
+                                <TextBlock x:Name="StateText" FontWeight="SemiBold" Foreground="#1B7A2F" />
+                            </Border>
+                            <TextBlock x:Name="StateFriendlyText" Foreground="{StaticResource MutedTextBrush}"
+                                       TextWrapping="Wrap" Margin="0,6,0,0" />
+
+                            <TextBlock Text="AÇÃO RECOMENDADA" Style="{StaticResource FieldLabel}" Margin="0,14,0,4" />
+                            <TextBlock x:Name="RecommendedActionText" TextWrapping="Wrap" />
+
+                            <!-- Banco saudável -->
+                            <Border x:Name="HealthyPanel" Visibility="Collapsed" Margin="0,16,0,0"
+                                    Background="#E7F3EA" BorderBrush="#1B7A2F" BorderThickness="1" CornerRadius="6" Padding="12">
+                                <TextBlock Text="Este banco está saudável (ONLINE). Nenhum reparo é necessário."
+                                           Foreground="#1B7A2F" TextWrapping="Wrap" />
+                            </Border>
+
+                            <!-- Banco de sistema -->
+                            <Border x:Name="SystemDbPanel" Visibility="Collapsed" Margin="0,16,0,0"
+                                    Background="#FFF6E5" BorderBrush="#B56A00" BorderThickness="1" CornerRadius="6" Padding="12">
+                                <TextBlock Text="Banco de sistema: o reparo automático destrutivo não é permitido por esta ferramenta. Acione o DBA/suporte."
+                                           Foreground="#8A5200" TextWrapping="Wrap" />
+                            </Border>
+
+                            <!-- Reparo seguro -->
+                            <StackPanel x:Name="SafeRepairPanel" Visibility="Collapsed" Margin="0,18,0,0">
+                                <Button x:Name="SafeRepairButton" Content="Reparar (modo seguro, sem perda de dados)"
+                                        Style="{StaticResource FlatButton}" Height="44" Click="SafeRepairButton_Click" />
+                                <TextBlock Text="Tentaremos primeiro a abordagem mais segura: religar / recuperar e, se necessário, DBCC CHECKDB com REPAIR_REBUILD."
+                                           Foreground="{StaticResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,8,0,0" />
+                            </StackPanel>
+
+                            <!-- Reparo com perda de dados (confirmação) -->
+                            <Border x:Name="DataLossPanel" Visibility="Collapsed" Margin="0,18,0,0"
+                                    Background="#FCEAEA" BorderBrush="{StaticResource DangerBrush}" BorderThickness="1"
+                                    CornerRadius="6" Padding="14">
+                                <StackPanel>
+                                    <TextBlock Text="⚠ ATENÇÃO: REPARO COM POSSÍVEL PERDA DE DADOS"
+                                               FontWeight="Bold" Foreground="{StaticResource DangerDarkBrush}" TextWrapping="Wrap" />
+                                    <TextBlock Margin="0,8,0,0" Foreground="{StaticResource DangerDarkBrush}" TextWrapping="Wrap"
+                                               Text="O reparo seguro não foi suficiente. A próxima etapa usa DBCC CHECKDB com REPAIR_ALLOW_DATA_LOSS, que pode DESCARTAR dados corrompidos para tornar o banco consistente. Tentaremos um backup de segurança antes, mas ele pode não ser possível." />
+                                    <CheckBox x:Name="DataLossConfirmCheck" Margin="0,12,0,0" Foreground="{StaticResource DangerDarkBrush}"
+                                              Content="Estou ciente e autorizo o reparo com possível perda de dados."
+                                              Checked="DataLossConfirmCheck_Changed" Unchecked="DataLossConfirmCheck_Changed" />
+                                    <Button x:Name="DataLossRepairButton" Content="Executar reparo COM perda de dados"
+                                            Style="{StaticResource DangerButton}" Height="42" Margin="0,12,0,0"
+                                            IsEnabled="False" Click="DataLossRepairButton_Click" />
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Resultado -->
+                            <Border x:Name="ResultPanel" Visibility="Collapsed" Margin="0,18,0,0"
+                                    BorderThickness="1" CornerRadius="6" Padding="12">
+                                <TextBlock x:Name="ResultText" TextWrapping="Wrap" />
+                            </Border>
+                        </StackPanel>
+
+                        <ProgressBar x:Name="RepairBusyBar" IsIndeterminate="True" Height="5" Margin="0,16,0,0"
+                                     Visibility="Collapsed" Foreground="{StaticResource PrimaryBrush}" />
+                    </StackPanel>
+                </ScrollViewer>
+            </Border>
+        </Grid>
+
+        <!-- ===== Splitter ===== -->
+        <GridSplitter Grid.Row="2" Height="6" HorizontalAlignment="Stretch" VerticalAlignment="Center"
+                      Background="Transparent" ResizeBehavior="PreviousAndNext" />
+
+        <!-- ===== Log ===== -->
+        <Border Grid.Row="3" Background="{StaticResource CardBrush}" BorderBrush="{StaticResource LineBrush}"
+                BorderThickness="1" CornerRadius="6">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+                <Border Grid.Row="0" Background="#EEF3F7" CornerRadius="6,6,0,0" Padding="12,8">
+                    <Grid>
+                        <TextBlock Text="Registro de operações" FontWeight="SemiBold"
+                                   Foreground="{StaticResource PrimaryDarkBrush}" VerticalAlignment="Center" />
+                        <Button x:Name="ClearLogButton" Content="Limpar" HorizontalAlignment="Right"
+                                Style="{StaticResource SecondaryButton}" Padding="10,3" FontSize="12"
+                                Click="ClearLogButton_Click" />
+                    </Grid>
+                </Border>
+                <ListBox x:Name="LogList" Grid.Row="1" BorderThickness="0" Background="Transparent"
+                         ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                         ScrollViewer.VerticalScrollBarVisibility="Auto"
+                         VirtualizingStackPanel.IsVirtualizing="True">
+                    <ListBox.ItemContainerStyle>
+                        <Style TargetType="ListBoxItem">
+                            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                            <Setter Property="Padding" Value="2,1" />
+                        </Style>
+                    </ListBox.ItemContainerStyle>
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="{Binding TimestampText}" FontFamily="Consolas"
+                                           FontSize="12" Foreground="{StaticResource MutedTextBrush}" Margin="0,0,10,0" />
+                                <TextBlock Grid.Column="1" Text="{Binding Message}" FontFamily="Consolas" FontSize="12"
+                                           TextWrapping="Wrap" Foreground="{Binding Level, Converter={StaticResource LevelToBrush}}" />
+                            </Grid>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+            </Grid>
+        </Border>
+
+        <!-- ===== Status bar ===== -->
+        <Border Grid.Row="4" Margin="0,10,0,0">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBlock x:Name="StatusText" Grid.Column="0" Foreground="{StaticResource MutedTextBrush}"
+                           FontSize="12" VerticalAlignment="Center" Text="Pronto." />
+                <TextBlock x:Name="LogPathText" Grid.Column="1" Foreground="{StaticResource MutedTextBrush}"
+                           FontSize="11" VerticalAlignment="Center" />
+            </Grid>
+        </Border>
+    </Grid>
+</Window>

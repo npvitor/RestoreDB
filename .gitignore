@@ -1,0 +1,13 @@
+## .NET / Visual Studio
+bin/
+obj/
+.vs/
+*.user
+*.suo
+
+## Build / publish
+[Pp]ublish/
+artifacts/
+
+## Logs locais
+*.log

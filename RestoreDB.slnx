@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/RestoreDB.App/RestoreDB.App.csproj" />
+    <Project Path="src/RestoreDB.DataAccess/RestoreDB.DataAccess.csproj" />
+    <Project Path="src/RestoreDB.Domain/RestoreDB.Domain.csproj" />
+    <Project Path="src/RestoreDB.Services/RestoreDB.Services.csproj" />
+  </Folder>
+</Solution>
