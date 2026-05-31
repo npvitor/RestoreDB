@@ -86,6 +86,27 @@ dotnet run --project src/RestoreDB.App
 > `REPAIR_REBUILD` (sem perda de dados) passa a ser permitido. O
 > `REPAIR_ALLOW_DATA_LOSS`, ao contrário, **é** permitido em `EMERGENCY`.
 
+### Último recurso: reconstruir o log de transações (recriar o `.ldf`)
+
+Quando o reparo é **impossível** (resultado *Failed*), a ferramenta oferece — para
+bancos de usuário, com **confirmação explícita** — a reconstrução do log:
+
+1. `SET EMERGENCY` → `sp_detach_db` (desanexa e libera os arquivos);
+2. **remove** o arquivo de log antigo (renomeia para `*.corrupt_AAAAMMDDHHMMSS`);
+3. `CREATE DATABASE [x] ON (FILENAME='...mdf') FOR ATTACH_REBUILD_LOG` (cria um log novo);
+4. `SET MULTI_USER` + `DBCC CHECKDB` (verificação).
+
+> **Validado em engine real:** `sp_detach_db` funciona com o banco em `EMERGENCY`,
+> e `ATTACH_REBUILD_LOG` **só recria o log se o `.ldf` não existir fisicamente** —
+> daí a remoção do arquivo ser obrigatória. **Pode haver perda de dados.**
+>
+> Requisitos: os arquivos do banco precisam estar **acessíveis a partir da máquina
+> que roda a ferramenta** (servidor local) e a aplicação precisa de permissão na
+> pasta de dados. Se o servidor for remoto/sem acesso, a operação é **abortada com
+> segurança** (sem desanexar) e o log mostra o comando manual a executar no host.
+> Em caso de falha após o detach, a ferramenta tenta **reverter** (reanexar o log
+> original).
+
 Detalhes importantes:
 
 - Toda a sequência roda na **mesma conexão** (`SqlSession`), garantindo que o

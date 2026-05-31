@@ -86,6 +86,29 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         return value as string ?? "DESCONHECIDO";
     }
 
+    /// <summary>Lê os arquivos físicos de um banco (sys.master_files). Compatível com 2008 R2.</summary>
+    public async Task<List<DatabaseFile>> GetDatabaseFilesAsync(string databaseName, CancellationToken ct = default)
+    {
+        const string sql =
+            "SELECT CAST(mf.type AS int) AS [type], mf.type_desc, mf.physical_name " +
+            "FROM sys.master_files AS mf WHERE mf.database_id = DB_ID(@db) ORDER BY mf.type, mf.file_id;";
+
+        var list = new List<DatabaseFile>();
+        await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+        cmd.Parameters.AddWithValue("@db", databaseName);
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            list.Add(new DatabaseFile
+            {
+                Type = reader.GetInt32(0),
+                TypeDesc = reader.IsDBNull(1) ? string.Empty : reader.GetString(1),
+                PhysicalName = reader.IsDBNull(2) ? string.Empty : reader.GetString(2)
+            });
+        }
+        return list;
+    }
+
     private static string FormatMessage(SqlError err)
     {
         // Severidade (Class) 0-10 e número 0 => mensagem puramente informativa (PRINT / DBCC).

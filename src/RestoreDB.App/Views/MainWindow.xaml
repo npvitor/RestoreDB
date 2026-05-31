@@ -143,6 +143,26 @@
                                     BorderThickness="1" CornerRadius="6" Padding="12">
                                 <TextBlock x:Name="ResultText" TextWrapping="Wrap" />
                             </Border>
+
+                            <!-- Último recurso: reconstruir o log de transações -->
+                            <Border x:Name="LogRebuildPanel" Visibility="Collapsed" Margin="0,18,0,0"
+                                    Background="#F7DCDC" BorderBrush="{StaticResource DangerDarkBrush}" BorderThickness="2"
+                                    CornerRadius="6" Padding="14">
+                                <StackPanel>
+                                    <TextBlock Text="⛔ ÚLTIMO RECURSO: RECONSTRUIR O LOG DE TRANSAÇÕES"
+                                               FontWeight="Bold" Foreground="{StaticResource DangerDarkBrush}" TextWrapping="Wrap" />
+                                    <TextBlock Margin="0,8,0,0" Foreground="{StaticResource DangerDarkBrush}" TextWrapping="Wrap"
+                                               Text="Indicado quando o problema está no LOG de transações (ex.: RECOVERY_PENDING ou SUSPECT por log corrompido/ausente) e o reparo não resolveu. Esta operação desanexa o banco, REMOVE o arquivo de log (.ldf) e o recria (FOR ATTACH_REBUILD_LOG) para forçar o retorno a ONLINE. Pode haver PERDA DE DADOS e inconsistências lógicas." />
+                                    <TextBlock Margin="0,6,0,0" Foreground="{StaticResource DangerDarkBrush}" TextWrapping="Wrap" FontSize="11"
+                                               Text="Requer que os arquivos do banco estejam acessíveis nesta máquina (servidor local) e que a aplicação tenha permissão na pasta de dados. O log antigo é preservado com a extensão .corrupt_AAAAMMDDHHMMSS." />
+                                    <CheckBox x:Name="LogRebuildConfirmCheck" Margin="0,12,0,0" Foreground="{StaticResource DangerDarkBrush}"
+                                              Content="Entendo os riscos e autorizo reconstruir o log."
+                                              Checked="LogRebuildConfirmCheck_Changed" Unchecked="LogRebuildConfirmCheck_Changed" />
+                                    <Button x:Name="LogRebuildButton" Content="Reconstruir log (recriar .ldf)"
+                                            Style="{StaticResource DangerButton}" Height="42" Margin="0,12,0,0"
+                                            IsEnabled="False" Click="LogRebuildButton_Click" />
+                                </StackPanel>
+                            </Border>
                         </StackPanel>
 
                         <ProgressBar x:Name="RepairBusyBar" IsIndeterminate="True" Height="5" Margin="0,16,0,0"

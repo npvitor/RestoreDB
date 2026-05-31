@@ -1,3 +1,4 @@
+using System.IO;
 using RestoreDB.DataAccess;
 using RestoreDB.Domain.Constants;
 using RestoreDB.Domain.Models;
@@ -68,7 +69,18 @@ public sealed class RepairService
             status = RepairStatus.Failed;
         }
 
-        var finalState = await session.GetDatabaseStateAsync(db.Name, ct);
+        string finalState;
+        try
+        {
+            finalState = await session.GetDatabaseStateAsync(db.Name, ct);
+        }
+        catch (Exception ex)
+        {
+            // Nunca deixar uma falha na leitura do estado final escapar do método.
+            Report(progress, db.Name, RepairLogLevel.Warning, "Não foi possível reler o estado final: " + ex.Message);
+            finalState = db.StateDesc;
+        }
+
         result.Status = status;
         result.FinalStateDesc = finalState;
         db.StateDesc = finalState; // a grade da UI reflete via INotifyPropertyChanged
@@ -207,6 +219,8 @@ public sealed class RepairService
         {
             Report(p, db.Name, RepairLogLevel.Warning,
                 "O reparo SEM perda de dados não foi suficiente. É necessária a CONFIRMAÇÃO do usuário para o reparo COM possível perda de dados.");
+            Report(p, db.Name, RepairLogLevel.Info,
+                "Dica: se o problema for o LOG de transações (corrompido/ausente), considere a opção 'Reconstruir log (último recurso)'.");
             await TrySetMultiUserAsync(s, db, p, ct);
             return RepairStatus.NeedsDataLossConfirmation;
         }
@@ -236,6 +250,228 @@ public sealed class RepairService
 
         await TrySetMultiUserAsync(s, db, p, ct);
         return verifyFinal.Success ? RepairStatus.Success : RepairStatus.Failed;
+    }
+
+    // ----------------------------------------------------------------------------------
+    // ÚLTIMO RECURSO: reconstrução do log de transações (recriar o .ldf)
+    // ----------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Operação de ÚLTIMO RECURSO para um banco irreparável por causa do log de transações.
+    /// Reconstrói o .ldf: coloca em EMERGENCY, desanexa (detach), remove o arquivo de log
+    /// antigo e reanexa com CREATE DATABASE ... FOR ATTACH_REBUILD_LOG (cria um log novo),
+    /// trazendo o banco de volta a ONLINE. Compatível com SQL Server 2008 R2.
+    ///
+    /// IMPORTANTE: pode haver PERDA DE DADOS (transações não confirmadas são descartadas) e
+    /// o banco pode ficar logicamente inconsistente — por isso roda um DBCC CHECKDB ao final.
+    /// Os arquivos precisam estar acessíveis a partir desta máquina (servidor local). Se o
+    /// SQL Server for remoto, a operação é abortada com orientação, sem desanexar o banco.
+    /// </summary>
+    public async Task<RepairResult> RebuildTransactionLogAsync(
+        DatabaseInfo db,
+        string connectionString,
+        IProgress<RepairLogEntry> progress,
+        CancellationToken ct = default)
+    {
+        var result = new RepairResult();
+        Report(progress, db.Name, RepairLogLevel.Warning,
+            $"════════ ÚLTIMO RECURSO: reconstrução do log de [{db.Name}] ════════");
+
+        if (AppConstants.IsSystemDatabase(db.Name))
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = "Banco de sistema: a reconstrução de log não é permitida por esta ferramenta.";
+            Report(progress, db.Name, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+
+        await using var session = await _data.OpenSessionAsync(connectionString, ct);
+
+        // 1. Coletar os arquivos físicos do banco
+        var files = await session.GetDatabaseFilesAsync(db.Name, ct);
+        var dataFiles = files.Where(f => f.IsData).ToList();
+        var logFiles = files.Where(f => f.IsLog).ToList();
+
+        foreach (var f in files)
+            Report(progress, db.Name, RepairLogLevel.Info, $"Arquivo {f.TypeDesc}: {f.PhysicalName}");
+
+        if (dataFiles.Count == 0 || logFiles.Count == 0)
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = "Não foi possível obter a lista de arquivos do banco.";
+            Report(progress, db.Name, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+
+        // 2. Pré-checagem: os arquivos de dados precisam estar acessíveis DESTA máquina.
+        if (dataFiles.Any(f => !File.Exists(f.PhysicalName)))
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message =
+                "Os arquivos do banco não estão acessíveis a partir desta máquina (o SQL Server pode ser remoto). " +
+                "Execute a ferramenta diretamente no servidor, com permissão sobre a pasta de dados.";
+            Report(progress, db.Name, RepairLogLevel.Error, result.Message);
+            LogManualInstructions(progress, db, dataFiles, logFiles);
+            return result;
+        }
+
+        // 3. EMERGENCY (permite desanexar mesmo um banco SUSPECT)
+        await RunStepAsync(session, db, progress, "Colocando o banco em modo EMERGENCY", AlterDatabase(db.Name, "SET EMERGENCY"), ct);
+
+        // 4. Detach (libera os arquivos no sistema operacional)
+        var detach = await RunStepAsync(session, db, progress, "Desanexando o banco (detach)", DetachDb(db.Name), ct);
+        if (!detach.Success)
+        {
+            Report(progress, db.Name, RepairLogLevel.Error, "Não foi possível desanexar o banco. Operação abortada.");
+            await TrySetMultiUserAsync(session, db, progress, ct);
+            db.StateDesc = await session.GetDatabaseStateAsync(db.Name, ct);
+            result.Status = RepairStatus.Failed;
+            result.Message = "Não foi possível desanexar o banco para reconstruir o log.";
+            return result;
+        }
+
+        // 5. Remover (renomear) os arquivos de log antigos — necessário para que o log seja recriado
+        var renamed = new List<(string original, string backup)>();
+        var renameFailed = false;
+        foreach (var lf in logFiles)
+        {
+            try
+            {
+                if (File.Exists(lf.PhysicalName))
+                {
+                    var backup = lf.PhysicalName + ".corrupt_" + DateTime.Now.ToString("yyyyMMddHHmmss");
+                    File.Move(lf.PhysicalName, backup);
+                    renamed.Add((lf.PhysicalName, backup));
+                    Report(progress, db.Name, RepairLogLevel.Success, $"Log antigo movido para: {backup}");
+                }
+                else
+                {
+                    Report(progress, db.Name, RepairLogLevel.Info, $"Log já ausente (será recriado): {lf.PhysicalName}");
+                }
+            }
+            catch (Exception ex)
+            {
+                renameFailed = true;
+                Report(progress, db.Name, RepairLogLevel.Error, $"Não foi possível remover o log '{lf.PhysicalName}': {ex.Message}");
+                break;
+            }
+        }
+
+        if (renameFailed)
+        {
+            RestoreRenamed(renamed, progress, db);
+            await TryReattachAsync(session, db, files, progress, ct, "Restaurando o banco (reanexar)");
+            db.StateDesc = await session.GetDatabaseStateAsync(db.Name, ct);
+            result.Status = RepairStatus.Failed;
+            result.Message = "Não foi possível remover o arquivo de log. A operação foi abortada e o banco restaurado.";
+            LogManualInstructions(progress, db, dataFiles, logFiles);
+            return result;
+        }
+
+        // 6. Reanexar reconstruindo o log
+        var attach = await RunStepAsync(session, db, progress,
+            "Reanexando e reconstruindo o log (FOR ATTACH_REBUILD_LOG)",
+            BuildAttach(db.Name, dataFiles, rebuildLog: true), ct);
+
+        if (!attach.Success)
+        {
+            Report(progress, db.Name, RepairLogLevel.Warning, "Falha ao reconstruir o log. Tentando restaurar o estado anterior...");
+            RestoreRenamed(renamed, progress, db);
+            await TryReattachAsync(session, db, files, progress, ct, "Restaurando o banco (reanexar com o log original)");
+            db.StateDesc = await session.GetDatabaseStateAsync(db.Name, ct);
+            result.Status = RepairStatus.Failed;
+            result.Message = "Não foi possível reconstruir o log de transações.";
+            LogManualInstructions(progress, db, dataFiles, logFiles);
+            return result;
+        }
+
+        // 7. Normalizar acesso e verificar consistência
+        await TrySetMultiUserAsync(session, db, progress, ct);
+        var finalState = await session.GetDatabaseStateAsync(db.Name, ct);
+        db.StateDesc = finalState;
+
+        var check = await RunStepAsync(session, db, progress,
+            "Verificação de consistência (DBCC CHECKDB)", Dbcc(db.Name, repairOption: null, noInfoMsgs: true), ct);
+
+        if (finalState.Equals("ONLINE", StringComparison.OrdinalIgnoreCase))
+        {
+            result.Status = RepairStatus.Success;
+            result.FinalStateDesc = finalState;
+            result.Message = check.Success
+                ? "Log de transações reconstruído com sucesso. Banco ONLINE e consistente."
+                : "Log reconstruído e banco ONLINE, mas o DBCC CHECKDB ainda acusa inconsistências. Considere o reparo COM perda de dados.";
+            Report(progress, db.Name, check.Success ? RepairLogLevel.Success : RepairLogLevel.Warning, result.Message);
+        }
+        else
+        {
+            result.Status = RepairStatus.Failed;
+            result.FinalStateDesc = finalState;
+            result.Message = $"Após a reconstrução do log, o banco está {finalState}.";
+            Report(progress, db.Name, RepairLogLevel.Error, result.Message);
+        }
+
+        Report(progress, db.Name, RepairLogLevel.Info, $"════════ Fim da reconstrução de log de [{db.Name}] ════════");
+        return result;
+    }
+
+    private async Task TryReattachAsync(SqlSession s, DatabaseInfo db, List<DatabaseFile> allFiles,
+        IProgress<RepairLogEntry> p, CancellationToken ct, string description)
+    {
+        if (await s.GetDatabaseStateAsync(db.Name, ct) is not "DESCONHECIDO")
+            return; // ainda anexado
+
+        var r = await RunStepAsync(s, db, p, description, BuildAttach(db.Name, allFiles, rebuildLog: false), ct);
+        if (!r.Success)
+            Report(p, db.Name, RepairLogLevel.Error, "Não foi possível reanexar o banco automaticamente. Veja as instruções manuais no log.");
+    }
+
+    private void RestoreRenamed(List<(string original, string backup)> renamed, IProgress<RepairLogEntry> p, DatabaseInfo db)
+    {
+        foreach (var (original, backup) in renamed)
+        {
+            try
+            {
+                if (File.Exists(backup) && !File.Exists(original))
+                {
+                    File.Move(backup, original);
+                    Report(p, db.Name, RepairLogLevel.Info, $"Arquivo de log restaurado: {original}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Report(p, db.Name, RepairLogLevel.Warning, $"Não foi possível restaurar '{original}': {ex.Message}");
+            }
+        }
+    }
+
+    private void LogManualInstructions(IProgress<RepairLogEntry> p, DatabaseInfo db,
+        List<DatabaseFile> dataFiles, List<DatabaseFile> logFiles)
+    {
+        var dataClause = string.Join(",\n    ", dataFiles.Select(f => $"(FILENAME = N'{f.PhysicalName}')"));
+        Report(p, db.Name, RepairLogLevel.Info,
+            "Recuperação manual (no servidor): após apagar/renomear o(s) arquivo(s) de log " +
+            string.Join("; ", logFiles.Select(f => f.PhysicalName)) + " execute:");
+        Report(p, db.Name, RepairLogLevel.Info,
+            $"CREATE DATABASE [{db.Name}] ON\n    {dataClause}\n FOR ATTACH_REBUILD_LOG;");
+    }
+
+    private static (string sql, Dictionary<string, object?> prm) DetachDb(string dbName)
+    {
+        // sp_detach_db recebe o nome por parâmetro (seguro). @skipchecks evita falhas em bancos problemáticos.
+        const string sql = "EXEC master.dbo.sp_detach_db @dbname = @db, @skipchecks = N'true';";
+        return (sql, new Dictionary<string, object?> { ["@db"] = dbName });
+    }
+
+    private static (string sql, Dictionary<string, object?> prm) BuildAttach(string dbName, IEnumerable<DatabaseFile> filesToList, bool rebuildLog)
+    {
+        // Caminhos vêm de sys.master_files (metadados confiáveis do servidor); ainda assim escapamos aspas.
+        var clause = string.Join(", ", filesToList.Select(f => $"(FILENAME = N'{f.PhysicalName.Replace("'", "''")}')"));
+        var forClause = rebuildLog ? "FOR ATTACH_REBUILD_LOG" : "FOR ATTACH";
+        var sql =
+            "DECLARE @cmd nvarchar(max);\n" +
+            "SET @cmd = N'CREATE DATABASE ' + QUOTENAME(@db) + N' ON ' + @files + N' " + forClause + ";';\n" +
+            "EXEC sys.sp_executesql @cmd;";
+        return (sql, new Dictionary<string, object?> { ["@db"] = dbName, ["@files"] = clause });
     }
 
     // ----------------------------------------------------------------------------------

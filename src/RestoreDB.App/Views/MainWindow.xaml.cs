@@ -125,6 +125,9 @@ public partial class MainWindow : Window
             DataLossPanel.Visibility = Visibility.Collapsed;
             DataLossConfirmCheck.IsChecked = false;
             DataLossRepairButton.IsEnabled = false;
+            LogRebuildPanel.Visibility = Visibility.Collapsed;
+            LogRebuildConfirmCheck.IsChecked = false;
+            LogRebuildButton.IsEnabled = false;
 
             HealthyPanel.Visibility = db.IsHealthy ? Visibility.Visible : Visibility.Collapsed;
             SystemDbPanel.Visibility = db is { IsProblematic: true, IsSystemDatabase: true }
@@ -191,13 +194,32 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             StatusText.Text = "Falha no reparo.";
-            ShowError("Ocorreu uma falha durante o reparo.", ex);
+            // Mesmo em falha inesperada, oferecer o último recurso (reconstruir o log) p/ bancos de usuário.
+            ResultPanel.Visibility = Visibility.Visible;
+            ResultPanel.Background = ProblemBack;
+            ResultPanel.BorderBrush = ProblemFore;
+            ResultText.Foreground = ProblemFore;
+            ResultText.Text = "Ocorreu uma falha durante o reparo: " + ex.Message;
+            ShowLogRebuildOption(db);
         }
         finally
         {
             SetBusy(false);
             RefreshStateLabels(db);
         }
+    }
+
+    /// <summary>Exibe a opção de último recurso (reconstruir o log), exceto em bancos de sistema.</summary>
+    private void ShowLogRebuildOption(DatabaseInfo db)
+    {
+        if (db.IsSystemDatabase)
+        {
+            LogRebuildPanel.Visibility = Visibility.Collapsed;
+            return;
+        }
+        LogRebuildPanel.Visibility = Visibility.Visible;
+        LogRebuildConfirmCheck.IsChecked = false;
+        LogRebuildButton.IsEnabled = false;
     }
 
     private void HandleRepairResult(DatabaseInfo db, RepairResult result)
@@ -214,6 +236,7 @@ public partial class MainWindow : Window
                 ResultText.Foreground = HealthyFore;
                 SafeRepairPanel.Visibility = Visibility.Collapsed;
                 DataLossPanel.Visibility = Visibility.Collapsed;
+                LogRebuildPanel.Visibility = Visibility.Collapsed;
                 HealthyPanel.Visibility = db.IsHealthy ? Visibility.Visible : Visibility.Collapsed;
                 break;
 
@@ -225,13 +248,71 @@ public partial class MainWindow : Window
                 DataLossPanel.Visibility = Visibility.Visible;
                 DataLossConfirmCheck.IsChecked = false;
                 DataLossRepairButton.IsEnabled = false;
+                // E também oferece o último recurso (reconstruir o log) como alternativa —
+                // útil quando o problema é o próprio log de transações (ex.: RECOVERY_PENDING).
+                ShowLogRebuildOption(db);
                 break;
 
             default: // Failed
                 ResultPanel.Background = ProblemBack;
                 ResultPanel.BorderBrush = ProblemFore;
                 ResultText.Foreground = ProblemFore;
+                // Irreparável: oferecer o último recurso (reconstruir o log).
+                ShowLogRebuildOption(db);
                 break;
+        }
+    }
+
+    // ------------------------------------------------------------------ Último recurso: reconstruir log
+
+    private void LogRebuildConfirmCheck_Changed(object sender, RoutedEventArgs e)
+        => LogRebuildButton.IsEnabled = LogRebuildConfirmCheck.IsChecked == true && !_busy;
+
+    private void LogRebuildButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+
+        var confirm = MessageBox.Show(
+            $"ÚLTIMO RECURSO para o banco \"{db.Name}\".\n\n" +
+            "O banco será desanexado, o arquivo de log (.ldf) será removido e um novo log será criado " +
+            "para forçar o retorno a ONLINE.\n\n" +
+            "Pode haver PERDA DE DADOS e inconsistências. Continuar?",
+            "Confirmar reconstrução do log",
+            MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+
+        if (confirm == MessageBoxResult.Yes)
+            _ = RunRebuildLogAsync(db);
+    }
+
+    private async Task RunRebuildLogAsync(DatabaseInfo db)
+    {
+        if (_busy) return;
+
+        SetBusy(true);
+        ResultPanel.Visibility = Visibility.Collapsed;
+        StatusText.Text = $"Reconstruindo o log de \"{db.Name}\"...";
+
+        try
+        {
+            var result = await _repairService.RebuildTransactionLogAsync(db, _connectionString, _progress);
+            HandleRepairResult(db, result);
+            if (result.Status == RepairStatus.Success)
+                LogRebuildPanel.Visibility = Visibility.Collapsed;
+            StatusText.Text = result.Message;
+        }
+        catch (OperationCanceledException)
+        {
+            StatusText.Text = "Operação cancelada.";
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = "Falha na reconstrução do log.";
+            ShowError("Ocorreu uma falha durante a reconstrução do log.", ex);
+        }
+        finally
+        {
+            SetBusy(false);
+            RefreshStateLabels(db);
         }
     }
 
@@ -257,6 +338,7 @@ public partial class MainWindow : Window
         var db = DatabasesGrid.SelectedItem as DatabaseInfo;
         SafeRepairButton.IsEnabled = !busy && db is { IsProblematic: true };
         DataLossRepairButton.IsEnabled = !busy && DataLossConfirmCheck.IsChecked == true;
+        LogRebuildButton.IsEnabled = !busy && LogRebuildConfirmCheck.IsChecked == true;
 
         RepairBusyBar.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
     }

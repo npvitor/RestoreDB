@@ -97,6 +97,46 @@ GO
 
 
 /* ----------------------------------------------------------------------------
+   5) ÚLTIMO RECURSO — banco irreparável por causa do LOG de transações:
+      reconstruir o .ldf (detach -> remover o log -> ATTACH_REBUILD_LOG).
+
+      Use SOMENTE quando os reparos acima falharem. PODE HAVER PERDA DE DADOS
+      (transações não confirmadas são descartadas) e o banco pode ficar
+      logicamente inconsistente — por isso rode um DBCC CHECKDB ao final.
+
+      Comportamento validado em engine real:
+        * sp_detach_db FUNCIONA com o banco em EMERGENCY;
+        * ATTACH_REBUILD_LOG só recria o log se o arquivo .ldf NÃO existir
+          fisicamente — por isso o passo 5.3 (remover/renomear o .ldf) é
+          obrigatório. Com o .ldf presente, o ATTACH falha ("File activation
+          failure ... CREATE DATABASE is aborted").
+   ---------------------------------------------------------------------------- */
+
+-- 5.1 Descobrir os arquivos físicos (dados e log)
+SELECT type_desc, physical_name
+FROM   sys.master_files
+WHERE  database_id = DB_ID(N'NomeDoBanco')
+ORDER BY type, file_id;
+
+-- 5.2 EMERGENCY + detach (libera os arquivos no SO)
+ALTER DATABASE [NomeDoBanco] SET EMERGENCY;
+EXEC master.dbo.sp_detach_db @dbname = N'NomeDoBanco', @skipchecks = 'true';
+
+-- 5.3 (NO SISTEMA OPERACIONAL) renomear/apagar o(s) arquivo(s) .ldf.
+--     Ex.: ren "C:\...\NomeDoBanco_log.ldf" "NomeDoBanco_log.ldf.corrupt"
+
+-- 5.4 Reanexar reconstruindo o log (informe APENAS o(s) arquivo(s) de dados)
+CREATE DATABASE [NomeDoBanco] ON
+    (FILENAME = N'C:\...\NomeDoBanco.mdf')   -- repita para cada .ndf, se houver
+    FOR ATTACH_REBUILD_LOG;
+
+-- 5.5 Normalizar e verificar consistência
+ALTER DATABASE [NomeDoBanco] SET MULTI_USER;
+DBCC CHECKDB ([NomeDoBanco]) WITH NO_INFOMSGS, ALL_ERRORMSGS;
+GO
+
+
+/* ----------------------------------------------------------------------------
    Forma usada DENTRO da aplicação (segura contra injeção):
    o nome do banco entra por parâmetro e é protegido por QUOTENAME.
    ---------------------------------------------------------------------------- */
