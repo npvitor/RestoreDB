@@ -102,10 +102,17 @@ bancos de usuário, com **confirmação explícita** — a reconstrução do log
 >
 > Requisitos: os arquivos do banco precisam estar **acessíveis a partir da máquina
 > que roda a ferramenta** (servidor local) e a aplicação precisa de permissão na
-> pasta de dados. Se o servidor for remoto/sem acesso, a operação é **abortada com
-> segurança** (sem desanexar) e o log mostra o comando manual a executar no host.
-> Em caso de falha após o detach, a ferramenta tenta **reverter** (reanexar o log
-> original).
+> pasta de dados. **Execute a ferramenta como Administrador** — para remover o `.ldf`
+> do SQL Server ela precisa de privilégios (tenta inclusive *assumir a posse* do
+> arquivo via `takeown`/`icacls`). A partir da correção, isso é **verificado ANTES
+> de desanexar** o banco: sem elevação/permissão, a operação é **abortada sem tocar
+> no banco**. Se algo falhar após o detach, a ferramenta tenta **reverter** (reanexar
+> o log original) e, em último caso, registra o comando manual de recuperação.
+>
+> **Alternativa sem Administrador:** quando o problema é o log, o **reparo COM perda
+> de dados** (`DBCC CHECKDB ... REPAIR_ALLOW_DATA_LOSS` em modo `EMERGENCY`) também
+> reconstrói o log — porém **inteiramente no servidor**, sem mexer em arquivos, logo
+> **não exige Administrador**. Prefira esse caminho quando possível.
 
 Detalhes importantes:
 

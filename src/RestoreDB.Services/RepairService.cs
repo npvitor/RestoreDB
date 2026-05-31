@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using System.IO;
+using System.Security.Principal;
 using RestoreDB.DataAccess;
 using RestoreDB.Domain.Constants;
 using RestoreDB.Domain.Models;
@@ -315,6 +317,37 @@ public sealed class RepairService
             return result;
         }
 
+        // 2b. Pré-checagem de PERMISSÕES antes de qualquer mudança destrutiva.
+        //     É essencial validar AGORA (com o banco ainda anexado) para nunca deixá-lo
+        //     desanexado caso não seja possível remover o arquivo de log depois.
+        if (!IsRunningElevated())
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message =
+                "A reconstrução de log exige executar esta ferramenta COMO ADMINISTRADOR para remover o " +
+                "arquivo de log do SQL Server. O banco NÃO foi alterado. Feche e reabra a ferramenta como administrador.";
+            Report(progress, db.Name, RepairLogLevel.Error, result.Message);
+            LogManualInstructions(progress, db, dataFiles, logFiles);
+            return result;
+        }
+
+        var directories = files
+            .Select(f => Path.GetDirectoryName(f.PhysicalName) ?? string.Empty)
+            .Where(d => d.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var notWritable = directories.FirstOrDefault(d => !CanWriteToDirectory(d));
+        if (notWritable is not null)
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message =
+                $"Sem permissão de escrita na pasta de dados do servidor ('{notWritable}'). O banco NÃO foi alterado. " +
+                "Execute no próprio servidor com permissão adequada na pasta de dados.";
+            Report(progress, db.Name, RepairLogLevel.Error, result.Message);
+            LogManualInstructions(progress, db, dataFiles, logFiles);
+            return result;
+        }
+
         // 3. EMERGENCY (permite desanexar mesmo um banco SUSPECT)
         await RunStepAsync(session, db, progress, "Colocando o banco em modo EMERGENCY", AlterDatabase(db.Name, "SET EMERGENCY"), ct);
 
@@ -330,29 +363,26 @@ public sealed class RepairService
             return result;
         }
 
-        // 5. Remover (renomear) os arquivos de log antigos — necessário para que o log seja recriado
+        // 5. Remover (renomear) os arquivos de log antigos — necessário para que o log seja recriado.
+        //    Em caso de "acesso negado", tentamos assumir a posse do arquivo (takeown/icacls).
         var renamed = new List<(string original, string backup)>();
         var renameFailed = false;
         foreach (var lf in logFiles)
         {
-            try
+            if (!File.Exists(lf.PhysicalName))
             {
-                if (File.Exists(lf.PhysicalName))
-                {
-                    var backup = lf.PhysicalName + ".corrupt_" + DateTime.Now.ToString("yyyyMMddHHmmss");
-                    File.Move(lf.PhysicalName, backup);
-                    renamed.Add((lf.PhysicalName, backup));
-                    Report(progress, db.Name, RepairLogLevel.Success, $"Log antigo movido para: {backup}");
-                }
-                else
-                {
-                    Report(progress, db.Name, RepairLogLevel.Info, $"Log já ausente (será recriado): {lf.PhysicalName}");
-                }
+                Report(progress, db.Name, RepairLogLevel.Info, $"Log já ausente (será recriado): {lf.PhysicalName}");
+                continue;
             }
-            catch (Exception ex)
+
+            if (TryMoveLogAside(lf.PhysicalName, progress, db, out var movedTo) && movedTo is not null)
+            {
+                renamed.Add((lf.PhysicalName, movedTo));
+                Report(progress, db.Name, RepairLogLevel.Success, $"Log antigo movido para: {movedTo}");
+            }
+            else
             {
                 renameFailed = true;
-                Report(progress, db.Name, RepairLogLevel.Error, $"Não foi possível remover o log '{lf.PhysicalName}': {ex.Message}");
                 break;
             }
         }
@@ -447,12 +477,133 @@ public sealed class RepairService
     private void LogManualInstructions(IProgress<RepairLogEntry> p, DatabaseInfo db,
         List<DatabaseFile> dataFiles, List<DatabaseFile> logFiles)
     {
+        var allClause = string.Join(",\n    ", dataFiles.Concat(logFiles).Select(f => $"(FILENAME = N'{f.PhysicalName}')"));
         var dataClause = string.Join(",\n    ", dataFiles.Select(f => $"(FILENAME = N'{f.PhysicalName}')"));
+
+        Report(p, db.Name, RepairLogLevel.Info, "── Recuperação manual (no servidor, como administrador/sysadmin) ──");
         Report(p, db.Name, RepairLogLevel.Info,
-            "Recuperação manual (no servidor): após apagar/renomear o(s) arquivo(s) de log " +
-            string.Join("; ", logFiles.Select(f => f.PhysicalName)) + " execute:");
+            $"1) Se o banco ficou DESANEXADO, reanexe-o com o log atual:\nCREATE DATABASE [{db.Name}] ON\n    {allClause}\n FOR ATTACH;");
         Report(p, db.Name, RepairLogLevel.Info,
+            "   Se aparecer 'operating system error 5 (Acesso negado)', conceda acesso à conta de serviço do SQL aos arquivos e tente de novo, ex.:\n" +
+            string.Join("\n", dataFiles.Concat(logFiles).Select(f => $"icacls \"{f.PhysicalName}\" /grant \"NT SERVICE\\MSSQLSERVER\":(F)")));
+        Report(p, db.Name, RepairLogLevel.Info,
+            $"2) Para RECONSTRUIR o log: apague/renomeie o(s) arquivo(s) {string.Join("; ", logFiles.Select(f => f.PhysicalName))} e execute:\n" +
             $"CREATE DATABASE [{db.Name}] ON\n    {dataClause}\n FOR ATTACH_REBUILD_LOG;");
+    }
+
+    // --- Permissões / sistema de arquivos (operação roda no host do SQL Server) ---
+
+    private static bool IsRunningElevated()
+    {
+        try
+        {
+            using var identity = WindowsIdentity.GetCurrent();
+            return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool CanWriteToDirectory(string directory)
+    {
+        try
+        {
+            if (!Directory.Exists(directory)) return false;
+            var probe = Path.Combine(directory, ".restoredb_probe_" + Guid.NewGuid().ToString("N"));
+            File.WriteAllText(probe, "x");
+            File.Delete(probe);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private bool TryMoveLogAside(string path, IProgress<RepairLogEntry> p, DatabaseInfo db, out string? movedTo)
+    {
+        movedTo = null;
+        var backup = path + ".corrupt_" + DateTime.Now.ToString("yyyyMMddHHmmss");
+        try
+        {
+            ClearReadOnly(path);
+            File.Move(path, backup);
+            movedTo = backup;
+            return true;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            Report(p, db.Name, RepairLogLevel.Warning, $"Acesso negado ao log. Tentando assumir a posse do arquivo: {path}");
+            if (TryTakeOwnershipAndGrant(path, p, db))
+            {
+                try
+                {
+                    ClearReadOnly(path);
+                    File.Move(path, backup);
+                    movedTo = backup;
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Report(p, db.Name, RepairLogLevel.Error, $"Ainda sem acesso ao log '{path}': {ex.Message}");
+                    return false;
+                }
+            }
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Report(p, db.Name, RepairLogLevel.Error, $"Não foi possível remover o log '{path}': {ex.Message}");
+            return false;
+        }
+    }
+
+    private static void ClearReadOnly(string path)
+    {
+        try
+        {
+            var attrs = File.GetAttributes(path);
+            if (attrs.HasFlag(FileAttributes.ReadOnly))
+                File.SetAttributes(path, attrs & ~FileAttributes.ReadOnly);
+        }
+        catch
+        {
+            // best-effort
+        }
+    }
+
+    private bool TryTakeOwnershipAndGrant(string path, IProgress<RepairLogEntry> p, DatabaseInfo db)
+    {
+        var owned = RunTool("takeown", $"/F \"{path}\"");
+        // S-1-5-32-544 = grupo Administradores (independente de idioma do Windows)
+        var granted = RunTool("icacls", $"\"{path}\" /grant *S-1-5-32-544:F");
+        if (!owned || !granted)
+            Report(p, db.Name, RepairLogLevel.Warning, "Não foi possível ajustar a posse/permissão do arquivo de log automaticamente.");
+        return owned && granted;
+    }
+
+    private static bool RunTool(string exe, string arguments)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo(exe, arguments)
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            using var process = Process.Start(psi);
+            if (process is null) return false;
+            process.WaitForExit(20000);
+            return process.HasExited && process.ExitCode == 0;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static (string sql, Dictionary<string, object?> prm) DetachDb(string dbName)
