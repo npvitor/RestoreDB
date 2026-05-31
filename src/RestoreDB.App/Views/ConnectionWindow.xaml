@@ -56,6 +56,6 @@
         <!-- Rodapé -->
         <TextBlock Grid.Row="3" VerticalAlignment="Bottom"
                    Text="A conexão usa o banco master e parâmetros pré-definidos (timeout, criptografia, etc.). Compatível com SQL Server 2008 R2."
-                   Foreground="{StaticResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,16,0,0" />
+                   Foreground="{StaticResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0" HorizontalAlignment="Center" />
     </Grid>
 </Window>
