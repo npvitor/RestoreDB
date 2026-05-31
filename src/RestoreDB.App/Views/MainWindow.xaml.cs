@@ -128,7 +128,10 @@ public partial class MainWindow : Window
             LogRebuildPanel.Visibility = Visibility.Collapsed;
             LogRebuildConfirmCheck.IsChecked = false;
             LogRebuildButton.IsEnabled = false;
+            DiagnosisResultPanel.Visibility = Visibility.Collapsed;
 
+            DiagnosePanel.Visibility = db.IsProblematic ? Visibility.Visible : Visibility.Collapsed;
+            DiagnoseButton.IsEnabled = db.IsProblematic && !_busy;
             HealthyPanel.Visibility = db.IsHealthy ? Visibility.Visible : Visibility.Collapsed;
             SystemDbPanel.Visibility = db is { IsProblematic: true, IsSystemDatabase: true }
                 ? Visibility.Visible : Visibility.Collapsed;
@@ -146,6 +149,57 @@ public partial class MainWindow : Window
 
         StateBadge.Background = db.IsHealthy ? HealthyBack : ProblemBack;
         StateText.Foreground = db.IsHealthy ? HealthyFore : ProblemFore;
+    }
+
+    // ------------------------------------------------------------------ Diagnóstico (somente leitura)
+
+    private void DiagnoseButton_Click(object sender, RoutedEventArgs e) => _ = RunDiagnoseAsync();
+
+    private async Task RunDiagnoseAsync()
+    {
+        if (_busy) return;
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+
+        SetBusy(true);
+        DiagnosisResultPanel.Visibility = Visibility.Collapsed;
+        StatusText.Text = $"Diagnosticando \"{db.Name}\"...";
+
+        try
+        {
+            var diag = await _repairService.DiagnoseAsync(db, _connectionString, _progress);
+
+            DiagnosisSummaryText.Text = diag.Summary;
+            DiagnosisRecoText.Text = string.IsNullOrEmpty(diag.Recommendation)
+                ? string.Empty
+                : "Recomendação: " + diag.Recommendation;
+
+            // Cor conforme a conclusão.
+            Brush back, fore;
+            if (diag.LogCorruptionSuspected && !diag.DataCorruptionSuspected) { back = WarnBack; fore = WarnFore; }
+            else if (diag.DataCorruptionSuspected) { back = ProblemBack; fore = ProblemFore; }
+            else { back = HealthyBack; fore = HealthyFore; }
+
+            DiagnosisResultPanel.Background = back;
+            DiagnosisResultPanel.BorderBrush = fore;
+            DiagnosisSummaryText.Foreground = fore;
+            DiagnosisRecoText.Foreground = fore;
+            DiagnosisResultPanel.Visibility = Visibility.Visible;
+
+            // Se o log está corrompido, já deixa visível a opção recomendada de reconstrução.
+            if (diag.LogCorruptionSuspected && !db.IsSystemDatabase)
+                ShowLogRebuildOption(db);
+
+            StatusText.Text = diag.Summary;
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = "Falha no diagnóstico.";
+            ShowError("Não foi possível concluir o diagnóstico.", ex);
+        }
+        finally
+        {
+            SetBusy(false);
+        }
     }
 
     // ------------------------------------------------------------------ Reparo
@@ -336,6 +390,7 @@ public partial class MainWindow : Window
         DatabasesGrid.IsEnabled = !busy;
 
         var db = DatabasesGrid.SelectedItem as DatabaseInfo;
+        DiagnoseButton.IsEnabled = !busy && db is { IsProblematic: true };
         SafeRepairButton.IsEnabled = !busy && db is { IsProblematic: true };
         DataLossRepairButton.IsEnabled = !busy && DataLossConfirmCheck.IsChecked == true;
         LogRebuildButton.IsEnabled = !busy && LogRebuildConfirmCheck.IsChecked == true;

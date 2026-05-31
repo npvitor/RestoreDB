@@ -109,6 +109,41 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         return list;
     }
 
+    /// <summary>
+    /// Lê o log de erros atual do SQL Server filtrando pelas linhas que mencionam o banco
+    /// (sp_readerrorlog). Somente leitura. Best-effort: se não houver permissão/sp, devolve vazio.
+    /// Compatível com SQL Server 2008 R2.
+    /// </summary>
+    public async Task<List<string>> ReadErrorLogAsync(string databaseName, CancellationToken ct = default)
+    {
+        var lines = new List<string>();
+        try
+        {
+            // @p1 = 0 (log atual), @p2 = 1 (SQL Server, não o Agent), @p3 = texto a filtrar.
+            await using var cmd = new SqlCommand("EXEC sys.sp_readerrorlog @arch, @logtype, @search;", _connection)
+            {
+                CommandTimeout = AppConstants.QueryCommandTimeoutSeconds
+            };
+            cmd.Parameters.AddWithValue("@arch", 0);
+            cmd.Parameters.AddWithValue("@logtype", 1);
+            cmd.Parameters.AddWithValue("@search", databaseName);
+
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                // Colunas: LogDate, ProcessInfo, Text
+                var date = reader.IsDBNull(0) ? string.Empty : Convert.ToString(reader.GetValue(0)) ?? string.Empty;
+                var text = reader.IsDBNull(2) ? string.Empty : reader.GetString(2);
+                lines.Add(string.IsNullOrEmpty(date) ? text : $"{date}  {text}");
+            }
+        }
+        catch
+        {
+            // best-effort: sem permissão (não-sysadmin), sp indisponível, etc.
+        }
+        return lines;
+    }
+
     private static string FormatMessage(SqlError err)
     {
         // Severidade (Class) 0-10 e número 0 => mensagem puramente informativa (PRINT / DBCC).

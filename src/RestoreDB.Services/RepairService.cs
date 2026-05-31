@@ -108,6 +108,111 @@ public sealed class RepairService
     }
 
     // ----------------------------------------------------------------------------------
+    // Diagnóstico SOMENTE LEITURA (dados x log)
+    // ----------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Analisa, sem alterar o banco, se a causa provável do estado problemático está nos
+    /// arquivos de DADOS (.mdf/.ndf) ou no LOG de transações (.ldf). Baseia-se no log de
+    /// erros do SQL Server (sp_readerrorlog) e nos arquivos de sys.master_files.
+    /// </summary>
+    public async Task<DiagnosisResult> DiagnoseAsync(
+        DatabaseInfo db, string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default)
+    {
+        var diag = new DiagnosisResult { DatabaseName = db.Name, StateDesc = db.StateDesc };
+        Report(progress, db.Name, RepairLogLevel.Info, $"──── Diagnóstico (somente leitura) de [{db.Name}] ────");
+
+        try
+        {
+            await using var session = await _data.OpenSessionAsync(connectionString, ct);
+            diag.StateDesc = await session.GetDatabaseStateAsync(db.Name, ct);
+
+            var files = await session.GetDatabaseFilesAsync(db.Name, ct);
+            foreach (var f in files)
+                Report(progress, db.Name, RepairLogLevel.Info, $"Arquivo {f.TypeDesc}: {f.PhysicalName}");
+
+            var logNames = files.Where(f => f.IsLog).Select(f => Path.GetFileName(f.PhysicalName))
+                                .Where(n => !string.IsNullOrEmpty(n)).ToList();
+            var dataNames = files.Where(f => f.IsData).Select(f => Path.GetFileName(f.PhysicalName))
+                                 .Where(n => !string.IsNullOrEmpty(n)).ToList();
+
+            Report(progress, db.Name, RepairLogLevel.Info, "Lendo o log de erros do SQL Server (sp_readerrorlog)...");
+            var lines = await session.ReadErrorLogAsync(db.Name, ct);
+
+            foreach (var line in lines)
+            {
+                if (!LooksLikeCorruptionLine(line)) continue;
+
+                var refLog = logNames.Any(n => line.Contains(n, StringComparison.OrdinalIgnoreCase))
+                             || line.Contains(".ldf", StringComparison.OrdinalIgnoreCase);
+                var refData = dataNames.Any(n => line.Contains(n, StringComparison.OrdinalIgnoreCase))
+                              || line.Contains(".mdf", StringComparison.OrdinalIgnoreCase)
+                              || line.Contains(".ndf", StringComparison.OrdinalIgnoreCase);
+
+                diag.Evidence.Add(line);
+                if (refLog) diag.LogCorruptionSuspected = true;
+                if (refData) diag.DataCorruptionSuspected = true;
+            }
+
+            BuildConclusion(diag);
+
+            foreach (var e in diag.Evidence.Take(8))
+                Report(progress, db.Name, RepairLogLevel.Warning, "  • " + e);
+            if (!diag.HasEvidence)
+                Report(progress, db.Name, RepairLogLevel.Info, "Sem entradas de corrupção encontradas no log de erros (ou sem permissão para lê-lo).");
+
+            Report(progress, db.Name,
+                diag.LogCorruptionSuspected || diag.DataCorruptionSuspected ? RepairLogLevel.Warning : RepairLogLevel.Success,
+                diag.Summary);
+            if (diag.Recommendation.Length > 0)
+                Report(progress, db.Name, RepairLogLevel.Info, "Recomendação: " + diag.Recommendation);
+        }
+        catch (Exception ex)
+        {
+            diag.Summary = "Não foi possível concluir o diagnóstico: " + ex.Message;
+            Report(progress, db.Name, RepairLogLevel.Error, diag.Summary);
+        }
+
+        Report(progress, db.Name, RepairLogLevel.Info, "──── Fim do diagnóstico ────");
+        return diag;
+    }
+
+    private static bool LooksLikeCorruptionLine(string line) => ContainsAny(line,
+        // EN
+        "checksum", "consistency-based", "consistency based", "i/o error", "torn page",
+        "activation error", "cannot open", "could not open", "corrupt", "incorrect",
+        // PT
+        "verificação", "consistência", "erro de e/s", "página corrompida", "ativação de arquivo",
+        "não é possível abrir", "não foi possível abrir", "corrompid", "incorreta");
+
+    private static bool ContainsAny(string text, params string[] terms)
+        => terms.Any(t => text.Contains(t, StringComparison.OrdinalIgnoreCase));
+
+    private static void BuildConclusion(DiagnosisResult d)
+    {
+        if (d.LogCorruptionSuspected && !d.DataCorruptionSuspected)
+        {
+            d.Summary = "Os arquivos de DADOS parecem íntegros e o LOG de transações (.ldf) apresenta corrupção.";
+            d.Recommendation = "Reconstruir o log: 'Reparar (modo seguro)' → 'reparo COM perda de dados' (reconstrói o log no servidor, sem Administrador) ou a opção 'Reconstruir log'. Os dados devem ser preservados.";
+        }
+        else if (d.DataCorruptionSuspected && !d.LogCorruptionSuspected)
+        {
+            d.Summary = "Há indícios de corrupção nos arquivos de DADOS (.mdf/.ndf).";
+            d.Recommendation = "Prefira RESTAURAR de backup. Sem backup, use o reparo (DBCC CHECKDB), possivelmente COM perda de dados.";
+        }
+        else if (d.DataCorruptionSuspected && d.LogCorruptionSuspected)
+        {
+            d.Summary = "Há indícios de corrupção tanto nos DADOS quanto no LOG.";
+            d.Recommendation = "Prefira RESTAURAR de backup. Caso contrário, reparo COM perda de dados.";
+        }
+        else
+        {
+            d.Summary = "Não foram encontradas evidências claras de corrupção no log de erros. A causa pode ser outra (arquivo/recurso indisponível, permissão, etc.).";
+            d.Recommendation = "Tente 'Reparar (modo seguro)' e verifique se os arquivos do banco existem e estão acessíveis ao SQL Server.";
+        }
+    }
+
+    // ----------------------------------------------------------------------------------
     // Fluxos por estado
     // ----------------------------------------------------------------------------------
 

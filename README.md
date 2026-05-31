@@ -70,6 +70,21 @@ dotnet run --project src/RestoreDB.App
 
 ---
 
+## Diagnóstico (DADOS × LOG) — somente leitura
+
+Para qualquer banco problemático há o botão **"Diagnosticar (sem alterar o banco)"**.
+Ele lê o **log de erros do SQL Server** (`sp_readerrorlog`) e os arquivos de
+`sys.master_files` e conclui, **sem modificar nada**, se a corrupção está nos
+arquivos de **DADOS** (`.mdf`/`.ndf`) ou no **LOG de transações** (`.ldf`):
+
+- erros de E/S / checksum / *file activation* referenciando o `.ldf` ⇒ **log corrompido**
+  (os dados tendem a estar íntegros) ⇒ recomenda **reconstruir o log**;
+- erros referenciando `.mdf`/`.ndf` ⇒ **dados corrompidos** ⇒ recomenda **restaurar de backup**.
+
+A detecção é tolerante a idioma (palavras-chave EN/PT) e usa o **nome físico do arquivo**
+como discriminador (independe de idioma). Quando conclui que o log está corrompido, a UI
+já destaca a opção de reconstrução.
+
 ## Lógica de reparo (escalonamento: do menos ao mais agressivo)
 
 | Estado            | Ação                                                                              | Perda de dados |

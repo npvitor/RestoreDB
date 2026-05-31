@@ -112,6 +112,24 @@
                                            Foreground="#8A5200" TextWrapping="Wrap" />
                             </Border>
 
+                            <!-- Diagnóstico (somente leitura) -->
+                            <StackPanel x:Name="DiagnosePanel" Visibility="Collapsed" Margin="0,18,0,0">
+                                <Button x:Name="DiagnoseButton" Content="Diagnosticar (sem alterar o banco)"
+                                        Style="{StaticResource SecondaryButton}" Height="40" Click="DiagnoseButton_Click" />
+                                <TextBlock Text="Lê o log de erros do SQL Server e identifica se o problema está nos DADOS (.mdf/.ndf) ou no LOG de transações (.ldf). Não modifica nada."
+                                           Foreground="{StaticResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,8,0,0" />
+                            </StackPanel>
+
+                            <!-- Resultado do diagnóstico -->
+                            <Border x:Name="DiagnosisResultPanel" Visibility="Collapsed" Margin="0,12,0,0"
+                                    BorderThickness="1" CornerRadius="6" Padding="12">
+                                <StackPanel>
+                                    <TextBlock Text="DIAGNÓSTICO" Style="{StaticResource FieldLabel}" />
+                                    <TextBlock x:Name="DiagnosisSummaryText" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,2,0,0" />
+                                    <TextBlock x:Name="DiagnosisRecoText" TextWrapping="Wrap" Margin="0,6,0,0" />
+                                </StackPanel>
+                            </Border>
+
                             <!-- Reparo seguro -->
                             <StackPanel x:Name="SafeRepairPanel" Visibility="Collapsed" Margin="0,18,0,0">
                                 <Button x:Name="SafeRepairButton" Content="Reparar (modo seguro, sem perda de dados)"
