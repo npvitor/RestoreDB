@@ -135,8 +135,10 @@ public partial class MainWindow : Window
             HealthyPanel.Visibility = db.IsHealthy ? Visibility.Visible : Visibility.Collapsed;
             SystemDbPanel.Visibility = db is { IsProblematic: true, IsSystemDatabase: true }
                 ? Visibility.Visible : Visibility.Collapsed;
-            SafeRepairPanel.Visibility = db.IsProblematic ? Visibility.Visible : Visibility.Collapsed;
-            SafeRepairButton.IsEnabled = db.IsProblematic && !_busy;
+            // As opções de reparo só são liberadas DEPOIS do diagnóstico.
+            SafeRepairTitle.Visibility = Visibility.Collapsed;
+            SafeRepairPanel.Visibility = Visibility.Collapsed;
+            SafeRepairButton.IsEnabled = false;
         }
     }
 
@@ -198,6 +200,12 @@ public partial class MainWindow : Window
         }
         finally
         {
+            // O diagnóstico é a 1ª etapa: somente depois dele liberamos as opções de reparo.
+            if (db.IsProblematic)
+            {
+                SafeRepairTitle.Visibility = Visibility.Visible;
+                SafeRepairPanel.Visibility = Visibility.Visible;
+            }
             SetBusy(false);
         }
     }
@@ -288,6 +296,9 @@ public partial class MainWindow : Window
                 ResultPanel.Background = HealthyBack;
                 ResultPanel.BorderBrush = HealthyFore;
                 ResultText.Foreground = HealthyFore;
+                DiagnosePanel.Visibility = Visibility.Collapsed;
+                DiagnosisResultPanel.Visibility = Visibility.Collapsed;
+                SafeRepairTitle.Visibility = Visibility.Collapsed;
                 SafeRepairPanel.Visibility = Visibility.Collapsed;
                 DataLossPanel.Visibility = Visibility.Collapsed;
                 LogRebuildPanel.Visibility = Visibility.Collapsed;

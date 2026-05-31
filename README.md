@@ -60,11 +60,15 @@ dotnet run --project src/RestoreDB.App
    **constantes** em `AppConstants`. O botão **Conectar** valida e segue.
 2. **Listagem** — todos os bancos e seus `state_desc` (de `sys.databases`).
    Os bancos problemáticos ficam **destacados em vermelho**.
-3. **Reparo** — ao selecionar um banco problemático, a ferramenta oferece
-   **primeiro o reparo SEM perda de dados**. Apenas se ele falhar, oferece o
-   reparo **COM possível perda de dados**, com aviso destacado e exigindo
-   **confirmação explícita** (checkbox + diálogo). O estado é atualizado na lista
-   após cada operação, e cada comando é registrado no log (tela + arquivo).
+3. **Diagnóstico (1ª etapa)** — ao selecionar um banco problemático, a **única**
+   ação inicial é **"Diagnosticar (sem alterar o banco)"**. Só **depois** que o
+   diagnóstico roda e recomenda é que as **opções de reparo** aparecem (e, quando o
+   log está corrompido, a opção de reconstrução já vem destacada).
+4. **Reparo** — a ferramenta oferece **primeiro o reparo SEM perda de dados**.
+   Apenas se ele falhar, oferece o reparo **COM possível perda de dados**, com aviso
+   destacado e exigindo **confirmação explícita** (checkbox + diálogo). O estado é
+   atualizado na lista após cada operação, e cada comando é registrado no log
+   (tela + arquivo).
 
 > O login utilizado precisa ser **sysadmin** (DBCC CHECKDB / ALTER DATABASE).
 

@@ -130,8 +130,12 @@
                                 </StackPanel>
                             </Border>
 
+                            <!-- Cabeçalho das opções de reparo (aparece só após o diagnóstico) -->
+                            <TextBlock x:Name="SafeRepairTitle" Visibility="Collapsed" Text="OPÇÕES DE REPARO"
+                                       Style="{StaticResource FieldLabel}" Margin="0,20,0,0" />
+
                             <!-- Reparo seguro -->
-                            <StackPanel x:Name="SafeRepairPanel" Visibility="Collapsed" Margin="0,18,0,0">
+                            <StackPanel x:Name="SafeRepairPanel" Visibility="Collapsed" Margin="0,6,0,0">
                                 <Button x:Name="SafeRepairButton" Content="Reparar (modo seguro, sem perda de dados)"
                                         Style="{StaticResource FlatButton}" Height="44" Click="SafeRepairButton_Click" />
                                 <TextBlock Text="Tentaremos primeiro a abordagem mais segura: religar / recuperar e, se necessário, DBCC CHECKDB com REPAIR_REBUILD."
