@@ -7,5 +7,6 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/RestoreDB.Tests/RestoreDB.Tests.csproj" />
+    <Project Path="tests/RestoreDB.IntegrationTests/RestoreDB.IntegrationTests.csproj" />
   </Folder>
 </Solution>

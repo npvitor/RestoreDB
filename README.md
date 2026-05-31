@@ -251,11 +251,27 @@ compatibilidade com o TLS de servidores antigos (2008 R2). É possível usar
 
 ## Testes
 
-O projeto [`tests/RestoreDB.Tests`](tests/RestoreDB.Tests) (xUnit) cobre a **lógica pura**
-(sem necessidade de um SQL Server): montagem da *connection string* (SQL × Windows auth),
-geração do script planejado (*dry-run*), classificação de corrupção só-índice
-(`CheckDbReport`), detecção de topologia/disco e os utilitários de domínio.
+**Testes de lógica** ([`tests/RestoreDB.Tests`](tests/RestoreDB.Tests), xUnit) — não precisam de
+SQL Server: *connection string* (SQL × Windows auth), script planejado (*dry-run*), classificação
+de corrupção só-índice (`CheckDbReport`), topologia/disco e utilitários de domínio.
 
 ```powershell
 dotnet test RestoreDB.slnx
 ```
+
+**Testes de integração** ([`tests/RestoreDB.IntegrationTests`](tests/RestoreDB.IntegrationTests)) —
+exercitam os serviços reais contra uma instância SQL: conexão/`ServerInfo`, reparo `OFFLINE`,
+`EMERGENCY` e `RESTORING`, diagnóstico estruturado (CHECKDB/`suspect_pages`/topologia/disco),
+restauração de backup (revertendo perda de dados) e `HEADERONLY`/`FILELISTONLY`. Cada teste cria
+e **derruba** seu próprio banco `RestoreDB_IT_*` (isolado) e limpa os backups gerados. Sem as
+variáveis de ambiente abaixo, esses testes são **ignorados** (o `dotnet test` padrão segue verde).
+
+```powershell
+$env:RESTOREDB_IT_SERVER = "localhost"
+$env:RESTOREDB_IT_USER   = "sa"
+$env:RESTOREDB_IT_PASS   = "********"
+dotnet test tests/RestoreDB.IntegrationTests
+```
+
+> Validado contra **SQL Server 2022 (Developer Edition)**: 41 testes de lógica + 10 de integração,
+> todos aprovados.
