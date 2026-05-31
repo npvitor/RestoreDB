@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO;
 using System.Security.Principal;
+using System.Text;
 using RestoreDB.DataAccess;
 using RestoreDB.Domain.Constants;
 using RestoreDB.Domain.Models;
@@ -124,12 +125,55 @@ public sealed class RepairService
 
         try
         {
+            // Capacidades da instância (conexão própria, best-effort).
+            try { diag.Server = await _data.GetServerInfoAsync(connectionString, ct); } catch { /* ignora */ }
+            if (diag.Server is not null)
+                Report(progress, db.Name, RepairLogLevel.Info,
+                    $"Instância: {diag.Server.ShortDescription} — login {(diag.Server.IsSysadmin ? "É" : "NÃO é")} sysadmin.");
+
             await using var session = await _data.OpenSessionAsync(connectionString, ct);
             diag.StateDesc = await session.GetDatabaseStateAsync(db.Name, ct);
 
             var files = await session.GetDatabaseFilesAsync(db.Name, ct);
             foreach (var f in files)
                 Report(progress, db.Name, RepairLogLevel.Info, $"Arquivo {f.TypeDesc}: {f.PhysicalName}");
+
+            // Topologia (espelhamento/AG/log shipping/replicação) — afeta a segurança do reparo.
+            diag.Topology = await session.GetTopologyInfoAsync(db.Name, ct);
+            if (diag.Topology.IsRisky)
+            {
+                Report(progress, db.Name, RepairLogLevel.Warning, "TOPOLOGIA: " + diag.Topology.Summary);
+                foreach (var w in diag.Topology.Warnings)
+                    Report(progress, db.Name, RepairLogLevel.Warning, "  ⚠ " + w);
+            }
+
+            // Recomendação preventiva: PAGE_VERIFY = CHECKSUM detecta corrupção futura.
+            var pageVerify = await session.GetPageVerifyOptionAsync(db.Name, ct);
+            if (pageVerify.Length > 0 && !pageVerify.Equals("CHECKSUM", StringComparison.OrdinalIgnoreCase))
+                Report(progress, db.Name, RepairLogLevel.Warning,
+                    $"PAGE_VERIFY está como {pageVerify}. Recomenda-se: ALTER DATABASE [{db.Name}] SET PAGE_VERIFY CHECKSUM; (detecta corrupção futura).");
+
+            // Espaço em disco dos volumes do banco.
+            diag.Disks.AddRange(await session.GetDiskSpaceAsync(db.Name, ct));
+            foreach (var d in diag.Disks.Where(d => d.IsLow))
+                Report(progress, db.Name, RepairLogLevel.Warning,
+                    $"DISCO BAIXO: volume {d.VolumeMountPoint} com {d.AvailableGb:0.0} GB livres ({d.PercentFree:0.#}%).");
+
+            // Páginas suspeitas (fonte autoritativa de corrupção).
+            diag.SuspectPages.AddRange(await session.GetSuspectPagesAsync(db.Name, ct));
+            var active = diag.SuspectPages.Where(p => p.IsActiveCorruption).ToList();
+            if (active.Count > 0)
+            {
+                diag.DataCorruptionSuspected = true;
+                Report(progress, db.Name, RepairLogLevel.Warning,
+                    $"msdb.suspect_pages: {active.Count} página(s) corrompida(s) registrada(s).");
+                foreach (var p in active.Take(8))
+                    Report(progress, db.Name, RepairLogLevel.Warning,
+                        $"  • arquivo {p.FileId}, página {p.PageId} — {p.EventTypeDescription} (x{p.ErrorCount})");
+            }
+
+            // DBCC CHECKDB estruturado (somente leitura) — quando o banco está acessível.
+            await TryStructuredCheckDbAsync(session, db, diag, progress, ct);
 
             var logNames = files.Where(f => f.IsLog).Select(f => Path.GetFileName(f.PhysicalName))
                                 .Where(n => !string.IsNullOrEmpty(n)).ToList();
@@ -141,6 +185,9 @@ public sealed class RepairService
 
             foreach (var line in lines)
             {
+                if (ContainsAny(line, "9002")) diag.LogFull = true;
+                if (ContainsAny(line, " 823", " 824", " 825", "823,", "824,", "825,")) diag.IoErrors = true;
+
                 if (!LooksLikeCorruptionLine(line)) continue;
 
                 var refLog = logNames.Any(n => line.Contains(n, StringComparison.OrdinalIgnoreCase))
@@ -158,11 +205,11 @@ public sealed class RepairService
 
             foreach (var e in diag.Evidence.Take(8))
                 Report(progress, db.Name, RepairLogLevel.Warning, "  • " + e);
-            if (!diag.HasEvidence)
-                Report(progress, db.Name, RepairLogLevel.Info, "Sem entradas de corrupção encontradas no log de erros (ou sem permissão para lê-lo).");
+            if (!diag.HasEvidence && diag.SuspectPages.Count == 0 && (diag.CheckDb is null || !diag.CheckDb.Executed))
+                Report(progress, db.Name, RepairLogLevel.Info, "Sem entradas de corrupção encontradas (ou sem permissão para lê-las).");
 
             Report(progress, db.Name,
-                diag.LogCorruptionSuspected || diag.DataCorruptionSuspected ? RepairLogLevel.Warning : RepairLogLevel.Success,
+                diag.LogCorruptionSuspected || diag.DataCorruptionSuspected || diag.LogFull ? RepairLogLevel.Warning : RepairLogLevel.Success,
                 diag.Summary);
             if (diag.Recommendation.Length > 0)
                 Report(progress, db.Name, RepairLogLevel.Info, "Recomendação: " + diag.Recommendation);
@@ -188,28 +235,119 @@ public sealed class RepairService
     private static bool ContainsAny(string text, params string[] terms)
         => terms.Any(t => text.Contains(t, StringComparison.OrdinalIgnoreCase));
 
+    /// <summary>
+    /// Executa um DBCC CHECKDB estruturado (WITH TABLERESULTS) somente leitura e resolve os nomes
+    /// dos objetos/índices envolvidos. Funciona quando o banco está acessível (ONLINE/EMERGENCY);
+    /// em SUSPECT pode falhar — nesse caso o relatório fica vazio e o diagnóstico usa as demais fontes.
+    /// </summary>
+    private async Task TryStructuredCheckDbAsync(SqlSession session, DatabaseInfo db, DiagnosisResult diag, IProgress<RepairLogEntry> progress, CancellationToken ct)
+    {
+        Report(progress, db.Name, RepairLogLevel.Info, "Analisando consistência (DBCC CHECKDB ... WITH TABLERESULTS, somente leitura)...");
+        var report = await session.CheckDbWithResultsAsync(db.Name, repairOption: null, ct);
+        diag.CheckDb = report;
+
+        if (!report.Executed)
+        {
+            Report(progress, db.Name, RepairLogLevel.Info, "Não foi possível rodar o CHECKDB agora (banco inacessível neste estado). Usando demais evidências.");
+            return;
+        }
+        if (!report.HasErrors)
+        {
+            Report(progress, db.Name, RepairLogLevel.Success, "DBCC CHECKDB não encontrou erros de consistência.");
+            return;
+        }
+
+        // Resolve nomes de objetos/índices para tornar o relatório legível.
+        foreach (var d in report.Details.Where(x => x.ObjectId != 0))
+        {
+            d.ObjectName = await session.ResolveObjectNameAsync(db.Name, d.ObjectId, ct);
+            if (d.IndexId > 0)
+                d.IndexName = await session.ResolveIndexNameAsync(db.Name, d.ObjectId, d.IndexId, ct);
+        }
+
+        diag.DataCorruptionSuspected = true;
+        diag.IndexOnlyRepairPossible = report.AllErrorsAreNonClusteredIndex;
+
+        Report(progress, db.Name, RepairLogLevel.Warning,
+            $"DBCC CHECKDB: {report.ErrorCount} erro(s). Nível mínimo de reparo: {(report.MinRepairLevel.Length > 0 ? report.MinRepairLevel : "não reparável pelo DBCC")}.");
+        foreach (var d in report.Details.Where(x => x.Error != 0 && x.Level >= 16).Take(8))
+        {
+            var obj = string.IsNullOrEmpty(d.ObjectName) ? $"objeto {d.ObjectId}" : d.ObjectName;
+            var idx = string.IsNullOrEmpty(d.IndexName) ? (d.IndexId > 0 ? $"índice {d.IndexId}" : "") : $"índice '{d.IndexName}'";
+            Report(progress, db.Name, RepairLogLevel.Warning, $"  • {obj} {idx}: {d.MessageText}".TrimEnd());
+        }
+        if (diag.IndexOnlyRepairPossible)
+            Report(progress, db.Name, RepairLogLevel.Info,
+                "Toda a corrupção está em índices NÃO clusterizados — reconstruíveis SEM perda de dados.");
+    }
+
     private static void BuildConclusion(DiagnosisResult d)
     {
+        var topoNote = d.Topology is { IsRisky: true }
+            ? " ATENÇÃO: " + d.Topology.Summary + " Reparos destrutivos/restore podem afetar essa configuração."
+            : string.Empty;
+
+        // 1) Corrupção restrita a índices não-clusterizados → reconstrução SEM perda de dados.
+        if (d.IndexOnlyRepairPossible)
+        {
+            d.RecommendedAction = RecommendedActionKind.RebuildIndexesOnly;
+            d.Summary = "A corrupção está restrita a índices NÃO clusterizados.";
+            d.Recommendation = "Use 'Reparar índices (sem perda de dados)': basta reconstruir os índices afetados (ALTER INDEX REBUILD). Nenhum dado é perdido." + topoNote;
+            return;
+        }
+
+        // 2) Log de transações cheio (erro 9002) — não é corrupção.
+        if (d.LogFull && !d.DataCorruptionSuspected && !d.LogCorruptionSuspected)
+        {
+            d.RecommendedAction = RecommendedActionKind.FreeDiskSpace;
+            d.Summary = "O LOG de transações está CHEIO (erro 9002) — não é corrupção.";
+            d.Recommendation = "Libere espaço no volume do log, faça BACKUP LOG e/ou adicione espaço ao arquivo de log. Depois religue o banco." + topoNote;
+            return;
+        }
+
+        // 3) Corrupção de DADOS → restaurar de backup (ou restauração de página, se poucas páginas).
+        if (d.DataCorruptionSuspected && !d.LogCorruptionSuspected)
+        {
+            var fewPages = d.SuspectPages.Count(p => p.IsActiveCorruption) is > 0 and <= 100;
+            d.RecommendedAction = fewPages ? RecommendedActionKind.PageRestore : RecommendedActionKind.RestoreFromBackup;
+            d.Summary = "Há corrupção nos arquivos de DADOS (.mdf/.ndf).";
+            d.Recommendation = (fewPages
+                ? "Poucas páginas afetadas: prefira RESTAURAR APENAS AS PÁGINAS (page restore), preservando o resto. "
+                : "Prefira RESTAURAR de backup. ")
+                + "Sem backup, resta o reparo COM perda de dados (DBCC CHECKDB), que descarta o que está corrompido." + topoNote;
+            return;
+        }
+
+        // 4) Corrupção apenas no LOG → reconstruir o log.
         if (d.LogCorruptionSuspected && !d.DataCorruptionSuspected)
         {
+            d.RecommendedAction = RecommendedActionKind.RebuildLog;
             d.Summary = "Os arquivos de DADOS parecem íntegros e o LOG de transações (.ldf) apresenta corrupção.";
-            d.Recommendation = "Reconstruir o log: 'Reparar (modo seguro)' → 'reparo COM perda de dados' (reconstrói o log no servidor, sem Administrador) ou a opção 'Reconstruir log'. Os dados devem ser preservados.";
+            d.Recommendation = "Reconstruir o log: 'reparo COM perda de dados' (reconstrói o log no servidor, sem Administrador) ou a opção 'Reconstruir log'. Os dados devem ser preservados." + topoNote;
+            return;
         }
-        else if (d.DataCorruptionSuspected && !d.LogCorruptionSuspected)
+
+        // 5) Ambos corrompidos.
+        if (d.DataCorruptionSuspected && d.LogCorruptionSuspected)
         {
-            d.Summary = "Há indícios de corrupção nos arquivos de DADOS (.mdf/.ndf).";
-            d.Recommendation = "Prefira RESTAURAR de backup. Sem backup, use o reparo (DBCC CHECKDB), possivelmente COM perda de dados.";
-        }
-        else if (d.DataCorruptionSuspected && d.LogCorruptionSuspected)
-        {
+            d.RecommendedAction = RecommendedActionKind.RestoreFromBackup;
             d.Summary = "Há indícios de corrupção tanto nos DADOS quanto no LOG.";
-            d.Recommendation = "Prefira RESTAURAR de backup. Caso contrário, reparo COM perda de dados.";
+            d.Recommendation = "Prefira RESTAURAR de backup. Caso contrário, reparo COM perda de dados." + topoNote;
+            return;
         }
-        else
+
+        // 6) Disco baixo como causa provável de RECOVERY_PENDING.
+        if (d.Disks.Any(x => x.IsLow))
         {
-            d.Summary = "Não foram encontradas evidências claras de corrupção no log de erros. A causa pode ser outra (arquivo/recurso indisponível, permissão, etc.).";
-            d.Recommendation = "Tente 'Reparar (modo seguro)' e verifique se os arquivos do banco existem e estão acessíveis ao SQL Server.";
+            d.RecommendedAction = RecommendedActionKind.FreeDiskSpace;
+            d.Summary = "Pouco espaço livre em disco — causa comum de RECOVERY_PENDING / falha de recuperação.";
+            d.Recommendation = "Libere espaço no(s) volume(s) do banco e tente 'Reparar (modo seguro)'." + topoNote;
+            return;
         }
+
+        d.RecommendedAction = RecommendedActionKind.SafeRepair;
+        d.Summary = "Não foram encontradas evidências claras de corrupção. A causa pode ser outra (arquivo/recurso indisponível, permissão, etc.).";
+        d.Recommendation = "Tente 'Reparar (modo seguro)' e verifique se os arquivos do banco existem e estão acessíveis ao SQL Server." + topoNote;
     }
 
     // ----------------------------------------------------------------------------------
@@ -270,6 +408,9 @@ public sealed class RepairService
             return RepairStatus.Failed;
         }
 
+        if (await IsTopologyRiskyAsync(s, db, p, ct))
+            return RepairStatus.Failed;
+
         // 1. EMERGENCY (torna o banco acessível para diagnóstico)
         await RunStepAsync(s, db, p, "Colocando o banco em modo EMERGENCY", AlterDatabase(db.Name, "SET EMERGENCY"), ct);
 
@@ -321,6 +462,27 @@ public sealed class RepairService
             return RepairStatus.Success;
         }
 
+        // 4b. Antes de escalar para perda de dados: se a corrupção remanescente está restrita a
+        //     índices NÃO clusterizados, reconstruí-los resolve SEM perda de dados.
+        var onlineNow = (await s.GetDatabaseStateAsync(db.Name, ct)).Equals("ONLINE", StringComparison.OrdinalIgnoreCase);
+        if (onlineNow)
+        {
+            var structured = await s.CheckDbWithResultsAsync(db.Name, repairOption: null, ct);
+            if (structured.HasErrors && structured.AllErrorsAreNonClusteredIndex)
+            {
+                Report(p, db.Name, RepairLogLevel.Info,
+                    "Corrupção restrita a índices não-clusterizados — reconstruindo os índices (SEM perda de dados)...");
+                var rebuilt = await RebuildNonClusteredIndexesAsync(s, db, structured, p, ct);
+                var verifyIdx = await RunStepAsync(s, db, p, "Verificação pós-reconstrução de índices (DBCC CHECKDB)",
+                    Dbcc(db.Name, repairOption: null, noInfoMsgs: true), ct);
+                if (rebuilt && verifyIdx.Success)
+                {
+                    await TrySetMultiUserAsync(s, db, p, ct);
+                    return RepairStatus.Success;
+                }
+            }
+        }
+
         // 5. Reparo seguro insuficiente
         if (!allowDataLoss)
         {
@@ -347,7 +509,7 @@ public sealed class RepairService
             return RepairStatus.Failed;
         }
 
-        await TryBackupAsync(s, db, p, ct);
+        await TrySafetyNetAsync(s, db, p, ct);
 
         await RunStepAsync(s, db, p, "Reparo COM possível PERDA DE DADOS (REPAIR_ALLOW_DATA_LOSS)",
             Dbcc(db.Name, "REPAIR_ALLOW_DATA_LOSS", noInfoMsgs: false), ct);
@@ -410,6 +572,26 @@ public sealed class RepairService
             return result;
         }
 
+        // 1b. Guarda de topologia: nunca desanexar um banco espelhado/em AG/log shipping/replicação.
+        if (await IsTopologyRiskyAsync(session, db, progress, ct))
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = "Reconstrução de log bloqueada pela topologia de alta disponibilidade/replicação.";
+            return result;
+        }
+
+        // 1c. Guarda de FILESTREAM/full-text: o ATTACH_REBUILD_LOG com apenas arquivos de dados
+        //     não cobre com segurança esses contêineres especiais.
+        if (files.Any(f => f.IsSpecialContainer))
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message =
+                "O banco possui arquivos FILESTREAM/full-text. A reconstrução de log por detach/attach não é " +
+                "segura nesse caso — prefira RESTAURAR de backup ou acione o DBA.";
+            Report(progress, db.Name, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+
         // 2. Pré-checagem: os arquivos de dados precisam estar acessíveis DESTA máquina.
         if (dataFiles.Any(f => !File.Exists(f.PhysicalName)))
         {
@@ -467,6 +649,10 @@ public sealed class RepairService
             result.Message = "Não foi possível desanexar o banco para reconstruir o log.";
             return result;
         }
+
+        // 4b. Rede de segurança: com o banco desanexado (arquivos liberados), copiar dados e log
+        //     antes de remover o log antigo. Permite reanexar manualmente em caso de problema.
+        CopyFilesAside(files, progress, db);
 
         // 5. Remover (renomear) os arquivos de log antigos — necessário para que o log seja recriado.
         //    Em caso de "acesso negado", tentamos assumir a posse do arquivo (takeown/icacls).
@@ -733,6 +919,238 @@ public sealed class RepairService
     // ----------------------------------------------------------------------------------
     // Backup de segurança e MULTI_USER
     // ----------------------------------------------------------------------------------
+
+    // ----------------------------------------------------------------------------------
+    // Reparo SEM perda de dados: reconstrução de índices não-clusterizados
+    // ----------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Reparo SEM perda de dados quando a corrupção está restrita a índices NÃO clusterizados:
+    /// obtém acesso exclusivo, confirma (via CHECKDB estruturado) que toda a corrupção é de
+    /// índice não-clusterizado e reconstrói esses índices (ALTER INDEX REBUILD), verificando ao final.
+    /// </summary>
+    public async Task<RepairResult> RebuildIndexesAsync(
+        DatabaseInfo db, string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default)
+    {
+        var result = new RepairResult();
+        Report(progress, db.Name, RepairLogLevel.Info, $"════════ Reparo SEM perda (reconstrução de índices) de [{db.Name}] ════════");
+
+        await using var session = await _data.OpenSessionAsync(connectionString, ct);
+
+        if (await IsTopologyRiskyAsync(session, db, progress, ct))
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = "Operação bloqueada pela topologia de alta disponibilidade/replicação.";
+            return result;
+        }
+
+        await RunStepAsync(session, db, progress, "Obtendo acesso exclusivo (SINGLE_USER WITH ROLLBACK IMMEDIATE)",
+            AlterDatabase(db.Name, "SET SINGLE_USER WITH ROLLBACK IMMEDIATE"), ct);
+
+        var report = await session.CheckDbWithResultsAsync(db.Name, repairOption: null, ct);
+        if (!report.Executed)
+        {
+            await TrySetMultiUserAsync(session, db, progress, ct);
+            result.Status = RepairStatus.Failed;
+            result.Message = "Não foi possível analisar o banco (inacessível). Use o fluxo de reparo padrão.";
+            Report(progress, db.Name, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+        if (!report.HasErrors)
+        {
+            await TrySetMultiUserAsync(session, db, progress, ct);
+            result.Status = RepairStatus.Success;
+            result.Message = "Nenhuma inconsistência encontrada — nada a reconstruir.";
+            Report(progress, db.Name, RepairLogLevel.Success, result.Message);
+            return result;
+        }
+        if (!report.AllErrorsAreNonClusteredIndex)
+        {
+            await TrySetMultiUserAsync(session, db, progress, ct);
+            result.Status = RepairStatus.NeedsDataLossConfirmation;
+            result.Message = "A corrupção NÃO está restrita a índices não-clusterizados. Use o reparo padrão (e, se necessário, RESTAURAR de backup).";
+            Report(progress, db.Name, RepairLogLevel.Warning, result.Message);
+            return result;
+        }
+
+        var ok = await RebuildNonClusteredIndexesAsync(session, db, report, progress, ct);
+        var verify = await RunStepAsync(session, db, progress, "Verificação pós-reconstrução (DBCC CHECKDB)",
+            Dbcc(db.Name, repairOption: null, noInfoMsgs: true), ct);
+        await TrySetMultiUserAsync(session, db, progress, ct);
+
+        result.FinalStateDesc = await session.GetDatabaseStateAsync(db.Name, ct);
+        db.StateDesc = result.FinalStateDesc;
+        result.Status = ok && verify.Success ? RepairStatus.Success : RepairStatus.Failed;
+        result.Message = result.Status == RepairStatus.Success
+            ? "Índices reconstruídos com sucesso — SEM perda de dados. Banco consistente."
+            : "A reconstrução de índices não eliminou todas as inconsistências. Considere o reparo padrão.";
+        Report(progress, db.Name, result.Status == RepairStatus.Success ? RepairLogLevel.Success : RepairLogLevel.Warning, result.Message);
+        return result;
+    }
+
+    private async Task<bool> RebuildNonClusteredIndexesAsync(
+        SqlSession s, DatabaseInfo db, CheckDbReport report, IProgress<RepairLogEntry> p, CancellationToken ct)
+    {
+        var targets = report.NonClusteredIndexesToRebuild;
+        if (targets.Count == 0) return false;
+
+        var ok = true;
+        foreach (var (objectId, indexId) in targets)
+        {
+            var objName = await s.ResolveObjectNameAsync(db.Name, objectId, ct);
+            var idxName = await s.ResolveIndexNameAsync(db.Name, objectId, indexId, ct);
+            var label = $"índice {(string.IsNullOrEmpty(idxName) ? indexId.ToString() : idxName)} de " +
+                        $"{(string.IsNullOrEmpty(objName) ? objectId.ToString() : objName)}";
+            var (sql, prm) = RebuildIndex(db.Name, objectId, indexId);
+            var r = await RunStepAsync(s, db, p, "Reconstruindo " + label, sql, prm, ct);
+            ok = ok && r.Success;
+        }
+        return ok;
+    }
+
+    private static (string sql, Dictionary<string, object?> prm) RebuildIndex(string db, int objectId, int indexId)
+    {
+        // O ALTER INDEX roda NO CONTEXTO do banco alvo (EXEC [db].sys.sp_executesql), montando o
+        // nome qualificado (schema.tabela) a partir do object_id já lá dentro.
+        var sql =
+            "DECLARE @inner nvarchar(max) = N'" +
+            "DECLARE @c nvarchar(max); " +
+            "SELECT @c = N''ALTER INDEX '' + QUOTENAME(i.name) + N'' ON '' + QUOTENAME(OBJECT_SCHEMA_NAME(@o)) + N''.'' + QUOTENAME(OBJECT_NAME(@o)) + N'' REBUILD;'' " +
+            "FROM sys.indexes i WHERE i.object_id = @o AND i.index_id = @i; " +
+            "IF @c IS NOT NULL EXEC sys.sp_executesql @c;';\n" +
+            "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
+            "EXEC @proc @inner, N'@o int, @i int', @o = @oid, @i = @iid;";
+        return (sql, new Dictionary<string, object?> { ["@db"] = db, ["@oid"] = objectId, ["@iid"] = indexId });
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Guardas de segurança (topologia) e rede de segurança (cópia física)
+    // ----------------------------------------------------------------------------------
+
+    private async Task<bool> IsTopologyRiskyAsync(SqlSession s, DatabaseInfo db, IProgress<RepairLogEntry> p, CancellationToken ct)
+    {
+        var topo = await s.GetTopologyInfoAsync(db.Name, ct);
+        if (!topo.IsRisky) return false;
+
+        Report(p, db.Name, RepairLogLevel.Error, "Operação bloqueada por segurança: " + topo.Summary);
+        foreach (var w in topo.Warnings)
+            Report(p, db.Name, RepairLogLevel.Error, "  ⛔ " + w);
+        Report(p, db.Name, RepairLogLevel.Info,
+            "Remova o banco dessa configuração (failover/remover do AG ou do espelhamento, desativar log shipping/replicação) antes de reparar, ou acione o DBA.");
+        return true;
+    }
+
+    /// <summary>
+    /// Tenta o backup COPY_ONLY e, em seguida, uma cópia física dos arquivos (quando locais) —
+    /// porque o BACKUP costuma falhar com o banco em EMERGENCY (Msg 3033). Tudo best-effort.
+    /// </summary>
+    private async Task TrySafetyNetAsync(SqlSession s, DatabaseInfo db, IProgress<RepairLogEntry> p, CancellationToken ct)
+    {
+        await TryBackupAsync(s, db, p, ct);
+        await TryCopyPhysicalFilesAsync(s, db, p, ct);
+    }
+
+    private async Task TryCopyPhysicalFilesAsync(SqlSession s, DatabaseInfo db, IProgress<RepairLogEntry> p, CancellationToken ct)
+    {
+        try
+        {
+            var files = await s.GetDatabaseFilesAsync(db.Name, ct);
+            var local = files.Where(f => File.Exists(f.PhysicalName)).ToList();
+            if (local.Count == 0)
+            {
+                Report(p, db.Name, RepairLogLevel.Info,
+                    "Cópia física de segurança não realizada (arquivos não acessíveis nesta máquina).");
+                return;
+            }
+            var stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+            foreach (var f in local)
+            {
+                var dest = f.PhysicalName + $".pre_repair_{stamp}";
+                File.Copy(f.PhysicalName, dest, overwrite: false);
+                Report(p, db.Name, RepairLogLevel.Success, $"Cópia de segurança do arquivo criada: {dest}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Report(p, db.Name, RepairLogLevel.Warning,
+                "Não foi possível copiar os arquivos como rede de segurança (o SQL Server pode mantê-los bloqueados): " + ex.Message);
+        }
+    }
+
+    private void CopyFilesAside(IEnumerable<DatabaseFile> files, IProgress<RepairLogEntry> p, DatabaseInfo db)
+    {
+        var stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+        foreach (var f in files)
+        {
+            try
+            {
+                if (!File.Exists(f.PhysicalName)) continue;
+                var dest = f.PhysicalName + $".pre_rebuild_{stamp}";
+                File.Copy(f.PhysicalName, dest, overwrite: false);
+                Report(p, db.Name, RepairLogLevel.Success, $"Cópia de segurança criada: {dest}");
+            }
+            catch (Exception ex)
+            {
+                Report(p, db.Name, RepairLogLevel.Warning, $"Não foi possível copiar '{f.PhysicalName}': {ex.Message}");
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Pré-visualização (dry-run): script T-SQL planejado para o estado atual
+    // ----------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Monta o T-SQL que a ferramenta executaria para o estado atual do banco, SEM executar nada.
+    /// Útil para revisão por um DBA ou para rodar manualmente em um servidor remoto.
+    /// </summary>
+    public static string BuildPlannedScript(DatabaseInfo db, bool allowDataLoss)
+    {
+        var n = "[" + db.Name.Replace("]", "]]") + "]";
+        var sb = new StringBuilder();
+        sb.AppendLine($"/* Script planejado para [{db.Name}] — estado atual: {db.StateDesc}.");
+        sb.AppendLine("   REVISE antes de executar. Compatível com SQL Server 2008 R2. */");
+        sb.AppendLine();
+
+        switch (db.StateDesc.Trim().ToUpperInvariant())
+        {
+            case "OFFLINE":
+                sb.AppendLine($"ALTER DATABASE {n} SET ONLINE;");
+                sb.AppendLine($"ALTER DATABASE {n} SET MULTI_USER;");
+                break;
+            case "RESTORING":
+            case "RECOVERING":
+                sb.AppendLine($"RESTORE DATABASE {n} WITH RECOVERY;");
+                break;
+            case "RECOVERY_PENDING":
+                sb.AppendLine($"ALTER DATABASE {n} SET ONLINE;   -- se falhar, seguir para o fluxo EMERGENCY abaixo");
+                sb.AppendLine();
+                goto case "SUSPECT";
+            case "SUSPECT":
+            case "EMERGENCY":
+                sb.AppendLine($"ALTER DATABASE {n} SET EMERGENCY;");
+                sb.AppendLine($"ALTER DATABASE {n} SET SINGLE_USER WITH ROLLBACK IMMEDIATE;");
+                sb.AppendLine($"DBCC CHECKDB ({n}) WITH NO_INFOMSGS, ALL_ERRORMSGS;   -- diagnóstico");
+                sb.AppendLine($"ALTER DATABASE {n} SET ONLINE;                          -- recuperação normal");
+                sb.AppendLine($"DBCC CHECKDB ({n}, REPAIR_REBUILD) WITH ALL_ERRORMSGS;  -- SEM perda de dados");
+                sb.AppendLine($"DBCC CHECKDB ({n}) WITH NO_INFOMSGS, ALL_ERRORMSGS;     -- verificação");
+                if (allowDataLoss)
+                {
+                    sb.AppendLine();
+                    sb.AppendLine("/* DESTRUTIVO — somente com confirmação explícita: */");
+                    sb.AppendLine($"ALTER DATABASE {n} SET EMERGENCY;");
+                    sb.AppendLine($"ALTER DATABASE {n} SET SINGLE_USER WITH ROLLBACK IMMEDIATE;");
+                    sb.AppendLine($"DBCC CHECKDB ({n}, REPAIR_ALLOW_DATA_LOSS) WITH ALL_ERRORMSGS;");
+                    sb.AppendLine($"DBCC CHECKDB ({n}) WITH NO_INFOMSGS, ALL_ERRORMSGS;");
+                }
+                sb.AppendLine($"ALTER DATABASE {n} SET MULTI_USER;");
+                break;
+            default:
+                sb.AppendLine("-- Estado saudável ou não problemático: nenhuma ação planejada.");
+                break;
+        }
+        return sb.ToString();
+    }
 
     private async Task TryBackupAsync(SqlSession s, DatabaseInfo db, IProgress<RepairLogEntry> p, CancellationToken ct)
     {

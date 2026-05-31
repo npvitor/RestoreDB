@@ -137,6 +137,88 @@ GO
 
 
 /* ----------------------------------------------------------------------------
+   6) DIAGNÓSTICO ESTRUTURADO (somente leitura) — fontes autoritativas
+   ---------------------------------------------------------------------------- */
+
+-- 6.1 Páginas suspeitas registradas pelo SQL Server (erros 823/824/825).
+SELECT file_id, page_id, event_type, error_count, last_update_date
+FROM   msdb.dbo.suspect_pages
+WHERE  database_id = DB_ID(N'NomeDoBanco');
+-- event_type: 1 = 823/824; 2 = checksum; 3 = página rasgada; 4 = restaurada; 5 = reparada; 7 = desalocada.
+
+-- 6.2 CHECKDB com saída ESTRUTURADA: identifica objeto/índice e o nível mínimo de reparo,
+--     sem precisar parsear texto livre. (index_id > 1 => índice NÃO clusterizado.)
+DBCC CHECKDB (N'NomeDoBanco') WITH TABLERESULTS, ALL_ERRORMSGS, NO_INFOMSGS;
+
+-- 6.3 Opção PAGE_VERIFY (recomenda-se CHECKSUM para detectar corrupção futura).
+SELECT page_verify_option_desc FROM sys.databases WHERE name = N'NomeDoBanco';
+ALTER DATABASE [NomeDoBanco] SET PAGE_VERIFY CHECKSUM;  -- se estiver NONE/TORN_PAGE_DETECTION
+
+-- 6.4 Espaço livre dos volumes do banco (2008 R2 SP1+).
+SELECT DISTINCT vs.volume_mount_point, vs.total_bytes, vs.available_bytes
+FROM   sys.master_files mf
+CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) vs
+WHERE  mf.database_id = DB_ID(N'NomeDoBanco');
+GO
+
+
+/* ----------------------------------------------------------------------------
+   7) REPARO SEM PERDA DE DADOS — corrupção restrita a índices NÃO clusterizados
+      Quando o CHECKDB (6.2) mostra erros apenas em índices com index_id > 1,
+      basta reconstruí-los: NENHUM dado é perdido.
+   ---------------------------------------------------------------------------- */
+ALTER DATABASE [NomeDoBanco] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+ALTER INDEX [NomeDoIndice] ON [schema].[Tabela] REBUILD;  -- repita para cada índice afetado
+DBCC CHECKDB (N'NomeDoBanco') WITH NO_INFOMSGS, ALL_ERRORMSGS;  -- verificação
+ALTER DATABASE [NomeDoBanco] SET MULTI_USER;
+GO
+
+
+/* ----------------------------------------------------------------------------
+   8) RESTAURAR DE BACKUP — caminho correto para corrupção de DADOS (.mdf/.ndf)
+   ---------------------------------------------------------------------------- */
+
+-- 8.1 Inspecionar o arquivo de backup
+RESTORE HEADERONLY   FROM DISK = N'C:\Backups\NomeDoBanco.bak';
+RESTORE FILELISTONLY FROM DISK = N'C:\Backups\NomeDoBanco.bak' WITH FILE = 1;
+RESTORE VERIFYONLY   FROM DISK = N'C:\Backups\NomeDoBanco.bak' WITH FILE = 1;
+
+-- 8.2 Restaurar (substituindo o banco corrompido; realoque arquivos com MOVE se necessário)
+RESTORE DATABASE [NomeDoBanco] FROM DISK = N'C:\Backups\NomeDoBanco.bak'
+    WITH FILE = 1,
+         MOVE N'NomeDoBanco'      TO N'C:\Dados\NomeDoBanco.mdf',
+         MOVE N'NomeDoBanco_log'  TO N'C:\Dados\NomeDoBanco_log.ldf',
+         REPLACE, RECOVERY;
+
+-- 8.3 RESTAURAÇÃO DE PÁGINA (page restore) — recupera só as páginas corrompidas (poucas).
+--     Requer a cadeia full + logs e modelo de recuperação FULL.
+RESTORE DATABASE [NomeDoBanco] PAGE = '1:57' FROM DISK = N'C:\Backups\NomeDoBanco.bak'
+    WITH FILE = 1, NORECOVERY;
+RESTORE LOG [NomeDoBanco] FROM DISK = N'C:\Backups\NomeDoBanco.trn' WITH FILE = 1, RECOVERY;
+
+-- 8.4 Corrigir usuários órfãos após o RESTORE (reassocia ao login de mesmo nome).
+--     A aplicação executa este lote NO CONTEXTO do banco restaurado.
+-- ALTER USER [usuario] WITH LOGIN = [usuario];
+GO
+
+
+/* ----------------------------------------------------------------------------
+   9) DETECÇÃO DE TOPOLOGIA — antes de qualquer reparo destrutivo/restore
+      Espelhamento, Always On, log shipping e replicação tornam o reparo
+      destrutivo/detach PERIGOSO. A ferramenta BLOQUEIA o reparo nesses casos.
+   ---------------------------------------------------------------------------- */
+SELECT mirroring_role_desc, mirroring_state_desc
+FROM   sys.database_mirroring WHERE database_id = DB_ID(N'NomeDoBanco') AND mirroring_guid IS NOT NULL;
+
+SELECT is_published, is_subscribed, is_merge_published
+FROM   sys.databases WHERE name = N'NomeDoBanco';
+
+-- Always On (2012+): sys.availability_databases_cluster / sys.availability_groups
+-- Log shipping: msdb.dbo.log_shipping_primary_databases / log_shipping_secondary_databases
+GO
+
+
+/* ----------------------------------------------------------------------------
    Forma usada DENTRO da aplicação (segura contra injeção):
    o nome do banco entra por parâmetro e é protegido por QUOTENAME.
    ---------------------------------------------------------------------------- */

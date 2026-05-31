@@ -1,7 +1,10 @@
 using System.Collections.ObjectModel;
+using System.IO;
+using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
+using Microsoft.Win32;
 using RestoreDB.Domain.Models;
 using RestoreDB.Services;
 
@@ -11,16 +14,21 @@ public partial class MainWindow : Window
 {
     private readonly string _connectionString;
     private readonly string _serverName;
+    private readonly ServerInfo _serverInfo;
 
     private readonly DatabaseService _databaseService = new();
     private readonly LogService _logService = new();
     private readonly RepairService _repairService;
+    private readonly RestoreService _restoreService;
+    private readonly ReportService _reportService = new();
 
     private readonly ObservableCollection<DatabaseInfo> _databases = new();
     private readonly ObservableCollection<RepairLogEntry> _logEntries = new();
+    private readonly ObservableCollection<BackupSetInfo> _backupSets = new();
     private readonly IProgress<RepairLogEntry> _progress;
 
     private bool _busy;
+    private CancellationTokenSource? _cts;
 
     private static readonly Brush HealthyBack = new SolidColorBrush(Color.FromRgb(0xE7, 0xF3, 0xEA));
     private static readonly Brush HealthyFore = new SolidColorBrush(Color.FromRgb(0x1B, 0x7A, 0x2F));
@@ -29,19 +37,25 @@ public partial class MainWindow : Window
     private static readonly Brush WarnBack = new SolidColorBrush(Color.FromRgb(0xFF, 0xF6, 0xE5));
     private static readonly Brush WarnFore = new SolidColorBrush(Color.FromRgb(0x8A, 0x52, 0x00));
 
-    public MainWindow(string connectionString, string serverName)
+    public MainWindow(string connectionString, string serverName, ServerInfo? serverInfo = null)
     {
         InitializeComponent();
 
         _connectionString = connectionString;
         _serverName = serverName;
+        _serverInfo = serverInfo ?? new ServerInfo();
         _repairService = new RepairService(_logService);
+        _restoreService = new RestoreService(_logService);
         _progress = new Progress<RepairLogEntry>(OnLogEntry);
 
         DatabasesGrid.ItemsSource = _databases;
         LogList.ItemsSource = _logEntries;
+        BackupSetsList.ItemsSource = _backupSets;
 
-        ServerInfoText.Text = $"Servidor: {serverName}   •   Catálogo: master";
+        var caps = _serverInfo.ProductVersion.Length > 0
+            ? $"   •   {_serverInfo.Edition} {_serverInfo.ProductVersion}   •   {(_serverInfo.IsSysadmin ? "sysadmin" : "SEM sysadmin")}"
+            : string.Empty;
+        ServerInfoText.Text = $"Servidor: {serverName}   •   Catálogo: master{caps}";
         LogPathText.Text = "Log: " + _logService.LogFilePath;
 
         Loaded += async (_, _) => await LoadDatabasesAsync();
@@ -129,6 +143,12 @@ public partial class MainWindow : Window
             LogRebuildConfirmCheck.IsChecked = false;
             LogRebuildButton.IsEnabled = false;
             DiagnosisResultPanel.Visibility = Visibility.Collapsed;
+            TopologyWarnPanel.Visibility = Visibility.Collapsed;
+            IndexRepairPanel.Visibility = Visibility.Collapsed;
+            RestorePanel.Visibility = Visibility.Collapsed;
+            ViewScriptButton.Visibility = Visibility.Collapsed;
+            _backupSets.Clear();
+            BackupSourceText.Text = string.Empty;
 
             DiagnosePanel.Visibility = db.IsProblematic ? Visibility.Visible : Visibility.Collapsed;
             DiagnoseButton.IsEnabled = db.IsProblematic && !_busy;
@@ -168,7 +188,7 @@ public partial class MainWindow : Window
 
         try
         {
-            var diag = await _repairService.DiagnoseAsync(db, _connectionString, _progress);
+            var diag = await _repairService.DiagnoseAsync(db, _connectionString, _progress, _cts!.Token);
 
             DiagnosisSummaryText.Text = diag.Summary;
             DiagnosisRecoText.Text = string.IsNullOrEmpty(diag.Recommendation)
@@ -177,7 +197,8 @@ public partial class MainWindow : Window
 
             // Cor conforme a conclusão.
             Brush back, fore;
-            if (diag.LogCorruptionSuspected && !diag.DataCorruptionSuspected) { back = WarnBack; fore = WarnFore; }
+            if (diag.IndexOnlyRepairPossible) { back = HealthyBack; fore = HealthyFore; }
+            else if (diag.LogCorruptionSuspected && !diag.DataCorruptionSuspected) { back = WarnBack; fore = WarnFore; }
             else if (diag.DataCorruptionSuspected) { back = ProblemBack; fore = ProblemFore; }
             else { back = HealthyBack; fore = HealthyFore; }
 
@@ -187,11 +208,30 @@ public partial class MainWindow : Window
             DiagnosisRecoText.Foreground = fore;
             DiagnosisResultPanel.Visibility = Visibility.Visible;
 
+            // Aviso de topologia (espelhamento/AG/log shipping/replicação).
+            if (diag.Topology is { IsRisky: true })
+            {
+                TopologyWarnText.Text = diag.Topology.Summary + " " + string.Join(" ", diag.Topology.Warnings);
+                TopologyWarnPanel.Visibility = Visibility.Visible;
+            }
+
+            // Reparo SEM perda (índices) quando aplicável.
+            if (diag.IndexOnlyRepairPossible && !db.IsSystemDatabase)
+                IndexRepairPanel.Visibility = Visibility.Visible;
+
+            // Restaurar de backup: oferecer para bancos de usuário (recomendado em corrupção de dados).
+            if (!db.IsSystemDatabase)
+                await ShowRestoreOptionAsync(db);
+
             // Se o log está corrompido, já deixa visível a opção recomendada de reconstrução.
             if (diag.LogCorruptionSuspected && !db.IsSystemDatabase)
                 ShowLogRebuildOption(db);
 
             StatusText.Text = diag.Summary;
+        }
+        catch (OperationCanceledException)
+        {
+            StatusText.Text = "Diagnóstico cancelado.";
         }
         catch (Exception ex)
         {
@@ -205,8 +245,219 @@ public partial class MainWindow : Window
             {
                 SafeRepairTitle.Visibility = Visibility.Visible;
                 SafeRepairPanel.Visibility = Visibility.Visible;
+                ViewScriptButton.Visibility = Visibility.Visible;
             }
             SetBusy(false);
+        }
+    }
+
+    // ------------------------------------------------------------------ Reparo SEM perda: índices
+
+    private void RepairIndexesButton_Click(object sender, RoutedEventArgs e)
+        => _ = RunRebuildIndexesAsync();
+
+    private async Task RunRebuildIndexesAsync()
+    {
+        if (_busy) return;
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+
+        SetBusy(true);
+        ResultPanel.Visibility = Visibility.Collapsed;
+        StatusText.Text = $"Reparando índices de \"{db.Name}\" (sem perda de dados)...";
+        try
+        {
+            var result = await _repairService.RebuildIndexesAsync(db, _connectionString, _progress, _cts!.Token);
+            HandleRepairResult(db, result);
+            StatusText.Text = result.Message;
+        }
+        catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
+        catch (Exception ex)
+        {
+            StatusText.Text = "Falha ao reparar índices.";
+            ShowError("Não foi possível reparar os índices.", ex);
+        }
+        finally
+        {
+            SetBusy(false);
+            RefreshStateLabels(db);
+        }
+    }
+
+    // ------------------------------------------------------------------ Restaurar de backup
+
+    /// <summary>Exibe o painel de restauração e carrega o histórico de backups do banco (msdb).</summary>
+    private async Task ShowRestoreOptionAsync(DatabaseInfo db)
+    {
+        RestorePanel.Visibility = Visibility.Visible;
+        _backupSets.Clear();
+        try
+        {
+            var history = await _restoreService.ListBackupHistoryAsync(db.Name, _connectionString, _cts!.Token);
+            foreach (var b in history) _backupSets.Add(b);
+            BackupSourceText.Text = history.Count > 0
+                ? $"{history.Count} backup(s) no histórico (msdb). Selecione um ou escolha um arquivo .bak."
+                : "Nenhum backup no histórico. Escolha um arquivo .bak manualmente.";
+        }
+        catch
+        {
+            BackupSourceText.Text = "Não foi possível ler o histórico de backups. Escolha um arquivo .bak manualmente.";
+        }
+    }
+
+    private async void ChooseBackupButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_busy) return;
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+
+        var dialog = new OpenFileDialog
+        {
+            Title = "Escolher arquivo de backup",
+            Filter = "Backup do SQL Server (*.bak;*.trn)|*.bak;*.trn|Todos os arquivos (*.*)|*.*"
+        };
+        if (dialog.ShowDialog(this) != true) return;
+
+        SetBusy(true);
+        StatusText.Text = "Lendo o arquivo de backup...";
+        try
+        {
+            var sets = await _restoreService.ListBackupSetsInFileAsync(dialog.FileName, _connectionString, _cts!.Token);
+            _backupSets.Clear();
+            foreach (var s in sets) _backupSets.Add(s);
+            BackupSourceText.Text = $"Arquivo: {dialog.FileName} — {sets.Count} conjunto(s).";
+            StatusText.Text = $"{sets.Count} conjunto(s) de backup encontrados.";
+        }
+        catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
+        catch (Exception ex)
+        {
+            StatusText.Text = "Falha ao ler o backup.";
+            ShowError("Não foi possível ler o arquivo de backup.", ex);
+        }
+        finally { SetBusy(false); }
+    }
+
+    private void RestoreButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+        if (BackupSetsList.SelectedItem is not BackupSetInfo set)
+        {
+            ShowError("Selecione um conjunto de backup na lista.", new InvalidOperationException("Nenhum backup selecionado."));
+            return;
+        }
+
+        var confirm = MessageBox.Show(
+            $"Restaurar o banco \"{db.Name}\" a partir do backup selecionado?\n\n" +
+            $"{set.Display}\n\n" +
+            (RestoreReplaceCheck.IsChecked == true
+                ? "O banco atual será SUBSTITUÍDO (REPLACE) pelos dados do backup."
+                : "A restauração falhará se o banco já existir (REPLACE desmarcado).") +
+            "\n\nDeseja continuar?",
+            "Confirmar restauração", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+
+        if (confirm == MessageBoxResult.Yes)
+            _ = RunRestoreAsync(db, set);
+    }
+
+    private async Task RunRestoreAsync(DatabaseInfo db, BackupSetInfo set)
+    {
+        if (_busy) return;
+
+        SetBusy(true);
+        ResultPanel.Visibility = Visibility.Collapsed;
+        StatusText.Text = $"Restaurando \"{db.Name}\"...";
+        try
+        {
+            var request = new RestoreRequest
+            {
+                DatabaseName = db.Name,
+                Replace = RestoreReplaceCheck.IsChecked == true,
+                Pieces =
+                {
+                    new RestorePiece
+                    {
+                        DiskPath = set.PhysicalDevice,
+                        Position = set.Position,
+                        IsLog = string.Equals(set.BackupTypeCode, "L", StringComparison.OrdinalIgnoreCase)
+                    }
+                }
+            };
+            var result = await _restoreService.RestoreDatabaseAsync(request, _connectionString, _progress, _cts!.Token);
+            HandleRepairResult(db, result);
+            StatusText.Text = result.Message;
+        }
+        catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
+        catch (Exception ex)
+        {
+            StatusText.Text = "Falha na restauração.";
+            ShowError("Não foi possível restaurar o banco.", ex);
+        }
+        finally
+        {
+            SetBusy(false);
+            RefreshStateLabels(db);
+        }
+    }
+
+    // ------------------------------------------------------------------ Ver script (dry-run)
+
+    private void ViewScriptButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+        var script = RepairService.BuildPlannedScript(db, allowDataLoss: true);
+        var window = new Window
+        {
+            Title = $"Script planejado — {db.Name}",
+            Width = 720, Height = 480, Owner = this,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Content = new TextBox
+            {
+                Text = script,
+                IsReadOnly = true,
+                FontFamily = new System.Windows.Media.FontFamily("Consolas"),
+                FontSize = 12,
+                AcceptsReturn = true,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+                Margin = new Thickness(8)
+            }
+        };
+        window.ShowDialog();
+    }
+
+    // ------------------------------------------------------------------ Exportar relatório
+
+    private void ExportReportButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_logEntries.Count == 0)
+        {
+            StatusText.Text = "Nada a exportar (o registro está vazio).";
+            return;
+        }
+        var dialog = new SaveFileDialog
+        {
+            Title = "Exportar relatório",
+            Filter = "Página HTML (*.html)|*.html",
+            FileName = $"RestoreDB_{DateTime.Now:yyyyMMdd_HHmmss}.html"
+        };
+        if (dialog.ShowDialog(this) != true) return;
+        try
+        {
+            _reportService.SaveHtmlReport(_logEntries, _serverName, dialog.FileName);
+            StatusText.Text = "Relatório exportado: " + dialog.FileName;
+        }
+        catch (Exception ex)
+        {
+            ShowError("Não foi possível exportar o relatório.", ex);
+        }
+    }
+
+    // ------------------------------------------------------------------ Cancelar
+
+    private void CancelButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_cts is { IsCancellationRequested: false })
+        {
+            _cts.Cancel();
+            StatusText.Text = "Cancelando...";
         }
     }
 
@@ -245,7 +496,7 @@ public partial class MainWindow : Window
 
         try
         {
-            var result = await _repairService.RepairAsync(db, _connectionString, allowDataLoss, _progress);
+            var result = await _repairService.RepairAsync(db, _connectionString, allowDataLoss, _progress, _cts!.Token);
             HandleRepairResult(db, result);
             StatusText.Text = result.Message;
         }
@@ -302,6 +553,10 @@ public partial class MainWindow : Window
                 SafeRepairPanel.Visibility = Visibility.Collapsed;
                 DataLossPanel.Visibility = Visibility.Collapsed;
                 LogRebuildPanel.Visibility = Visibility.Collapsed;
+                IndexRepairPanel.Visibility = Visibility.Collapsed;
+                RestorePanel.Visibility = Visibility.Collapsed;
+                TopologyWarnPanel.Visibility = Visibility.Collapsed;
+                ViewScriptButton.Visibility = Visibility.Collapsed;
                 HealthyPanel.Visibility = db.IsHealthy ? Visibility.Visible : Visibility.Collapsed;
                 break;
 
@@ -359,7 +614,7 @@ public partial class MainWindow : Window
 
         try
         {
-            var result = await _repairService.RebuildTransactionLogAsync(db, _connectionString, _progress);
+            var result = await _repairService.RebuildTransactionLogAsync(db, _connectionString, _progress, _cts!.Token);
             HandleRepairResult(db, result);
             if (result.Status == RepairStatus.Success)
                 LogRebuildPanel.Visibility = Visibility.Collapsed;
@@ -395,16 +650,28 @@ public partial class MainWindow : Window
     {
         _busy = busy;
 
+        if (busy)
+        {
+            _cts?.Dispose();
+            _cts = new CancellationTokenSource();
+        }
+
         RefreshButton.IsEnabled = !busy;
         ReconnectButton.IsEnabled = !busy;
         ClearLogButton.IsEnabled = !busy;
+        ExportReportButton.IsEnabled = !busy;
         DatabasesGrid.IsEnabled = !busy;
+        CancelButton.IsEnabled = busy;
 
         var db = DatabasesGrid.SelectedItem as DatabaseInfo;
         DiagnoseButton.IsEnabled = !busy && db is { IsProblematic: true };
         SafeRepairButton.IsEnabled = !busy && db is { IsProblematic: true };
         DataLossRepairButton.IsEnabled = !busy && DataLossConfirmCheck.IsChecked == true;
         LogRebuildButton.IsEnabled = !busy && LogRebuildConfirmCheck.IsChecked == true;
+        RepairIndexesButton.IsEnabled = !busy;
+        ChooseBackupButton.IsEnabled = !busy;
+        RestoreButton.IsEnabled = !busy;
+        ViewScriptButton.IsEnabled = !busy;
 
         RepairBusyBar.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
     }

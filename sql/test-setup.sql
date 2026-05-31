@@ -71,3 +71,27 @@ GO
    (.mdf/.ldf), o que NÃO deve ser simulado em ambientes compartilhados. O fluxo
    de REPAIR_ALLOW_DATA_LOSS é acionado pela ferramenta apenas quando o reparo
    seguro não resolve, e sempre com confirmação explícita do usuário. */
+
+
+/* ----------------------------------------------------------------------------
+   CENÁRIO 4 — RESTAURAR DE BACKUP (testa o novo fluxo de restauração)
+   ---------------------------------------------------------------------------- */
+-- Gere um backup completo para testar a restauração na ferramenta:
+BACKUP DATABASE [Faturamento_Teste]
+    TO DISK = N'Faturamento_Teste_full.bak' WITH INIT, COPY_ONLY, NAME = N'Teste full';
+-- Na ferramenta: diagnostique o banco, abra "RESTAURAR DE BACKUP", escolha o .bak
+-- (ou selecione no histórico) e restaure com REPLACE.
+GO
+
+
+/* ----------------------------------------------------------------------------
+   CENÁRIO 5 — Pré-requisitos (testa as pré-checagens)
+   ---------------------------------------------------------------------------- */
+-- Conecte-se com um login NÃO sysadmin: a ferramenta deve avisar antes de prosseguir.
+-- Conecte-se com autenticação do Windows: marque a caixa na tela de conexão.
+--
+-- Reparo SEM perda (índices): a ferramenta detecta automaticamente, via
+-- DBCC CHECKDB ... WITH TABLERESULTS, quando a corrupção está apenas em índices
+-- NÃO clusterizados (index_id > 1) e oferece "Reparar índices (sem perda de dados)".
+-- Isso exige corrupção física real e, portanto, não é simulável com segurança aqui.
+GO

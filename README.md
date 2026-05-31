@@ -7,6 +7,22 @@ Faturamento**, com linguagem acessível a usuários leigos.
 
 Todo o T-SQL é **compatível com SQL Server 2008 R2** (e versões superiores).
 
+**Recursos principais:**
+
+- **Diagnóstico autoritativo** (somente leitura): `msdb.dbo.suspect_pages`,
+  `DBCC CHECKDB ... WITH TABLERESULTS` (estruturado), log de erros, topologia,
+  espaço em disco e `PAGE_VERIFY`.
+- **Escalonamento de reparo** do menos ao mais agressivo, **sempre primeiro SEM perda de dados**.
+- **Reparo SEM perda quando a corrupção está só em índices não-clusterizados**
+  (reconstrói os índices em vez de descartar dados).
+- **Restaurar de backup** (full/diferencial/log), incluindo **restauração de página**
+  e correção de usuários órfãos — o caminho correto para corrupção de dados.
+- **Guarda de topologia**: bloqueia reparo destrutivo em bancos espelhados, em Always On,
+  log shipping ou replicação.
+- **Reconstrução do log de transações** como último recurso.
+- **Autenticação SQL ou Windows**, **pré-checagem de sysadmin/edição**, **botão Cancelar**,
+  **exportação de relatório (HTML)** e **pré-visualização do script (dry-run)**.
+
 ---
 
 ## Arquitetura (em camadas)
@@ -25,15 +41,21 @@ src/
 │
 ├─ RestoreDB.Services/      Lógica + validações
 │   ├─ ConnectionService.cs             Validação e tradução de erros de conexão
+│   ├─ ServerService.cs                 Capacidades da instância + pré-checagem (sysadmin/edição)
 │   ├─ DatabaseService.cs               Listagem de bancos
-│   ├─ RepairService.cs                 Orquestração do reparo (escalonamento)
+│   ├─ RepairService.cs                 Orquestração do reparo + diagnóstico (escalonamento)
+│   ├─ RestoreService.cs                Restauração de backup (full/diff/log, página, usuários órfãos)
+│   ├─ ReportService.cs                 Exportação do relatório da sessão (HTML)
 │   └─ LogService.cs                    Log em arquivo (timestamp, thread-safe)
 │
 └─ RestoreDB.App/           WPF (View + code-behind, SEM MVVM)
     ├─ App.xaml                         Estilos/recursos globais
-    ├─ Views/ConnectionWindow.xaml      Tela de conexão
-    ├─ Views/MainWindow.xaml            Listagem + reparo + log ao vivo
+    ├─ Views/ConnectionWindow.xaml      Tela de conexão (SQL ou Windows auth)
+    ├─ Views/MainWindow.xaml            Listagem + diagnóstico + reparo + restore + log ao vivo
     └─ Converters/                      Cores do log por nível
+
+tests/
+└─ RestoreDB.Tests/         xUnit — testes de lógica pura (sem banco)
 ```
 
 - **ADO.NET puro** (sem ORM).
@@ -49,15 +71,18 @@ Pré-requisito: **.NET 10 SDK** (Windows).
 ```powershell
 dotnet build RestoreDB.slnx
 dotnet run --project src/RestoreDB.App
+dotnet test RestoreDB.slnx          # testes de lógica (xUnit)
 ```
 
 ---
 
 ## Fluxo de uso
 
-1. **Conexão** — informe *Servidor*, *Usuário* e *Senha*. Os demais parâmetros
-   (timeout, criptografia, *application name*, catálogo `master`, pooling) são
-   **constantes** em `AppConstants`. O botão **Conectar** valida e segue.
+1. **Conexão** — informe *Servidor* e, no modo SQL, *Usuário* e *Senha*; ou marque
+   **"Usar autenticação do Windows"**. Os demais parâmetros (timeout, criptografia,
+   *application name*, catálogo `master`, pooling) são **constantes** em `AppConstants`.
+   Ao conectar, a ferramenta faz uma **pré-checagem**: avisa se o login **não é sysadmin**
+   ou se a instância é **Azure SQL Database** (onde o reparo local não se aplica).
 2. **Listagem** — todos os bancos e seus `state_desc` (de `sys.databases`).
    Os bancos problemáticos ficam **destacados em vermelho**.
 3. **Diagnóstico (1ª etapa)** — ao selecionar um banco problemático, a **única**
@@ -74,20 +99,28 @@ dotnet run --project src/RestoreDB.App
 
 ---
 
-## Diagnóstico (DADOS × LOG) — somente leitura
+## Diagnóstico — somente leitura
 
 Para qualquer banco problemático há o botão **"Diagnosticar (sem alterar o banco)"**.
-Ele lê o **log de erros do SQL Server** (`sp_readerrorlog`) e os arquivos de
-`sys.master_files` e conclui, **sem modificar nada**, se a corrupção está nos
-arquivos de **DADOS** (`.mdf`/`.ndf`) ou no **LOG de transações** (`.ldf`):
+Sem modificar nada, ele cruza **fontes autoritativas** e recomenda o melhor caminho:
 
-- erros de E/S / checksum / *file activation* referenciando o `.ldf` ⇒ **log corrompido**
-  (os dados tendem a estar íntegros) ⇒ recomenda **reconstruir o log**;
-- erros referenciando `.mdf`/`.ndf` ⇒ **dados corrompidos** ⇒ recomenda **restaurar de backup**.
+- **`msdb.dbo.suspect_pages`** — lista oficial de páginas corrompidas (erros 823/824/825);
+- **`DBCC CHECKDB ... WITH TABLERESULTS`** (estruturado) — identifica **objeto e índice**
+  afetados e o **nível mínimo de reparo**; resolve nomes de tabela/índice para leitura;
+- **log de erros** (`sp_readerrorlog`, vários arquivos) — discrimina **DADOS** (`.mdf`/`.ndf`)
+  × **LOG** (`.ldf`) pelo nome físico do arquivo (independe de idioma) e detecta **9002**
+  (log cheio) e **823/824/825** (E/S);
+- **topologia** (espelhamento/Always On/log shipping/replicação);
+- **espaço em disco** dos volumes do banco (`sys.dm_os_volume_stats`);
+- **`PAGE_VERIFY`** — recomenda `CHECKSUM` quando estiver `NONE`/`TORN_PAGE_DETECTION`.
 
-A detecção é tolerante a idioma (palavras-chave EN/PT) e usa o **nome físico do arquivo**
-como discriminador (independe de idioma). Quando conclui que o log está corrompido, a UI
-já destaca a opção de reconstrução.
+A conclusão define a **ação recomendada** e a UI destaca o caminho certo:
+
+- corrupção **só em índices não-clusterizados** ⇒ **reparo SEM perda** (reconstruir índices);
+- corrupção de **dados** ⇒ **restaurar de backup** (ou **restauração de página**, se poucas);
+- corrupção de **log** ⇒ **reconstruir o log**;
+- **log cheio (9002)** ⇒ liberar espaço / `BACKUP LOG` (não é corrupção);
+- **topologia de alta disponibilidade** ⇒ alerta para tratar antes de reparar.
 
 ## Lógica de reparo (escalonamento: do menos ao mais agressivo)
 
@@ -97,7 +130,9 @@ já destaca a opção de reconstrução.
 | `RESTORING`/`RECOVERING` | `RESTORE DATABASE ... WITH RECOVERY`                                        | Não            |
 | `RECOVERY_PENDING`| Tenta `SET ONLINE`; se falhar, cai no fluxo de emergência abaixo                   | Não → (talvez) |
 | `SUSPECT`/`EMERGENCY` | `SET EMERGENCY` → `SET SINGLE_USER WITH ROLLBACK IMMEDIATE` → `DBCC CHECKDB` (diagnóstico) → `SET ONLINE` (recuperação) → `REPAIR_REBUILD` → verificação | Não |
-| ↳ se o reparo seguro não bastar | **(com confirmação)** `EMERGENCY` + `SINGLE_USER` → backup `COPY_ONLY` → `REPAIR_ALLOW_DATA_LOSS` → verificação → `MULTI_USER` | **Sim** |
+| ↳ se restar só corrupção de **índice não-clusterizado** | `ALTER INDEX ... REBUILD` (reconstrói os índices afetados) → verificação | **Não** |
+| ↳ se o reparo seguro não bastar | **(com confirmação)** `EMERGENCY` + `SINGLE_USER` → backup `COPY_ONLY` + **cópia física** dos arquivos → `REPAIR_ALLOW_DATA_LOSS` → verificação → `MULTI_USER` | **Sim** |
+| **Corrupção de dados** (recomendado) | **Restaurar de backup** (`RESTORE`/`RESTORE ... PAGE`) → corrigir usuários órfãos | Não* |
 
 > **Detalhe validado em engine real:** o SQL Server rejeita `REPAIR_REBUILD` com o
 > banco em modo `EMERGENCY` (Msg 7901). Por isso o fluxo tenta a **recuperação
@@ -145,6 +180,47 @@ Detalhes importantes:
 - Bancos de **sistema** (`master`, `model`, `msdb`, `tempdb`) **não** são
   submetidos a reparo destrutivo automático.
 
+### Reparo SEM perda de dados: índices não-clusterizados
+
+Boa parte das "corrupções" afeta apenas **índices não-clusterizados** (`index_id > 1`),
+que são **redundantes**. Quando o `DBCC CHECKDB ... WITH TABLERESULTS` confirma que **toda**
+a corrupção está nesses índices, a ferramenta os **reconstrói** (`ALTER INDEX ... REBUILD`)
+— **sem perder nenhum dado** — em vez de partir para o `REPAIR_ALLOW_DATA_LOSS`. O fluxo de
+emergência faz isso automaticamente antes de escalar, e o botão **"Reparar índices (sem perda
+de dados)"** fica disponível quando o diagnóstico identifica esse caso.
+
+### Restaurar de backup (corrupção de dados)
+
+Para corrupção nos **dados** (`.mdf`/`.ndf`), o caminho correto é **restaurar de backup** —
+`REPAIR_ALLOW_DATA_LOSS` apenas *descarta* o que está corrompido. O painel **"Restaurar de
+backup"**:
+
+- lista os backups do **histórico** (`msdb.dbo.backupset`) ou de um **arquivo `.bak`** escolhido
+  (`RESTORE HEADERONLY`);
+- **verifica** a mídia (`RESTORE VERIFYONLY`) antes de aplicar;
+- executa `RESTORE DATABASE ... WITH REPLACE` (e `MOVE`/`STOPAT` quando aplicável);
+- ao final, **corrige usuários órfãos** (reassocia ao login de mesmo nome).
+
+Também há **restauração de página** (`RESTORE ... PAGE`) para recuperar apenas as páginas
+corrompidas, preservando o restante (requer modelo de recuperação FULL e a cadeia de backups).
+
+### Segurança de topologia
+
+Antes de qualquer operação destrutiva (`SET EMERGENCY`/`SINGLE_USER`, detach, `RESTORE`),
+a ferramenta detecta **espelhamento**, **Always On (AG)**, **log shipping** e **replicação**.
+Se o banco participar de alguma dessas configurações, o reparo destrutivo é **bloqueado** com
+orientação (fazer *failover*, remover do AG/espelhamento, desativar log shipping/replicação),
+evitando quebrar a topologia. Bancos com **FILESTREAM/full-text** também não entram na
+reconstrução de log por detach/attach.
+
+### Pré-checagens, cancelamento e relatório
+
+- **Pré-checagem na conexão**: avisa se o login **não é sysadmin** ou se é **Azure SQL Database**.
+- **Botão Cancelar**: interrompe a operação em andamento (propaga `CancellationToken`).
+- **Ver script planejado (dry-run)**: mostra o T-SQL que *seria* executado, sem executar nada
+  — útil para revisão por DBA ou execução manual em servidor remoto.
+- **Exportar relatório (HTML)**: salva o registro da sessão para anexar a um chamado.
+
 Os comandos exatos estão em [`sql/repair-scripts.sql`](sql/repair-scripts.sql).
 Cenários de teste seguros em [`sql/test-setup.sql`](sql/test-setup.sql).
 
@@ -167,4 +243,19 @@ Cenários de teste seguros em [`sql/test-setup.sql`](sql/test-setup.sql).
 
 `Microsoft.Data.SqlClient` é configurado com `Encrypt=Optional`
 (`SqlConnectionEncryptOption.Optional`) e `TrustServerCertificate=True` para
-compatibilidade com o TLS de servidores antigos (2008 R2).
+compatibilidade com o TLS de servidores antigos (2008 R2). É possível usar
+**autenticação SQL** (Usuário/Senha) ou **autenticação do Windows**
+(`Integrated Security`), escolhida na tela de conexão.
+
+---
+
+## Testes
+
+O projeto [`tests/RestoreDB.Tests`](tests/RestoreDB.Tests) (xUnit) cobre a **lógica pura**
+(sem necessidade de um SQL Server): montagem da *connection string* (SQL × Windows auth),
+geração do script planejado (*dry-run*), classificação de corrupção só-índice
+(`CheckDbReport`), detecção de topologia/disco e os utilitários de domínio.
+
+```powershell
+dotnet test RestoreDB.slnx
+```

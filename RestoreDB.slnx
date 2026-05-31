@@ -5,4 +5,7 @@
     <Project Path="src/RestoreDB.Domain/RestoreDB.Domain.csproj" />
     <Project Path="src/RestoreDB.Services/RestoreDB.Services.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/RestoreDB.Tests/RestoreDB.Tests.csproj" />
+  </Folder>
 </Solution>

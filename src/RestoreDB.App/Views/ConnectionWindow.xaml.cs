@@ -7,12 +7,20 @@ namespace RestoreDB.App.Views;
 public partial class ConnectionWindow : Window
 {
     private readonly ConnectionService _connectionService = new();
+    private readonly ServerService _serverService = new();
     private bool _busy;
 
     public ConnectionWindow()
     {
         InitializeComponent();
         Loaded += (_, _) => ServerBox.Focus();
+    }
+
+    private void WindowsAuthCheck_Changed(object sender, RoutedEventArgs e)
+    {
+        var sql = WindowsAuthCheck.IsChecked != true;
+        UserLabel.IsEnabled = UserBox.IsEnabled = sql;
+        PasswordLabel.IsEnabled = PasswordBox.IsEnabled = sql;
     }
 
     private async void ConnectButton_Click(object sender, RoutedEventArgs e)
@@ -23,7 +31,8 @@ public partial class ConnectionWindow : Window
         {
             Server = ServerBox.Text,
             User = UserBox.Text,
-            Password = PasswordBox.Password
+            Password = PasswordBox.Password,
+            UseWindowsAuth = WindowsAuthCheck.IsChecked == true
         };
 
         SetBusy(true);
@@ -32,7 +41,23 @@ public partial class ConnectionWindow : Window
         {
             var connectionString = await _connectionService.ConnectAsync(info);
 
-            var main = new MainWindow(connectionString, info.Server.Trim());
+            // Pré-checagem de capacidades (versão, edição, sysadmin).
+            var serverInfo = await _serverService.GetServerInfoAsync(connectionString);
+            var warning = ServerService.PreflightWarning(serverInfo);
+            if (warning is not null)
+            {
+                var proceed = MessageBox.Show(
+                    warning + "\n\nDeseja continuar mesmo assim?",
+                    "RestoreDB — Aviso de pré-requisito",
+                    MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+                if (proceed != MessageBoxResult.Yes)
+                {
+                    SetBusy(false);
+                    return;
+                }
+            }
+
+            var main = new MainWindow(connectionString, info.Server.Trim(), serverInfo);
             Application.Current.MainWindow = main;
             main.Show();
             Close();
@@ -54,10 +79,14 @@ public partial class ConnectionWindow : Window
     private void SetBusy(bool busy)
     {
         _busy = busy;
+        var sqlAuth = WindowsAuthCheck.IsChecked != true;
         ConnectButton.IsEnabled = !busy;
         ServerBox.IsEnabled = !busy;
-        UserBox.IsEnabled = !busy;
-        PasswordBox.IsEnabled = !busy;
+        WindowsAuthCheck.IsEnabled = !busy;
+        UserBox.IsEnabled = !busy && sqlAuth;
+        PasswordBox.IsEnabled = !busy && sqlAuth;
+        UserLabel.IsEnabled = !busy && sqlAuth;
+        PasswordLabel.IsEnabled = !busy && sqlAuth;
         BusyBar.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
         ConnectButton.Content = busy ? "Conectando..." : "Conectar";
     }

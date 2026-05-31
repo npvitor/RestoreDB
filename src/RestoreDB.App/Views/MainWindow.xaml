@@ -28,6 +28,8 @@
                     <TextBlock x:Name="ServerInfoText" Foreground="{StaticResource MutedTextBrush}" FontSize="12" Margin="0,2,0,0" />
                 </StackPanel>
                 <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Button x:Name="CancelButton" Content="Cancelar" Style="{StaticResource DangerButton}"
+                            Click="CancelButton_Click" Margin="0,0,8,0" IsEnabled="False" />
                     <Button x:Name="RefreshButton" Content="Atualizar lista" Style="{StaticResource SecondaryButton}"
                             Click="RefreshButton_Click" Margin="0,0,8,0" />
                     <Button x:Name="ReconnectButton" Content="Trocar conexão" Style="{StaticResource SecondaryButton}"
@@ -130,6 +132,30 @@
                                 </StackPanel>
                             </Border>
 
+                            <!-- Aviso de topologia (espelhamento/AG/log shipping/replicação) -->
+                            <Border x:Name="TopologyWarnPanel" Visibility="Collapsed" Margin="0,12,0,0"
+                                    Background="#FFF6E5" BorderBrush="#B56A00" BorderThickness="1" CornerRadius="6" Padding="12">
+                                <StackPanel>
+                                    <TextBlock Text="⚠ TOPOLOGIA DE ALTA DISPONIBILIDADE / REPLICAÇÃO"
+                                               FontWeight="Bold" Foreground="#8A5200" TextWrapping="Wrap" />
+                                    <TextBlock x:Name="TopologyWarnText" Foreground="#8A5200" TextWrapping="Wrap" Margin="0,6,0,0" />
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Reparo SEM perda: reconstrução de índices (quando aplicável) -->
+                            <Border x:Name="IndexRepairPanel" Visibility="Collapsed" Margin="0,12,0,0"
+                                    Background="#E7F3EA" BorderBrush="#1B7A2F" BorderThickness="1" CornerRadius="6" Padding="12">
+                                <StackPanel>
+                                    <TextBlock Text="✔ REPARO SEM PERDA DE DADOS DISPONÍVEL" FontWeight="Bold"
+                                               Foreground="#1B7A2F" TextWrapping="Wrap" />
+                                    <TextBlock Text="A corrupção está restrita a índices não-clusterizados, que podem ser reconstruídos sem perder dados."
+                                               Foreground="#1B7A2F" TextWrapping="Wrap" Margin="0,6,0,0" />
+                                    <Button x:Name="RepairIndexesButton" Content="Reparar índices (sem perda de dados)"
+                                            Style="{StaticResource FlatButton}" Height="42" Margin="0,10,0,0"
+                                            Click="RepairIndexesButton_Click" />
+                                </StackPanel>
+                            </Border>
+
                             <!-- Cabeçalho das opções de reparo (aparece só após o diagnóstico) -->
                             <TextBlock x:Name="SafeRepairTitle" Visibility="Collapsed" Text="OPÇÕES DE REPARO"
                                        Style="{StaticResource FieldLabel}" Margin="0,20,0,0" />
@@ -140,6 +166,29 @@
                                         Style="{StaticResource FlatButton}" Height="44" Click="SafeRepairButton_Click" />
                                 <TextBlock Text="Tentaremos primeiro a abordagem mais segura: religar / recuperar e, se necessário, DBCC CHECKDB com REPAIR_REBUILD."
                                            Foreground="{StaticResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,8,0,0" />
+                            </StackPanel>
+
+                            <!-- Ver script planejado (dry-run) -->
+                            <Button x:Name="ViewScriptButton" Visibility="Collapsed" Content="Ver script planejado (não executa nada)"
+                                    Style="{StaticResource SecondaryButton}" Height="34" Margin="0,10,0,0"
+                                    Click="ViewScriptButton_Click" />
+
+                            <!-- Restaurar de backup -->
+                            <StackPanel x:Name="RestorePanel" Visibility="Collapsed" Margin="0,18,0,0">
+                                <TextBlock Text="RESTAURAR DE BACKUP" Style="{StaticResource FieldLabel}" />
+                                <TextBlock Text="Caminho correto quando os arquivos de DADOS estão corrompidos: substitui o banco pelos dados íntegros de um backup."
+                                           Foreground="{StaticResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,8" />
+                                <Button x:Name="ChooseBackupButton" Content="Escolher arquivo .bak..."
+                                        Style="{StaticResource SecondaryButton}" Height="34" Click="ChooseBackupButton_Click" />
+                                <TextBlock x:Name="BackupSourceText" Foreground="{StaticResource MutedTextBrush}" FontSize="11"
+                                           TextWrapping="Wrap" Margin="0,6,0,0" />
+                                <ListBox x:Name="BackupSetsList" Height="104" Margin="0,8,0,0"
+                                         DisplayMemberPath="Display" BorderBrush="{StaticResource LineBrush}" BorderThickness="1" />
+                                <CheckBox x:Name="RestoreReplaceCheck" Content="Substituir o banco existente (REPLACE)"
+                                          IsChecked="True" Margin="0,8,0,0" />
+                                <Button x:Name="RestoreButton" Content="Restaurar o backup selecionado"
+                                        Style="{StaticResource FlatButton}" Height="42" Margin="0,10,0,0"
+                                        Click="RestoreButton_Click" />
                             </StackPanel>
 
                             <!-- Reparo com perda de dados (confirmação) -->
@@ -210,9 +259,13 @@
                     <Grid>
                         <TextBlock Text="Registro de operações" FontWeight="SemiBold"
                                    Foreground="{StaticResource PrimaryDarkBrush}" VerticalAlignment="Center" />
-                        <Button x:Name="ClearLogButton" Content="Limpar" HorizontalAlignment="Right"
-                                Style="{StaticResource SecondaryButton}" Padding="10,3" FontSize="12"
-                                Click="ClearLogButton_Click" />
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                            <Button x:Name="ExportReportButton" Content="Exportar relatório" Style="{StaticResource SecondaryButton}"
+                                    Padding="10,3" FontSize="12" Margin="0,0,8,0" Click="ExportReportButton_Click" />
+                            <Button x:Name="ClearLogButton" Content="Limpar"
+                                    Style="{StaticResource SecondaryButton}" Padding="10,3" FontSize="12"
+                                    Click="ClearLogButton_Click" />
+                        </StackPanel>
                     </Grid>
                 </Border>
                 <ListBox x:Name="LogList" Grid.Row="1" BorderThickness="0" Background="Transparent"

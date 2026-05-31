@@ -15,8 +15,6 @@ public sealed class SqlDataAccess
         var builder = new SqlConnectionStringBuilder
         {
             DataSource = info.Server.Trim(),
-            UserID = info.User.Trim(),
-            Password = info.Password,
             InitialCatalog = AppConstants.DefaultCatalog,
             ConnectTimeout = AppConstants.ConnectTimeoutSeconds,
             // Optional => Encrypt=False: necessário para SQL Server 2008 R2 (TLS antigo).
@@ -27,6 +25,17 @@ public sealed class SqlDataAccess
             MaxPoolSize = AppConstants.MaxPoolSize,
             MultipleActiveResultSets = false
         };
+
+        if (info.UseWindowsAuth)
+        {
+            builder.IntegratedSecurity = true;
+        }
+        else
+        {
+            builder.UserID = info.User.Trim();
+            builder.Password = info.Password;
+        }
+
         return builder.ConnectionString;
     }
 
@@ -69,6 +78,47 @@ ORDER BY CASE WHEN d.state <> 0 THEN 0 ELSE 1 END, d.name;";
             });
         }
         return list;
+    }
+
+    /// <summary>
+    /// Coleta informações da instância (versão, edição, se o login é sysadmin) logo após a
+    /// conexão. Best-effort para campos que não existem em todas as edições/versões.
+    /// </summary>
+    public async Task<ServerInfo> GetServerInfoAsync(string connectionString, CancellationToken ct = default)
+    {
+        const string sql = @"
+SELECT  CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128))      AS ProductVersion,
+        CAST(SERVERPROPERTY('ProductLevel')   AS nvarchar(128))      AS ProductLevel,
+        CAST(SERVERPROPERTY('Edition')        AS nvarchar(256))      AS Edition,
+        CAST(ISNULL(SERVERPROPERTY('EngineEdition'), 0) AS int)      AS EngineEdition,
+        CAST(SERVERPROPERTY('MachineName')    AS nvarchar(256))      AS MachineName,
+        CAST(ISNULL(IS_SRVROLEMEMBER('sysadmin'), 0) AS int)         AS IsSysadmin,
+        @@VERSION                                                    AS FullVersion;";
+
+        await using var conn = new SqlConnection(connectionString);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+        if (!await reader.ReadAsync(ct))
+            return new ServerInfo();
+
+        var productVersion = reader.IsDBNull(0) ? string.Empty : reader.GetString(0);
+        var major = 0;
+        var dot = productVersion.IndexOf('.');
+        if (dot > 0) int.TryParse(productVersion[..dot], out major);
+
+        return new ServerInfo
+        {
+            ProductVersion = productVersion,
+            ProductLevel = reader.IsDBNull(1) ? string.Empty : reader.GetString(1),
+            Edition = reader.IsDBNull(2) ? string.Empty : reader.GetString(2),
+            EngineEdition = reader.IsDBNull(3) ? 0 : reader.GetInt32(3),
+            MachineName = reader.IsDBNull(4) ? string.Empty : reader.GetString(4),
+            IsSysadmin = !reader.IsDBNull(5) && reader.GetInt32(5) == 1,
+            FullVersionText = reader.IsDBNull(6) ? string.Empty : reader.GetString(6),
+            MajorVersion = major
+        };
     }
 
     /// <summary>Abre uma sessão (conexão única) para a sequência de reparo.</summary>
