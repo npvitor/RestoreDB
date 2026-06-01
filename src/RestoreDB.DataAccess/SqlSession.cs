@@ -86,6 +86,24 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         return value as string ?? "DESCONHECIDO";
     }
 
+    /// <summary>
+    /// Remove as entradas de msdb.dbo.suspect_pages do banco após um reparo bem-sucedido e
+    /// verificado. Necessário porque o SQL Server não limpa essa tabela automaticamente quando
+    /// a corrupção é resolvida fora do DBCC repair (ex.: reconstrução de índice). Best-effort.
+    /// </summary>
+    public async Task ClearSuspectPagesAsync(string databaseName, CancellationToken ct = default)
+    {
+        try
+        {
+            await using var cmd = new SqlCommand(
+                "DELETE FROM msdb.dbo.suspect_pages WHERE database_id = DB_ID(@db);", _connection)
+            { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        catch { /* best-effort */ }
+    }
+
     /// <summary>Lê a opção PAGE_VERIFY do banco (NONE / TORN_PAGE_DETECTION / CHECKSUM). Best-effort.</summary>
     public async Task<string> GetPageVerifyOptionAsync(string databaseName, CancellationToken ct = default)
     {

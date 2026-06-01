@@ -26,7 +26,14 @@ internal static class It
     public static string User => Environment.GetEnvironmentVariable("RESTOREDB_IT_USER") ?? "sa";
     public static string Pass => Environment.GetEnvironmentVariable("RESTOREDB_IT_PASS") ?? string.Empty;
 
-    public static ConnectionInfo Info => new() { Server = Server, User = User, Password = Pass };
+    /// <summary>Usa autenticação do Windows quando RESTOREDB_IT_USE_WINDOWS=1 ou quando não há usuário.</summary>
+    public static bool UseWindowsAuth =>
+        Environment.GetEnvironmentVariable("RESTOREDB_IT_USE_WINDOWS") == "1"
+        || string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("RESTOREDB_IT_USER"));
+
+    public static ConnectionInfo Info => UseWindowsAuth
+        ? new() { Server = Server, UseWindowsAuth = true }
+        : new() { Server = Server, User = User, Password = Pass };
     public static string Conn => new SqlDataAccess().BuildConnectionString(Info);
 
     /// <summary>Progresso no-op para passar aos serviços (eles relatam via IProgress).</summary>

@@ -96,6 +96,7 @@ public sealed class RestoreService
         if (finalState.Equals("ONLINE", StringComparison.OrdinalIgnoreCase))
         {
             await FixOrphanedUsersAsync(session, db, progress, ct);
+            await session.ClearSuspectPagesAsync(db, ct);
             result.Status = RepairStatus.Success;
             result.Message = $"Restauração concluída. Banco ONLINE.";
             Report(progress, db, RepairLogLevel.Success, result.Message);

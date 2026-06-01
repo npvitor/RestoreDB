@@ -159,10 +159,25 @@ public sealed class RepairService
                 Report(progress, db.Name, RepairLogLevel.Warning,
                     $"DISCO BAIXO: volume {d.VolumeMountPoint} com {d.AvailableGb:0.0} GB livres ({d.PercentFree:0.#}%).");
 
-            // Páginas suspeitas (fonte autoritativa de corrupção).
+            // DBCC CHECKDB estruturado (somente leitura) — é a VERDADE do momento; roda antes de
+            // interpretar as páginas suspeitas (que são um registro histórico).
+            await TryStructuredCheckDbAsync(session, db, diag, progress, ct);
+            var checkDbClean = diag.CheckDb is { Executed: true, HasErrors: false };
+
+            // Páginas suspeitas (msdb.dbo.suspect_pages). Reconciliadas com o CHECKDB: se o CHECKDB
+            // está limpo, as entradas referem-se a corrupção JÁ RESOLVIDA (o SQL Server não as
+            // remove automaticamente). Só são "corrupção ativa" se o CHECKDB também acusar (ou não
+            // tiver conseguido rodar). Isso evita falso positivo após um reparo.
             diag.SuspectPages.AddRange(await session.GetSuspectPagesAsync(db.Name, ct));
             var active = diag.SuspectPages.Where(p => p.IsActiveCorruption).ToList();
-            if (active.Count > 0)
+            if (active.Count > 0 && checkDbClean)
+            {
+                Report(progress, db.Name, RepairLogLevel.Info,
+                    $"msdb.suspect_pages tem {active.Count} registro(s) histórico(s), mas o CHECKDB está limpo — corrupção já resolvida. Limpando o histórico.");
+                await session.ClearSuspectPagesAsync(db.Name, ct);
+                diag.SuspectPages.Clear();
+            }
+            else if (active.Count > 0)
             {
                 diag.DataCorruptionSuspected = true;
                 Report(progress, db.Name, RepairLogLevel.Warning,
@@ -172,9 +187,6 @@ public sealed class RepairService
                         $"  • arquivo {p.FileId}, página {p.PageId} — {p.EventTypeDescription} (x{p.ErrorCount})");
             }
 
-            // DBCC CHECKDB estruturado (somente leitura) — quando o banco está acessível.
-            await TryStructuredCheckDbAsync(session, db, diag, progress, ct);
-
             var logNames = files.Where(f => f.IsLog).Select(f => Path.GetFileName(f.PhysicalName))
                                 .Where(n => !string.IsNullOrEmpty(n)).ToList();
             var dataNames = files.Where(f => f.IsData).Select(f => Path.GetFileName(f.PhysicalName))
@@ -183,10 +195,14 @@ public sealed class RepairService
             Report(progress, db.Name, RepairLogLevel.Info, "Lendo o log de erros do SQL Server (sp_readerrorlog)...");
             var lines = await session.ReadErrorLogAsync(db.Name, ct);
 
+            // O log de erros também é HISTÓRICO. Se o CHECKDB ao vivo está limpo, as linhas de
+            // corrupção referem-se a um problema JÁ RESOLVIDO — não devem disparar os flags de
+            // corrupção ativa (evita falso positivo após um reparo). Coletamos como evidência
+            // apenas para transparência.
             foreach (var line in lines)
             {
-                if (ContainsAny(line, "9002")) diag.LogFull = true;
-                if (ContainsAny(line, " 823", " 824", " 825", "823,", "824,", "825,")) diag.IoErrors = true;
+                if (!checkDbClean && ContainsAny(line, "9002")) diag.LogFull = true;
+                if (!checkDbClean && ContainsAny(line, " 823", " 824", " 825", "823,", "824,", "825,")) diag.IoErrors = true;
 
                 if (!LooksLikeCorruptionLine(line)) continue;
 
@@ -197,14 +213,19 @@ public sealed class RepairService
                               || line.Contains(".ndf", StringComparison.OrdinalIgnoreCase);
 
                 diag.Evidence.Add(line);
-                if (refLog) diag.LogCorruptionSuspected = true;
-                if (refData) diag.DataCorruptionSuspected = true;
+                if (!checkDbClean && refLog) diag.LogCorruptionSuspected = true;
+                if (!checkDbClean && refData) diag.DataCorruptionSuspected = true;
             }
 
             BuildConclusion(diag);
 
-            foreach (var e in diag.Evidence.Take(8))
-                Report(progress, db.Name, RepairLogLevel.Warning, "  • " + e);
+            if (checkDbClean && diag.Evidence.Count > 0)
+                Report(progress, db.Name, RepairLogLevel.Info,
+                    $"O log de erros tem {diag.Evidence.Count} entrada(s) de corrupção ANTIGA(s), mas o CHECKDB está limpo — já resolvida(s).");
+            else
+                foreach (var e in diag.Evidence.Take(8))
+                    Report(progress, db.Name, RepairLogLevel.Warning, "  • " + e);
+
             if (!diag.HasEvidence && diag.SuspectPages.Count == 0 && (diag.CheckDb is null || !diag.CheckDb.Executed))
                 Report(progress, db.Name, RepairLogLevel.Info, "Sem entradas de corrupção encontradas (ou sem permissão para lê-las).");
 
@@ -283,6 +304,16 @@ public sealed class RepairService
 
     private static void BuildConclusion(DiagnosisResult d)
     {
+        // Estado íntegro: CHECKDB ao vivo limpo e sem flags ativas (histórico já reconciliado).
+        if (d.CheckDb is { Executed: true, HasErrors: false }
+            && !d.DataCorruptionSuspected && !d.LogCorruptionSuspected && !d.LogFull)
+        {
+            d.RecommendedAction = RecommendedActionKind.NoAction;
+            d.Summary = "Nenhuma corrupção detectada — DBCC CHECKDB íntegro.";
+            d.Recommendation = string.Empty;
+            return;
+        }
+
         var topoNote = d.Topology is { IsRisky: true }
             ? " ATENÇÃO: " + d.Topology.Summary + " Reparos destrutivos/restore podem afetar essa configuração."
             : string.Empty;
@@ -944,48 +975,89 @@ public sealed class RepairService
             return result;
         }
 
-        await RunStepAsync(session, db, progress, "Obtendo acesso exclusivo (SINGLE_USER WITH ROLLBACK IMMEDIATE)",
-            AlterDatabase(db.Name, "SET SINGLE_USER WITH ROLLBACK IMMEDIATE"), ct);
-
-        var report = await session.CheckDbWithResultsAsync(db.Name, repairOption: null, ct);
-        if (!report.Executed)
+        try
         {
-            await TrySetMultiUserAsync(session, db, progress, ct);
-            result.Status = RepairStatus.Failed;
-            result.Message = "Não foi possível analisar o banco (inacessível). Use o fluxo de reparo padrão.";
-            Report(progress, db.Name, RepairLogLevel.Error, result.Message);
+            await RunStepAsync(session, db, progress, "Obtendo acesso exclusivo (SINGLE_USER WITH ROLLBACK IMMEDIATE)",
+                AlterDatabase(db.Name, "SET SINGLE_USER WITH ROLLBACK IMMEDIATE"), ct);
+
+            var report = await session.CheckDbWithResultsAsync(db.Name, repairOption: null, ct);
+            if (!report.Executed)
+            {
+                result.Status = RepairStatus.Failed;
+                result.Message = "Não foi possível analisar o banco (inacessível). Use o fluxo de reparo padrão.";
+                Report(progress, db.Name, RepairLogLevel.Error, result.Message);
+                return result;
+            }
+            if (!report.HasErrors)
+            {
+                result.Status = RepairStatus.Success;
+                result.Message = "Nenhuma inconsistência encontrada — nada a reconstruir.";
+                Report(progress, db.Name, RepairLogLevel.Success, result.Message);
+                return result;
+            }
+            if (!report.AllErrorsAreNonClusteredIndex)
+            {
+                result.Status = RepairStatus.NeedsDataLossConfirmation;
+                result.Message = "A corrupção NÃO está restrita a índices não-clusterizados. Use o reparo padrão (e, se necessário, RESTAURAR de backup).";
+                Report(progress, db.Name, RepairLogLevel.Warning, result.Message);
+                return result;
+            }
+
+            var ok = await RebuildNonClusteredIndexesAsync(session, db, report, progress, ct);
+            var verify = await RunStepAsync(session, db, progress, "Verificação pós-reconstrução (DBCC CHECKDB)",
+                Dbcc(db.Name, repairOption: null, noInfoMsgs: true), ct);
+
+            result.Status = ok && verify.Success ? RepairStatus.Success : RepairStatus.Failed;
+            if (result.Status == RepairStatus.Success)
+            {
+                await session.ClearSuspectPagesAsync(db.Name, ct);
+                result.Message = "Índices reconstruídos com sucesso — SEM perda de dados. Banco consistente.";
+                Report(progress, db.Name, RepairLogLevel.Success, result.Message);
+            }
+            else
+            {
+                result.Message = "A reconstrução de índices não eliminou todas as inconsistências. Considere o reparo padrão.";
+                Report(progress, db.Name, RepairLogLevel.Warning, result.Message);
+            }
             return result;
         }
-        if (!report.HasErrors)
+        finally
         {
-            await TrySetMultiUserAsync(session, db, progress, ct);
-            result.Status = RepairStatus.Success;
-            result.Message = "Nenhuma inconsistência encontrada — nada a reconstruir.";
-            Report(progress, db.Name, RepairLogLevel.Success, result.Message);
-            return result;
+            // 1) Religa na PRÓPRIA sessão (que é a dona do slot SINGLE_USER quando viva).
+            await TrySetMultiUserAsync(session, db, progress, CancellationToken.None);
+            // 2) Backstop em conexão NOVA, caso a sessão tenha sido derrubada por um erro severo (824).
+            result.FinalStateDesc = await ForceMultiUserAsync(connectionString, db, progress);
+            db.StateDesc = result.FinalStateDesc;
         }
-        if (!report.AllErrorsAreNonClusteredIndex)
+    }
+
+    /// <summary>
+    /// Garante o retorno do banco a MULTI_USER usando uma conexão NOVA — robusto mesmo que a
+    /// sessão principal tenha sido derrubada por um erro severo. Só age se necessário e usa
+    /// WITH ROLLBACK IMMEDIATE para não bloquear. Devolve o estado final lido.
+    /// </summary>
+    private async Task<string> ForceMultiUserAsync(string connectionString, DatabaseInfo db, IProgress<RepairLogEntry> p)
+    {
+        try
         {
-            await TrySetMultiUserAsync(session, db, progress, ct);
-            result.Status = RepairStatus.NeedsDataLossConfirmation;
-            result.Message = "A corrupção NÃO está restrita a índices não-clusterizados. Use o reparo padrão (e, se necessário, RESTAURAR de backup).";
-            Report(progress, db.Name, RepairLogLevel.Warning, result.Message);
-            return result;
+            await using var s = await _data.OpenSessionAsync(connectionString);
+            const string sql =
+                "IF EXISTS (SELECT 1 FROM sys.databases WHERE name = @db AND user_access_desc <> N'MULTI_USER')\n" +
+                "BEGIN\n" +
+                "  DECLARE @cmd nvarchar(max) = N'ALTER DATABASE ' + QUOTENAME(@db) + N' SET MULTI_USER WITH ROLLBACK IMMEDIATE;';\n" +
+                "  EXEC sys.sp_executesql @cmd;\n" +
+                "END";
+            var r = await s.ExecuteAsync("Garantir MULTI_USER (conexão de recuperação)", sql,
+                new Dictionary<string, object?> { ["@db"] = db.Name }, AppConstants.RepairCommandTimeoutSeconds, CancellationToken.None);
+            Report(p, db.Name, r.Success ? RepairLogLevel.Info : RepairLogLevel.Warning,
+                r.Success ? "Acesso normal assegurado (MULTI_USER)." : "Não foi possível assegurar MULTI_USER automaticamente.");
+            return await s.GetDatabaseStateAsync(db.Name, CancellationToken.None);
         }
-
-        var ok = await RebuildNonClusteredIndexesAsync(session, db, report, progress, ct);
-        var verify = await RunStepAsync(session, db, progress, "Verificação pós-reconstrução (DBCC CHECKDB)",
-            Dbcc(db.Name, repairOption: null, noInfoMsgs: true), ct);
-        await TrySetMultiUserAsync(session, db, progress, ct);
-
-        result.FinalStateDesc = await session.GetDatabaseStateAsync(db.Name, ct);
-        db.StateDesc = result.FinalStateDesc;
-        result.Status = ok && verify.Success ? RepairStatus.Success : RepairStatus.Failed;
-        result.Message = result.Status == RepairStatus.Success
-            ? "Índices reconstruídos com sucesso — SEM perda de dados. Banco consistente."
-            : "A reconstrução de índices não eliminou todas as inconsistências. Considere o reparo padrão.";
-        Report(progress, db.Name, result.Status == RepairStatus.Success ? RepairLogLevel.Success : RepairLogLevel.Warning, result.Message);
-        return result;
+        catch (Exception ex)
+        {
+            Report(p, db.Name, RepairLogLevel.Warning, "Conexão de recuperação para MULTI_USER falhou: " + ex.Message);
+            return db.StateDesc;
+        }
     }
 
     private async Task<bool> RebuildNonClusteredIndexesAsync(
@@ -1012,12 +1084,20 @@ public sealed class RepairService
     {
         // O ALTER INDEX roda NO CONTEXTO do banco alvo (EXEC [db].sys.sp_executesql), montando o
         // nome qualificado (schema.tabela) a partir do object_id já lá dentro.
+        //
+        // IMPORTANTE: primeiro DISABLE, depois REBUILD. Um REBUILD direto LÊ as páginas do índice
+        // — se elas estiverem fisicamente corrompidas (erro 824), o comando falha e derruba a
+        // conexão. O DISABLE desaloca a estrutura SEM ler as páginas corrompidas, e o REBUILD
+        // reconstrói o índice a partir do índice clusterizado/heap (íntegro), sem perda de dados.
         var sql =
             "DECLARE @inner nvarchar(max) = N'" +
-            "DECLARE @c nvarchar(max); " +
-            "SELECT @c = N''ALTER INDEX '' + QUOTENAME(i.name) + N'' ON '' + QUOTENAME(OBJECT_SCHEMA_NAME(@o)) + N''.'' + QUOTENAME(OBJECT_NAME(@o)) + N'' REBUILD;'' " +
-            "FROM sys.indexes i WHERE i.object_id = @o AND i.index_id = @i; " +
-            "IF @c IS NOT NULL EXEC sys.sp_executesql @c;';\n" +
+            "DECLARE @q nvarchar(300) = QUOTENAME(OBJECT_SCHEMA_NAME(@o)) + N''.'' + QUOTENAME(OBJECT_NAME(@o)); " +
+            "DECLARE @ix sysname = (SELECT name FROM sys.indexes WHERE object_id = @o AND index_id = @i); " +
+            "IF @ix IS NOT NULL BEGIN " +
+            "DECLARE @s1 nvarchar(max) = N''ALTER INDEX '' + QUOTENAME(@ix) + N'' ON '' + @q + N'' DISABLE;''; " +
+            "DECLARE @s2 nvarchar(max) = N''ALTER INDEX '' + QUOTENAME(@ix) + N'' ON '' + @q + N'' REBUILD;''; " +
+            "EXEC sys.sp_executesql @s1; EXEC sys.sp_executesql @s2; " +
+            "END';\n" +
             "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
             "EXEC @proc @inner, N'@o int, @i int', @o = @oid, @i = @iid;";
         return (sql, new Dictionary<string, object?> { ["@db"] = db, ["@oid"] = objectId, ["@iid"] = indexId });

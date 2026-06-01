@@ -165,10 +165,18 @@ GO
 /* ----------------------------------------------------------------------------
    7) REPARO SEM PERDA DE DADOS — corrupção restrita a índices NÃO clusterizados
       Quando o CHECKDB (6.2) mostra erros apenas em índices com index_id > 1,
-      basta reconstruí-los: NENHUM dado é perdido.
+      basta reconstruí-los: NENHUM dado é perdido. (Mesmo que o CHECKDB sugira
+      'repair_allow_data_loss', um índice não-clusterizado é redundante.)
+
+      IMPORTANTE (validado com corrupção real): primeiro DISABLE, depois REBUILD.
+      Um REBUILD direto LÊ as páginas do índice — se elas estiverem fisicamente
+      corrompidas (erro 824), o comando falha e derruba a conexão. O DISABLE
+      desaloca a estrutura SEM ler as páginas; o REBUILD recria o índice a partir
+      do índice clusterizado/heap (íntegro).
    ---------------------------------------------------------------------------- */
 ALTER DATABASE [NomeDoBanco] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
-ALTER INDEX [NomeDoIndice] ON [schema].[Tabela] REBUILD;  -- repita para cada índice afetado
+ALTER INDEX [NomeDoIndice] ON [schema].[Tabela] DISABLE;   -- não lê as páginas corrompidas
+ALTER INDEX [NomeDoIndice] ON [schema].[Tabela] REBUILD;   -- recria a partir dos dados íntegros
 DBCC CHECKDB (N'NomeDoBanco') WITH NO_INFOMSGS, ALL_ERRORMSGS;  -- verificação
 ALTER DATABASE [NomeDoBanco] SET MULTI_USER;
 GO

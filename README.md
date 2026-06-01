@@ -267,11 +267,32 @@ e **derruba** seu próprio banco `RestoreDB_IT_*` (isolado) e limpa os backups g
 variáveis de ambiente abaixo, esses testes são **ignorados** (o `dotnet test` padrão segue verde).
 
 ```powershell
+# Autenticação SQL:
 $env:RESTOREDB_IT_SERVER = "localhost"
 $env:RESTOREDB_IT_USER   = "sa"
 $env:RESTOREDB_IT_PASS   = "********"
+# ...ou autenticação do Windows (sem senha):
+$env:RESTOREDB_IT_SERVER       = "localhost"
+$env:RESTOREDB_IT_USE_WINDOWS  = "1"
 dotnet test tests/RestoreDB.IntegrationTests
 ```
 
 > Validado contra **SQL Server 2022 (Developer Edition)**: 41 testes de lógica + 10 de integração,
 > todos aprovados.
+
+### Validação com corrupção real
+
+Os caminhos destrutivos foram exercitados contra **corrupção física real** (via `DBCC WRITEPAGE`)
+num banco de produção de teste, com backup prévio e restauração ao final:
+
+- **Índice não-clusterizado corrompido** ⇒ a ferramenta detecta "só índice", reconstrói
+  (`DISABLE` + `REBUILD`) e verifica — **zero perda de dados** (checksum idêntico ao original).
+- **Página de dados corrompida** + `EMERGENCY` ⇒ `REPAIR_ALLOW_DATA_LOSS` torna o banco
+  consistente (perda mínima, registrada).
+- **Restaurar de backup** ⇒ recupera 100% dos dados; corrige usuários órfãos.
+- O diagnóstico **reconcilia histórico × estado atual**: entradas antigas de `msdb.suspect_pages`
+  e do log de erros não geram falso positivo quando o `DBCC CHECKDB` ao vivo está limpo.
+
+O utilitário [`tools/RestoreDB.Probe`](tools/RestoreDB.Probe) é um runner de linha de comando que
+invoca os serviços reais (`diagnose`/`repair-indexes`/`repair`/`restore`) — usado nessa validação
+e útil para operar a ferramenta sem a interface gráfica.

@@ -45,6 +45,11 @@ public sealed class ConnectionService
     {
         if (string.IsNullOrWhiteSpace(info.Server))
             throw new InvalidOperationException("Informe o nome ou endereço do servidor.");
+
+        // Na autenticação do Windows (Integrated Security) não há usuário/senha a informar.
+        if (info.UseWindowsAuth)
+            return;
+
         if (string.IsNullOrWhiteSpace(info.User))
             throw new InvalidOperationException("Informe o usuário.");
         if (string.IsNullOrEmpty(info.Password))
