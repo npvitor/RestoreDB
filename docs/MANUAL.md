@@ -251,9 +251,12 @@ ex.: `RECOVERY_PENDING`/`SUSPECT` por causa do log) e o reparo não resolveu.
 
 ## 9. Modo escuro
 
-Use o botão **“🌙 Tema escuro”** (na barra superior) para alternar entre **claro** e
-**escuro**. Ao ativar, ele muda para **“☀ Tema claro”**. O tema escolhido vale para toda a
-aplicação (inclusive ao trocar de conexão) durante o uso.
+Ao **iniciar**, a ferramenta adota automaticamente o **tema do Windows** (claro ou escuro),
+conforme a opção *Configurações → Cores → “Escolha o modo do aplicativo”* do sistema.
+
+Você pode alterná-lo a qualquer momento pelo botão **“🌙 Tema escuro”** (na barra superior),
+que passa a exibir **“☀ Tema claro”** quando o modo escuro está ativo. A escolha manual vale
+para toda a aplicação (inclusive ao trocar de conexão) durante o uso.
 
 ---
 

@@ -45,8 +45,31 @@ public partial class App : Application
             return;
         }
 
-        // Início normal: tela de conexão.
+        // Início normal: herda o tema (claro/escuro) configurado no Windows e abre a conexão.
+        ApplyTheme(DetectSystemTheme());
         new ConnectionWindow().Show();
+    }
+
+    /// <summary>
+    /// Lê a preferência de tema do Windows (Configurações → Cores → "Escolha o modo do aplicativo").
+    /// Chave HKCU\…\Themes\Personalize\AppsUseLightTheme: 0 = escuro; 1 ou ausente = claro.
+    /// Em qualquer falha de leitura, mantém o tema claro. O usuário pode alternar a qualquer momento.
+    /// </summary>
+    public static AppTheme DetectSystemTheme()
+    {
+        try
+        {
+            var value = Microsoft.Win32.Registry.GetValue(
+                @"HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                "AppsUseLightTheme", 1);
+            if (value is int light && light == 0)
+                return AppTheme.Dark;
+        }
+        catch
+        {
+            // Sem acesso ao registro / chave inexistente: mantém o tema claro.
+        }
+        return AppTheme.Light;
     }
 
     private void RunXamlSelfTest()
@@ -69,6 +92,7 @@ public partial class App : Application
             connection.Arrange(new Rect(0, 0, 800, 600));
             ApplyTheme(AppTheme.Light);
 
+            Console.Out.WriteLine("SYSTEM-THEME: " + DetectSystemTheme());
             Console.Out.WriteLine("SELFTEST-OK");
             Shutdown(0);
         }
