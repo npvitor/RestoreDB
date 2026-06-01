@@ -183,7 +183,7 @@
 
                             <!-- Ver script planejado (dry-run) -->
                             <Button x:Name="ViewScriptButton" Visibility="Collapsed" Content="Ver script planejado (não executa nada)"
-                                    Style="{StaticResource SecondaryButton}" Height="34" Margin="0,10,0,0"
+                                    Style="{StaticResource SecondaryButton}" Height="44" Margin="0,10,0,0"
                                     Click="ViewScriptButton_Click" />
 
                             <!-- [PRIMÁRIO p/ corrupção de DADOS] Restaurar de backup -->
@@ -192,7 +192,7 @@
                                 <TextBlock Text="Caminho correto quando os arquivos de DADOS estão corrompidos: substitui o banco pelos dados íntegros de um backup."
                                            Foreground="{DynamicResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,8" />
                                 <Button x:Name="ChooseBackupButton" Content="Escolher arquivo .bak..."
-                                        Style="{StaticResource SecondaryButton}" Height="34" Click="ChooseBackupButton_Click" />
+                                        Style="{StaticResource SecondaryButton}" Height="44" Click="ChooseBackupButton_Click" />
                                 <TextBlock x:Name="BackupSourceText" Foreground="{DynamicResource MutedTextBrush}" FontSize="11"
                                            TextWrapping="Wrap" Margin="0,6,0,0" />
                                 <ListBox x:Name="BackupSetsList" Height="104" Margin="0,8,0,0"
