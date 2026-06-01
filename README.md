@@ -7,6 +7,9 @@ Faturamento**, com linguagem acessível a usuários leigos.
 
 Todo o T-SQL é **compatível com SQL Server 2008 R2** (e versões superiores).
 
+> 📘 **Novo por aqui?** Comece pelo [**Manual de Utilização**](docs/MANUAL.md) — guia
+> passo a passo, em linguagem acessível, para operar a ferramenta.
+
 **Recursos principais:**
 
 - **Diagnóstico autoritativo** (somente leitura): `msdb.dbo.suspect_pages`,
