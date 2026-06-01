@@ -7,8 +7,8 @@ Faturamento**, com linguagem acessível a usuários leigos.
 
 Todo o T-SQL é **compatível com SQL Server 2008 R2** (e versões superiores).
 
-> 📘 **Novo por aqui?** Comece pelo [**Manual de Utilização**](docs/MANUAL.md) — guia
-> passo a passo, em linguagem acessível, para operar a ferramenta.
+> 📘 **Novo por aqui?** Comece pelo **Manual de Utilização** — guia passo a passo, em
+> linguagem acessível, para operar a ferramenta: [Markdown](docs/MANUAL.md) · [PDF](docs/MANUAL.pdf).
 
 **Recursos principais:**
 
