@@ -10,6 +10,7 @@ using RestoreDB.Services;
 //   repair-indexes <db>
 //   repair <db> [dataloss]
 //   restore <db> <bakPath> [replace]
+//   rebuild-log <db>
 //   state <db>
 
 if (args.Length < 2)
@@ -72,6 +73,13 @@ switch (cmd)
         var r = await new RepairService(log).RepairAsync(db, conn, dataloss, progress);
         Console.WriteLine($"RESULT: {r.Status} | {r.Message}");
         return r.Status is RepairStatus.Success or RepairStatus.NoActionNeeded ? 0 : 1;
+    }
+
+    case "rebuild-log":
+    {
+        var r = await new RepairService(log).RebuildTransactionLogAsync(db, conn, progress);
+        Console.WriteLine($"RESULT: {r.Status} | {r.Message}");
+        return r.Status == RepairStatus.Success ? 0 : 1;
     }
 
     case "restore":

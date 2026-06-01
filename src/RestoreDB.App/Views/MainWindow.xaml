@@ -4,7 +4,8 @@
         Title="RestoreDB — Diagnóstico e Reparo (Módulo de Faturamento)"
         Height="720" Width="1120" MinHeight="560" MinWidth="900"
         WindowStartupLocation="CenterScreen"
-        Background="{StaticResource WindowBackBrush}">
+        Foreground="{DynamicResource TextBrush}"
+        Background="{DynamicResource WindowBackBrush}">
 
     <Grid Margin="14">
         <Grid.RowDefinitions>
@@ -16,7 +17,7 @@
         </Grid.RowDefinitions>
 
         <!-- ===== Barra superior ===== -->
-        <Border Grid.Row="0" Background="{StaticResource CardBrush}" BorderBrush="{StaticResource LineBrush}"
+        <Border Grid.Row="0" Background="{DynamicResource CardBrush}" BorderBrush="{DynamicResource LineBrush}"
                 BorderThickness="1" CornerRadius="6" Padding="14,10" Margin="0,0,0,12">
             <Grid>
                 <Grid.ColumnDefinitions>
@@ -25,9 +26,11 @@
                 </Grid.ColumnDefinitions>
                 <StackPanel Grid.Column="0">
                     <TextBlock Text="Bancos de dados do servidor" Style="{StaticResource HeaderText}" FontSize="17" />
-                    <TextBlock x:Name="ServerInfoText" Foreground="{StaticResource MutedTextBrush}" FontSize="12" Margin="0,2,0,0" />
+                    <TextBlock x:Name="ServerInfoText" Foreground="{DynamicResource MutedTextBrush}" FontSize="12" Margin="0,2,0,0" />
                 </StackPanel>
                 <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                    <ToggleButton x:Name="ThemeToggleButton" Content="🌙  Tema escuro" Style="{StaticResource ThemeToggle}"
+                                  Margin="0,0,8,0" Click="ThemeToggleButton_Click" />
                     <Button x:Name="CancelButton" Content="Cancelar" Style="{StaticResource DangerButton}"
                             Click="CancelButton_Click" Margin="0,0,8,0" IsEnabled="False" />
                     <Button x:Name="RefreshButton" Content="Atualizar lista" Style="{StaticResource SecondaryButton}"
@@ -42,24 +45,28 @@
         <Grid Grid.Row="1">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
-                <ColumnDefinition Width="390" />
+                <ColumnDefinition Width="400" />
             </Grid.ColumnDefinitions>
 
             <!-- Lista de bancos -->
-            <Border Grid.Column="0" Background="{StaticResource CardBrush}" BorderBrush="{StaticResource LineBrush}"
+            <Border Grid.Column="0" Background="{DynamicResource CardBrush}" BorderBrush="{DynamicResource LineBrush}"
                     BorderThickness="1" CornerRadius="6" Margin="0,0,12,0">
                 <DataGrid x:Name="DatabasesGrid" AutoGenerateColumns="False" IsReadOnly="True"
                           HeadersVisibility="Column" GridLinesVisibility="Horizontal" BorderThickness="0"
-                          Background="Transparent" RowBackground="Transparent" AlternatingRowBackground="#F8FAFB"
+                          Background="Transparent" RowBackground="Transparent"
+                          Foreground="{DynamicResource TextBrush}"
+                          HorizontalGridLinesBrush="{DynamicResource LineBrush}"
+                          AlternatingRowBackground="{DynamicResource GridAltRowBrush}"
                           SelectionMode="Single" SelectionUnit="FullRow" CanUserAddRows="False"
                           SelectionChanged="DatabasesGrid_SelectionChanged"
                           HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
                     <DataGrid.RowStyle>
                         <Style TargetType="DataGridRow">
+                            <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
                             <Style.Triggers>
                                 <DataTrigger Binding="{Binding IsProblematic}" Value="True">
-                                    <Setter Property="Background" Value="#FCEAEA" />
-                                    <Setter Property="Foreground" Value="#9A1414" />
+                                    <Setter Property="Background" Value="{DynamicResource ProblemBackBrush}" />
+                                    <Setter Property="Foreground" Value="{DynamicResource ProblemForeBrush}" />
                                     <Setter Property="FontWeight" Value="SemiBold" />
                                 </DataTrigger>
                             </Style.Triggers>
@@ -74,7 +81,7 @@
             </Border>
 
             <!-- Painel de reparo -->
-            <Border Grid.Column="1" Background="{StaticResource CardBrush}" BorderBrush="{StaticResource LineBrush}"
+            <Border Grid.Column="1" Background="{DynamicResource CardBrush}" BorderBrush="{DynamicResource LineBrush}"
                     BorderThickness="1" CornerRadius="6" Padding="18">
                 <ScrollViewer VerticalScrollBarVisibility="Auto">
                     <StackPanel>
@@ -83,18 +90,19 @@
                         <!-- Sem seleção -->
                         <TextBlock x:Name="NoSelectionText"
                                    Text="Selecione um banco na lista para ver os detalhes."
-                                   Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap" />
+                                   Foreground="{DynamicResource MutedTextBrush}" TextWrapping="Wrap" />
 
                         <!-- Detalhes -->
                         <StackPanel x:Name="DetailsPanel" Visibility="Collapsed">
                             <TextBlock x:Name="DbNameText" FontSize="18" FontWeight="Bold"
-                                       Foreground="{StaticResource PrimaryDarkBrush}" TextWrapping="Wrap" />
+                                       Foreground="{DynamicResource PrimaryDarkBrush}" TextWrapping="Wrap" />
 
                             <TextBlock Text="ESTADO ATUAL" Style="{StaticResource FieldLabel}" Margin="0,14,0,4" />
-                            <Border x:Name="StateBadge" CornerRadius="4" Padding="8,4" HorizontalAlignment="Left" Background="#E7F3EA">
-                                <TextBlock x:Name="StateText" FontWeight="SemiBold" Foreground="#1B7A2F" />
+                            <Border x:Name="StateBadge" CornerRadius="4" Padding="8,4" HorizontalAlignment="Left"
+                                    Background="{DynamicResource OkBackBrush}">
+                                <TextBlock x:Name="StateText" FontWeight="SemiBold" Foreground="{DynamicResource OkForeBrush}" />
                             </Border>
-                            <TextBlock x:Name="StateFriendlyText" Foreground="{StaticResource MutedTextBrush}"
+                            <TextBlock x:Name="StateFriendlyText" Foreground="{DynamicResource MutedTextBrush}"
                                        TextWrapping="Wrap" Margin="0,6,0,0" />
 
                             <TextBlock Text="AÇÃO RECOMENDADA" Style="{StaticResource FieldLabel}" Margin="0,14,0,4" />
@@ -102,16 +110,18 @@
 
                             <!-- Banco saudável -->
                             <Border x:Name="HealthyPanel" Visibility="Collapsed" Margin="0,16,0,0"
-                                    Background="#E7F3EA" BorderBrush="#1B7A2F" BorderThickness="1" CornerRadius="6" Padding="12">
+                                    Background="{DynamicResource OkBackBrush}" BorderBrush="{DynamicResource OkForeBrush}"
+                                    BorderThickness="1" CornerRadius="6" Padding="12">
                                 <TextBlock Text="Este banco está saudável (ONLINE). Nenhum reparo é necessário."
-                                           Foreground="#1B7A2F" TextWrapping="Wrap" />
+                                           Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" />
                             </Border>
 
                             <!-- Banco de sistema -->
                             <Border x:Name="SystemDbPanel" Visibility="Collapsed" Margin="0,16,0,0"
-                                    Background="#FFF6E5" BorderBrush="#B56A00" BorderThickness="1" CornerRadius="6" Padding="12">
+                                    Background="{DynamicResource WarnBackBrush}" BorderBrush="{DynamicResource WarnLineBrush}"
+                                    BorderThickness="1" CornerRadius="6" Padding="12">
                                 <TextBlock Text="Banco de sistema: o reparo automático destrutivo não é permitido por esta ferramenta. Acione o DBA/suporte."
-                                           Foreground="#8A5200" TextWrapping="Wrap" />
+                                           Foreground="{DynamicResource WarnForeBrush}" TextWrapping="Wrap" />
                             </Border>
 
                             <!-- Diagnóstico (somente leitura) -->
@@ -119,53 +129,56 @@
                                 <Button x:Name="DiagnoseButton" Content="Diagnosticar (sem alterar o banco)"
                                         Style="{StaticResource SecondaryButton}" Height="40" Click="DiagnoseButton_Click" />
                                 <TextBlock Text="Lê o log de erros do SQL Server e identifica se o problema está nos DADOS (.mdf/.ndf) ou no LOG de transações (.ldf). Não modifica nada."
-                                           Foreground="{StaticResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,8,0,0" />
+                                           Foreground="{DynamicResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,8,0,0" />
                             </StackPanel>
 
-                            <!-- Resultado do diagnóstico -->
+                            <!-- Resultado do diagnóstico (= ação recomendada destacada) -->
                             <Border x:Name="DiagnosisResultPanel" Visibility="Collapsed" Margin="0,12,0,0"
                                     BorderThickness="1" CornerRadius="6" Padding="12">
                                 <StackPanel>
-                                    <TextBlock Text="DIAGNÓSTICO" Style="{StaticResource FieldLabel}" />
+                                    <TextBlock Text="RESULTADO DO DIAGNÓSTICO" Style="{StaticResource FieldLabel}" />
                                     <TextBlock x:Name="DiagnosisSummaryText" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,2,0,0" />
+                                    <TextBlock x:Name="RecoActionNameText" FontWeight="Bold" TextWrapping="Wrap" Margin="0,8,0,0" />
                                     <TextBlock x:Name="DiagnosisRecoText" TextWrapping="Wrap" Margin="0,6,0,0" />
                                 </StackPanel>
                             </Border>
 
                             <!-- Aviso de topologia (espelhamento/AG/log shipping/replicação) -->
                             <Border x:Name="TopologyWarnPanel" Visibility="Collapsed" Margin="0,12,0,0"
-                                    Background="#FFF6E5" BorderBrush="#B56A00" BorderThickness="1" CornerRadius="6" Padding="12">
+                                    Background="{DynamicResource WarnBackBrush}" BorderBrush="{DynamicResource WarnLineBrush}"
+                                    BorderThickness="1" CornerRadius="6" Padding="12">
                                 <StackPanel>
                                     <TextBlock Text="⚠ TOPOLOGIA DE ALTA DISPONIBILIDADE / REPLICAÇÃO"
-                                               FontWeight="Bold" Foreground="#8A5200" TextWrapping="Wrap" />
-                                    <TextBlock x:Name="TopologyWarnText" Foreground="#8A5200" TextWrapping="Wrap" Margin="0,6,0,0" />
+                                               FontWeight="Bold" Foreground="{DynamicResource WarnForeBrush}" TextWrapping="Wrap" />
+                                    <TextBlock x:Name="TopologyWarnText" Foreground="{DynamicResource WarnForeBrush}" TextWrapping="Wrap" Margin="0,6,0,0" />
                                 </StackPanel>
                             </Border>
 
-                            <!-- Reparo SEM perda: reconstrução de índices (quando aplicável) -->
-                            <Border x:Name="IndexRepairPanel" Visibility="Collapsed" Margin="0,12,0,0"
-                                    Background="#E7F3EA" BorderBrush="#1B7A2F" BorderThickness="1" CornerRadius="6" Padding="12">
+                            <!-- Cabeçalho das opções de reparo (aparece só após o diagnóstico) -->
+                            <TextBlock x:Name="RepairOptionsTitle" Visibility="Collapsed" Text="COMO RESOLVER"
+                                       Style="{StaticResource FieldLabel}" Margin="0,20,0,0" />
+
+                            <!-- [PRIMÁRIO p/ corrupção só de índice] Reparo SEM perda: reconstrução de índices -->
+                            <Border x:Name="IndexRepairPanel" Visibility="Collapsed" Margin="0,8,0,0"
+                                    Background="{DynamicResource OkBackBrush}" BorderBrush="{DynamicResource OkForeBrush}"
+                                    BorderThickness="1" CornerRadius="6" Padding="12">
                                 <StackPanel>
                                     <TextBlock Text="✔ REPARO SEM PERDA DE DADOS DISPONÍVEL" FontWeight="Bold"
-                                               Foreground="#1B7A2F" TextWrapping="Wrap" />
+                                               Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" />
                                     <TextBlock Text="A corrupção está restrita a índices não-clusterizados, que podem ser reconstruídos sem perder dados."
-                                               Foreground="#1B7A2F" TextWrapping="Wrap" Margin="0,6,0,0" />
+                                               Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" Margin="0,6,0,0" />
                                     <Button x:Name="RepairIndexesButton" Content="Reparar índices (sem perda de dados)"
                                             Style="{StaticResource FlatButton}" Height="42" Margin="0,10,0,0"
                                             Click="RepairIndexesButton_Click" />
                                 </StackPanel>
                             </Border>
 
-                            <!-- Cabeçalho das opções de reparo (aparece só após o diagnóstico) -->
-                            <TextBlock x:Name="SafeRepairTitle" Visibility="Collapsed" Text="OPÇÕES DE REPARO"
-                                       Style="{StaticResource FieldLabel}" Margin="0,20,0,0" />
-
-                            <!-- Reparo seguro -->
-                            <StackPanel x:Name="SafeRepairPanel" Visibility="Collapsed" Margin="0,6,0,0">
+                            <!-- [PRIMÁRIO p/ OFFLINE/RESTORING/etc.] Reparo seguro -->
+                            <StackPanel x:Name="SafeRepairPanel" Visibility="Collapsed" Margin="0,8,0,0">
                                 <Button x:Name="SafeRepairButton" Content="Reparar (modo seguro, sem perda de dados)"
                                         Style="{StaticResource FlatButton}" Height="44" Click="SafeRepairButton_Click" />
                                 <TextBlock Text="Tentaremos primeiro a abordagem mais segura: religar / recuperar e, se necessário, DBCC CHECKDB com REPAIR_REBUILD."
-                                           Foreground="{StaticResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,8,0,0" />
+                                           Foreground="{DynamicResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,8,0,0" />
                             </StackPanel>
 
                             <!-- Ver script planejado (dry-run) -->
@@ -173,17 +186,18 @@
                                     Style="{StaticResource SecondaryButton}" Height="34" Margin="0,10,0,0"
                                     Click="ViewScriptButton_Click" />
 
-                            <!-- Restaurar de backup -->
+                            <!-- [PRIMÁRIO p/ corrupção de DADOS] Restaurar de backup -->
                             <StackPanel x:Name="RestorePanel" Visibility="Collapsed" Margin="0,18,0,0">
                                 <TextBlock Text="RESTAURAR DE BACKUP" Style="{StaticResource FieldLabel}" />
                                 <TextBlock Text="Caminho correto quando os arquivos de DADOS estão corrompidos: substitui o banco pelos dados íntegros de um backup."
-                                           Foreground="{StaticResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,8" />
+                                           Foreground="{DynamicResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,8" />
                                 <Button x:Name="ChooseBackupButton" Content="Escolher arquivo .bak..."
                                         Style="{StaticResource SecondaryButton}" Height="34" Click="ChooseBackupButton_Click" />
-                                <TextBlock x:Name="BackupSourceText" Foreground="{StaticResource MutedTextBrush}" FontSize="11"
+                                <TextBlock x:Name="BackupSourceText" Foreground="{DynamicResource MutedTextBrush}" FontSize="11"
                                            TextWrapping="Wrap" Margin="0,6,0,0" />
                                 <ListBox x:Name="BackupSetsList" Height="104" Margin="0,8,0,0"
-                                         DisplayMemberPath="Display" BorderBrush="{StaticResource LineBrush}" BorderThickness="1" />
+                                         Background="{DynamicResource CardBrush}"
+                                         DisplayMemberPath="Display" BorderBrush="{DynamicResource LineBrush}" BorderThickness="1" />
                                 <CheckBox x:Name="RestoreReplaceCheck" Content="Substituir o banco existente (REPLACE)"
                                           IsChecked="True" Margin="0,8,0,0" />
                                 <Button x:Name="RestoreButton" Content="Restaurar o backup selecionado"
@@ -193,14 +207,14 @@
 
                             <!-- Reparo com perda de dados (confirmação) -->
                             <Border x:Name="DataLossPanel" Visibility="Collapsed" Margin="0,18,0,0"
-                                    Background="#FCEAEA" BorderBrush="{StaticResource DangerBrush}" BorderThickness="1"
-                                    CornerRadius="6" Padding="14">
+                                    Background="{DynamicResource ProblemBackBrush}" BorderBrush="{DynamicResource DangerBrush}"
+                                    BorderThickness="1" CornerRadius="6" Padding="14">
                                 <StackPanel>
                                     <TextBlock Text="⚠ ATENÇÃO: REPARO COM POSSÍVEL PERDA DE DADOS"
-                                               FontWeight="Bold" Foreground="{StaticResource DangerDarkBrush}" TextWrapping="Wrap" />
-                                    <TextBlock Margin="0,8,0,0" Foreground="{StaticResource DangerDarkBrush}" TextWrapping="Wrap"
+                                               FontWeight="Bold" Foreground="{DynamicResource DangerDarkBrush}" TextWrapping="Wrap" />
+                                    <TextBlock Margin="0,8,0,0" Foreground="{DynamicResource DangerDarkBrush}" TextWrapping="Wrap"
                                                Text="O reparo seguro não foi suficiente. A próxima etapa usa DBCC CHECKDB com REPAIR_ALLOW_DATA_LOSS, que pode DESCARTAR dados corrompidos para tornar o banco consistente. Tentaremos um backup de segurança antes, mas ele pode não ser possível." />
-                                    <CheckBox x:Name="DataLossConfirmCheck" Margin="0,12,0,0" Foreground="{StaticResource DangerDarkBrush}"
+                                    <CheckBox x:Name="DataLossConfirmCheck" Margin="0,12,0,0" Foreground="{DynamicResource DangerDarkBrush}"
                                               Content="Estou ciente e autorizo o reparo com possível perda de dados."
                                               Checked="DataLossConfirmCheck_Changed" Unchecked="DataLossConfirmCheck_Changed" />
                                     <Button x:Name="DataLossRepairButton" Content="Executar reparo COM perda de dados"
@@ -217,16 +231,16 @@
 
                             <!-- Último recurso: reconstruir o log de transações -->
                             <Border x:Name="LogRebuildPanel" Visibility="Collapsed" Margin="0,18,0,0"
-                                    Background="#F7DCDC" BorderBrush="{StaticResource DangerDarkBrush}" BorderThickness="2"
-                                    CornerRadius="6" Padding="14">
+                                    Background="{DynamicResource DangerPanelBackBrush}" BorderBrush="{DynamicResource DangerBrush}"
+                                    BorderThickness="2" CornerRadius="6" Padding="14">
                                 <StackPanel>
                                     <TextBlock Text="⛔ ÚLTIMO RECURSO: RECONSTRUIR O LOG DE TRANSAÇÕES"
-                                               FontWeight="Bold" Foreground="{StaticResource DangerDarkBrush}" TextWrapping="Wrap" />
-                                    <TextBlock Margin="0,8,0,0" Foreground="{StaticResource DangerDarkBrush}" TextWrapping="Wrap"
+                                               FontWeight="Bold" Foreground="{DynamicResource DangerDarkBrush}" TextWrapping="Wrap" />
+                                    <TextBlock Margin="0,8,0,0" Foreground="{DynamicResource DangerDarkBrush}" TextWrapping="Wrap"
                                                Text="Indicado quando o problema está no LOG de transações (ex.: RECOVERY_PENDING ou SUSPECT por log corrompido/ausente) e o reparo não resolveu. Esta operação desanexa o banco, REMOVE o arquivo de log (.ldf) e o recria (FOR ATTACH_REBUILD_LOG) para forçar o retorno a ONLINE. Pode haver PERDA DE DADOS e inconsistências lógicas." />
-                                    <TextBlock Margin="0,6,0,0" Foreground="{StaticResource DangerDarkBrush}" TextWrapping="Wrap" FontSize="11"
+                                    <TextBlock Margin="0,6,0,0" Foreground="{DynamicResource DangerDarkBrush}" TextWrapping="Wrap" FontSize="11"
                                                Text="Requer que os arquivos do banco estejam acessíveis nesta máquina (servidor local) e que a aplicação tenha permissão na pasta de dados. O log antigo é preservado com a extensão .corrupt_AAAAMMDDHHMMSS." />
-                                    <CheckBox x:Name="LogRebuildConfirmCheck" Margin="0,12,0,0" Foreground="{StaticResource DangerDarkBrush}"
+                                    <CheckBox x:Name="LogRebuildConfirmCheck" Margin="0,12,0,0" Foreground="{DynamicResource DangerDarkBrush}"
                                               Content="Entendo os riscos e autorizo reconstruir o log."
                                               Checked="LogRebuildConfirmCheck_Changed" Unchecked="LogRebuildConfirmCheck_Changed" />
                                     <Button x:Name="LogRebuildButton" Content="Reconstruir log (recriar .ldf)"
@@ -237,7 +251,7 @@
                         </StackPanel>
 
                         <ProgressBar x:Name="RepairBusyBar" IsIndeterminate="True" Height="5" Margin="0,16,0,0"
-                                     Visibility="Collapsed" Foreground="{StaticResource PrimaryBrush}" />
+                                     Visibility="Collapsed" Foreground="{DynamicResource PrimaryBrush}" />
                     </StackPanel>
                 </ScrollViewer>
             </Border>
@@ -248,17 +262,17 @@
                       Background="Transparent" ResizeBehavior="PreviousAndNext" />
 
         <!-- ===== Log ===== -->
-        <Border Grid.Row="3" Background="{StaticResource CardBrush}" BorderBrush="{StaticResource LineBrush}"
+        <Border Grid.Row="3" Background="{DynamicResource CardBrush}" BorderBrush="{DynamicResource LineBrush}"
                 BorderThickness="1" CornerRadius="6">
             <Grid>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="*" />
                 </Grid.RowDefinitions>
-                <Border Grid.Row="0" Background="#EEF3F7" CornerRadius="6,6,0,0" Padding="12,8">
+                <Border Grid.Row="0" Background="{DynamicResource LogHeaderBackBrush}" CornerRadius="6,6,0,0" Padding="12,8">
                     <Grid>
                         <TextBlock Text="Registro de operações" FontWeight="SemiBold"
-                                   Foreground="{StaticResource PrimaryDarkBrush}" VerticalAlignment="Center" />
+                                   Foreground="{DynamicResource PrimaryDarkBrush}" VerticalAlignment="Center" />
                         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                             <Button x:Name="ExportReportButton" Content="Exportar relatório" Style="{StaticResource SecondaryButton}"
                                     Padding="10,3" FontSize="12" Margin="0,0,8,0" Click="ExportReportButton_Click" />
@@ -276,6 +290,7 @@
                         <Style TargetType="ListBoxItem">
                             <Setter Property="HorizontalContentAlignment" Value="Stretch" />
                             <Setter Property="Padding" Value="2,1" />
+                            <Setter Property="Background" Value="Transparent" />
                         </Style>
                     </ListBox.ItemContainerStyle>
                     <ListBox.ItemTemplate>
@@ -286,7 +301,7 @@
                                     <ColumnDefinition Width="*" />
                                 </Grid.ColumnDefinitions>
                                 <TextBlock Grid.Column="0" Text="{Binding TimestampText}" FontFamily="Consolas"
-                                           FontSize="12" Foreground="{StaticResource MutedTextBrush}" Margin="0,0,10,0" />
+                                           FontSize="12" Foreground="{DynamicResource MutedTextBrush}" Margin="0,0,10,0" />
                                 <TextBlock Grid.Column="1" Text="{Binding Message}" FontFamily="Consolas" FontSize="12"
                                            TextWrapping="Wrap" Foreground="{Binding Level, Converter={StaticResource LevelToBrush}}" />
                             </Grid>
@@ -303,9 +318,9 @@
                     <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
-                <TextBlock x:Name="StatusText" Grid.Column="0" Foreground="{StaticResource MutedTextBrush}"
+                <TextBlock x:Name="StatusText" Grid.Column="0" Foreground="{DynamicResource MutedTextBrush}"
                            FontSize="12" VerticalAlignment="Center" Text="Pronto." />
-                <TextBlock x:Name="LogPathText" Grid.Column="1" Foreground="{StaticResource MutedTextBrush}"
+                <TextBlock x:Name="LogPathText" Grid.Column="1" Foreground="{DynamicResource MutedTextBrush}"
                            FontSize="11" VerticalAlignment="Center" />
             </Grid>
         </Border>

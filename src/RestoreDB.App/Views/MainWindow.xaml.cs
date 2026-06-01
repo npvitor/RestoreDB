@@ -30,13 +30,6 @@ public partial class MainWindow : Window
     private bool _busy;
     private CancellationTokenSource? _cts;
 
-    private static readonly Brush HealthyBack = new SolidColorBrush(Color.FromRgb(0xE7, 0xF3, 0xEA));
-    private static readonly Brush HealthyFore = new SolidColorBrush(Color.FromRgb(0x1B, 0x7A, 0x2F));
-    private static readonly Brush ProblemBack = new SolidColorBrush(Color.FromRgb(0xFC, 0xEA, 0xEA));
-    private static readonly Brush ProblemFore = new SolidColorBrush(Color.FromRgb(0x9A, 0x14, 0x14));
-    private static readonly Brush WarnBack = new SolidColorBrush(Color.FromRgb(0xFF, 0xF6, 0xE5));
-    private static readonly Brush WarnFore = new SolidColorBrush(Color.FromRgb(0x8A, 0x52, 0x00));
-
     public MainWindow(string connectionString, string serverName, ServerInfo? serverInfo = null)
     {
         InitializeComponent();
@@ -52,6 +45,9 @@ public partial class MainWindow : Window
         LogList.ItemsSource = _logEntries;
         BackupSetsList.ItemsSource = _backupSets;
 
+        // Reflete o tema atual (persiste por toda a aplicação, mesmo ao trocar de conexão).
+        SyncThemeToggle();
+
         var caps = _serverInfo.ProductVersion.Length > 0
             ? $"   •   {_serverInfo.Edition} {_serverInfo.ProductVersion}   •   {(_serverInfo.IsSysadmin ? "sysadmin" : "SEM sysadmin")}"
             : string.Empty;
@@ -59,6 +55,23 @@ public partial class MainWindow : Window
         LogPathText.Text = "Log: " + _logService.LogFilePath;
 
         Loaded += async (_, _) => await LoadDatabasesAsync();
+    }
+
+    // ------------------------------------------------------------------ Tema (claro/escuro)
+
+    private void ThemeToggleButton_Click(object sender, RoutedEventArgs e)
+    {
+        var dark = ThemeToggleButton.IsChecked == true;
+        App.ApplyTheme(dark ? AppTheme.Dark : AppTheme.Light);
+        SyncThemeToggle();
+        LogList.Items.Refresh(); // reaplica as cores do registro (converter) ao novo tema
+    }
+
+    private void SyncThemeToggle()
+    {
+        var dark = App.CurrentTheme == AppTheme.Dark;
+        ThemeToggleButton.IsChecked = dark;
+        ThemeToggleButton.Content = dark ? "☀  Tema claro" : "🌙  Tema escuro";
     }
 
     // ------------------------------------------------------------------ Listagem
@@ -156,7 +169,7 @@ public partial class MainWindow : Window
             SystemDbPanel.Visibility = db is { IsProblematic: true, IsSystemDatabase: true }
                 ? Visibility.Visible : Visibility.Collapsed;
             // As opções de reparo só são liberadas DEPOIS do diagnóstico.
-            SafeRepairTitle.Visibility = Visibility.Collapsed;
+            RepairOptionsTitle.Visibility = Visibility.Collapsed;
             SafeRepairPanel.Visibility = Visibility.Collapsed;
             SafeRepairButton.IsEnabled = false;
         }
@@ -169,8 +182,8 @@ public partial class MainWindow : Window
         StateFriendlyText.Text = db.StateFriendly;
         RecommendedActionText.Text = db.RecommendedAction;
 
-        StateBadge.Background = db.IsHealthy ? HealthyBack : ProblemBack;
-        StateText.Foreground = db.IsHealthy ? HealthyFore : ProblemFore;
+        StateBadge.SetResourceReference(Border.BackgroundProperty, db.IsHealthy ? "OkBackBrush" : "ProblemBackBrush");
+        StateText.SetResourceReference(TextBlock.ForegroundProperty, db.IsHealthy ? "OkForeBrush" : "ProblemForeBrush");
     }
 
     // ------------------------------------------------------------------ Diagnóstico (somente leitura)
@@ -191,41 +204,22 @@ public partial class MainWindow : Window
             var diag = await _repairService.DiagnoseAsync(db, _connectionString, _progress, _cts!.Token);
 
             DiagnosisSummaryText.Text = diag.Summary;
-            DiagnosisRecoText.Text = string.IsNullOrEmpty(diag.Recommendation)
-                ? string.Empty
-                : "Recomendação: " + diag.Recommendation;
+            RecoActionNameText.Text = RecommendedActionLabel(diag.RecommendedAction);
+            DiagnosisRecoText.Text = diag.Recommendation;
+            DiagnosisRecoText.Visibility = string.IsNullOrEmpty(diag.Recommendation)
+                ? Visibility.Collapsed : Visibility.Visible;
 
-            // Cor conforme a conclusão.
-            Brush back, fore;
-            if (diag.IndexOnlyRepairPossible) { back = HealthyBack; fore = HealthyFore; }
-            else if (diag.LogCorruptionSuspected && !diag.DataCorruptionSuspected) { back = WarnBack; fore = WarnFore; }
-            else if (diag.DataCorruptionSuspected) { back = ProblemBack; fore = ProblemFore; }
-            else { back = HealthyBack; fore = HealthyFore; }
-
-            DiagnosisResultPanel.Background = back;
-            DiagnosisResultPanel.BorderBrush = fore;
-            DiagnosisSummaryText.Foreground = fore;
-            DiagnosisRecoText.Foreground = fore;
+            // Cor conforme a severidade da conclusão.
+            var (backKey, foreKey) = SeverityKeys(diag.RecommendedAction);
+            DiagnosisResultPanel.SetResourceReference(Border.BackgroundProperty, backKey);
+            DiagnosisResultPanel.SetResourceReference(Border.BorderBrushProperty, foreKey);
+            DiagnosisSummaryText.SetResourceReference(TextBlock.ForegroundProperty, foreKey);
+            RecoActionNameText.SetResourceReference(TextBlock.ForegroundProperty, foreKey);
+            DiagnosisRecoText.SetResourceReference(TextBlock.ForegroundProperty, foreKey);
             DiagnosisResultPanel.Visibility = Visibility.Visible;
 
-            // Aviso de topologia (espelhamento/AG/log shipping/replicação).
-            if (diag.Topology is { IsRisky: true })
-            {
-                TopologyWarnText.Text = diag.Topology.Summary + " " + string.Join(" ", diag.Topology.Warnings);
-                TopologyWarnPanel.Visibility = Visibility.Visible;
-            }
-
-            // Reparo SEM perda (índices) quando aplicável.
-            if (diag.IndexOnlyRepairPossible && !db.IsSystemDatabase)
-                IndexRepairPanel.Visibility = Visibility.Visible;
-
-            // Restaurar de backup: oferecer para bancos de usuário (recomendado em corrupção de dados).
-            if (!db.IsSystemDatabase)
-                await ShowRestoreOptionAsync(db);
-
-            // Se o log está corrompido, já deixa visível a opção recomendada de reconstrução.
-            if (diag.LogCorruptionSuspected && !db.IsSystemDatabase)
-                ShowLogRebuildOption(db);
+            // Limita as opções exibidas ÀS aplicáveis para a situação diagnosticada.
+            await ApplyDiagnosisGatingAsync(db, diag);
 
             StatusText.Text = diag.Summary;
         }
@@ -240,16 +234,119 @@ public partial class MainWindow : Window
         }
         finally
         {
-            // O diagnóstico é a 1ª etapa: somente depois dele liberamos as opções de reparo.
-            if (db.IsProblematic)
-            {
-                SafeRepairTitle.Visibility = Visibility.Visible;
-                SafeRepairPanel.Visibility = Visibility.Visible;
-                ViewScriptButton.Visibility = Visibility.Visible;
-            }
             SetBusy(false);
         }
     }
+
+    /// <summary>
+    /// Aplica o resultado do diagnóstico à UI exibindo SOMENTE as opções de reparo apropriadas
+    /// para a ação recomendada — guiando o usuário ao caminho correto e evitando ações inválidas.
+    /// </summary>
+    private async Task ApplyDiagnosisGatingAsync(DatabaseInfo db, DiagnosisResult diag)
+    {
+        // Estado inicial: tudo oculto; cada caso revela o que faz sentido.
+        IndexRepairPanel.Visibility = Visibility.Collapsed;
+        SafeRepairPanel.Visibility = Visibility.Collapsed;
+        ViewScriptButton.Visibility = Visibility.Collapsed;
+        RestorePanel.Visibility = Visibility.Collapsed;
+        DataLossPanel.Visibility = Visibility.Collapsed;
+        LogRebuildPanel.Visibility = Visibility.Collapsed;
+        RepairOptionsTitle.Visibility = Visibility.Collapsed;
+
+        // Aviso de topologia: independente da ação, alerta quando há alta disponibilidade/replicação.
+        if (diag.Topology is { IsRisky: true })
+        {
+            TopologyWarnText.Text = diag.Topology.Summary + " " + string.Join(" ", diag.Topology.Warnings);
+            TopologyWarnPanel.Visibility = Visibility.Visible;
+        }
+
+        // Banco de sistema: somente o reparo NÃO destrutivo (modo seguro) é permitido.
+        if (db.IsSystemDatabase)
+        {
+            if (db.IsProblematic)
+            {
+                RepairOptionsTitle.Visibility = Visibility.Visible;
+                SafeRepairPanel.Visibility = Visibility.Visible;
+                ViewScriptButton.Visibility = Visibility.Visible;
+            }
+            return;
+        }
+
+        var showOptions = true;
+        switch (diag.RecommendedAction)
+        {
+            // Corrupção restrita a índices não-clusterizados → reconstrução SEM perda.
+            case RecommendedActionKind.RebuildIndexesOnly:
+                IndexRepairPanel.Visibility = Visibility.Visible;
+                break;
+
+            // Corrupção de DADOS → restaurar de backup é o caminho correto.
+            case RecommendedActionKind.RestoreFromBackup:
+            case RecommendedActionKind.PageRestore:
+                await ShowRestoreOptionAsync(db);
+                break;
+
+            // Problema de LOG → reparo seguro (reconstrói o log sem Administrador) e, como
+            // alternativa explícita, a reconstrução do log (último recurso).
+            case RecommendedActionKind.RebuildLog:
+                SafeRepairPanel.Visibility = Visibility.Visible;
+                ViewScriptButton.Visibility = Visibility.Visible;
+                ShowLogRebuildOption(db);
+                break;
+
+            // Log cheio / pouco espaço: liberar espaço e religar (modo seguro).
+            case RecommendedActionKind.FreeDiskSpace:
+                SafeRepairPanel.Visibility = Visibility.Visible;
+                ViewScriptButton.Visibility = Visibility.Visible;
+                break;
+
+            // CHECKDB íntegro: só age se o estado ainda for problemático (religar).
+            case RecommendedActionKind.NoAction:
+                if (db.IsProblematic)
+                {
+                    SafeRepairPanel.Visibility = Visibility.Visible;
+                    ViewScriptButton.Visibility = Visibility.Visible;
+                }
+                else
+                {
+                    showOptions = false;
+                }
+                break;
+
+            // Reparo seguro (OFFLINE/RESTORING/RECOVERY genéricos) e fallback.
+            case RecommendedActionKind.SafeRepair:
+            default:
+                SafeRepairPanel.Visibility = Visibility.Visible;
+                ViewScriptButton.Visibility = Visibility.Visible;
+                break;
+        }
+
+        RepairOptionsTitle.Visibility = showOptions ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private static string RecommendedActionLabel(RecommendedActionKind action) => action switch
+    {
+        RecommendedActionKind.NoAction => "✔ Nenhuma ação necessária — banco íntegro.",
+        RecommendedActionKind.RebuildIndexesOnly => "→ Ação recomendada: reparar índices (sem perda de dados).",
+        RecommendedActionKind.SafeRepair => "→ Ação recomendada: reparo no modo seguro (sem perda de dados).",
+        RecommendedActionKind.RestoreFromBackup => "→ Ação recomendada: restaurar de backup.",
+        RecommendedActionKind.PageRestore => "→ Ação recomendada: restaurar as páginas afetadas (ou de backup).",
+        RecommendedActionKind.RebuildLog => "→ Ação recomendada: reconstruir o log de transações.",
+        RecommendedActionKind.FreeDiskSpace => "→ Ação recomendada: liberar espaço em disco e religar o banco.",
+        RecommendedActionKind.ReviewTopology => "→ Ação recomendada: revisar a topologia antes de qualquer reparo.",
+        _ => "→ Ação recomendada: reparo no modo seguro."
+    };
+
+    /// <summary>Cor (chaves de recurso) do painel de diagnóstico conforme a severidade da ação.</summary>
+    private static (string back, string fore) SeverityKeys(RecommendedActionKind action) => action switch
+    {
+        RecommendedActionKind.NoAction => ("OkBackBrush", "OkForeBrush"),
+        RecommendedActionKind.RebuildIndexesOnly => ("OkBackBrush", "OkForeBrush"),
+        RecommendedActionKind.SafeRepair => ("OkBackBrush", "OkForeBrush"),
+        RecommendedActionKind.RestoreFromBackup => ("ProblemBackBrush", "ProblemForeBrush"),
+        RecommendedActionKind.PageRestore => ("ProblemBackBrush", "ProblemForeBrush"),
+        _ => ("WarnBackBrush", "WarnForeBrush")
+    };
 
     // ------------------------------------------------------------------ Reparo SEM perda: índices
 
@@ -408,13 +505,16 @@ public partial class MainWindow : Window
             Title = $"Script planejado — {db.Name}",
             Width = 720, Height = 480, Owner = this,
             WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Background = (Brush)Application.Current.FindResource("WindowBackBrush"),
             Content = new TextBox
             {
                 Text = script,
                 IsReadOnly = true,
-                FontFamily = new System.Windows.Media.FontFamily("Consolas"),
+                FontFamily = new FontFamily("Consolas"),
                 FontSize = 12,
                 AcceptsReturn = true,
+                Background = (Brush)Application.Current.FindResource("CardBrush"),
+                Foreground = (Brush)Application.Current.FindResource("TextBrush"),
                 VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
                 HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
                 Margin = new Thickness(8)
@@ -509,9 +609,9 @@ public partial class MainWindow : Window
             StatusText.Text = "Falha no reparo.";
             // Mesmo em falha inesperada, oferecer o último recurso (reconstruir o log) p/ bancos de usuário.
             ResultPanel.Visibility = Visibility.Visible;
-            ResultPanel.Background = ProblemBack;
-            ResultPanel.BorderBrush = ProblemFore;
-            ResultText.Foreground = ProblemFore;
+            ResultPanel.SetResourceReference(Border.BackgroundProperty, "ProblemBackBrush");
+            ResultPanel.SetResourceReference(Border.BorderBrushProperty, "ProblemForeBrush");
+            ResultText.SetResourceReference(TextBlock.ForegroundProperty, "ProblemForeBrush");
             ResultText.Text = "Ocorreu uma falha durante o reparo: " + ex.Message;
             ShowLogRebuildOption(db);
         }
@@ -544,12 +644,12 @@ public partial class MainWindow : Window
         {
             case RepairStatus.Success:
             case RepairStatus.NoActionNeeded:
-                ResultPanel.Background = HealthyBack;
-                ResultPanel.BorderBrush = HealthyFore;
-                ResultText.Foreground = HealthyFore;
+                ResultPanel.SetResourceReference(Border.BackgroundProperty, "OkBackBrush");
+                ResultPanel.SetResourceReference(Border.BorderBrushProperty, "OkForeBrush");
+                ResultText.SetResourceReference(TextBlock.ForegroundProperty, "OkForeBrush");
                 DiagnosePanel.Visibility = Visibility.Collapsed;
                 DiagnosisResultPanel.Visibility = Visibility.Collapsed;
-                SafeRepairTitle.Visibility = Visibility.Collapsed;
+                RepairOptionsTitle.Visibility = Visibility.Collapsed;
                 SafeRepairPanel.Visibility = Visibility.Collapsed;
                 DataLossPanel.Visibility = Visibility.Collapsed;
                 LogRebuildPanel.Visibility = Visibility.Collapsed;
@@ -561,9 +661,9 @@ public partial class MainWindow : Window
                 break;
 
             case RepairStatus.NeedsDataLossConfirmation:
-                ResultPanel.Background = WarnBack;
-                ResultPanel.BorderBrush = WarnFore;
-                ResultText.Foreground = WarnFore;
+                ResultPanel.SetResourceReference(Border.BackgroundProperty, "WarnBackBrush");
+                ResultPanel.SetResourceReference(Border.BorderBrushProperty, "WarnLineBrush");
+                ResultText.SetResourceReference(TextBlock.ForegroundProperty, "WarnForeBrush");
                 // Oferece o reparo destrutivo, exigindo confirmação explícita.
                 DataLossPanel.Visibility = Visibility.Visible;
                 DataLossConfirmCheck.IsChecked = false;
@@ -574,9 +674,9 @@ public partial class MainWindow : Window
                 break;
 
             default: // Failed
-                ResultPanel.Background = ProblemBack;
-                ResultPanel.BorderBrush = ProblemFore;
-                ResultText.Foreground = ProblemFore;
+                ResultPanel.SetResourceReference(Border.BackgroundProperty, "ProblemBackBrush");
+                ResultPanel.SetResourceReference(Border.BorderBrushProperty, "ProblemForeBrush");
+                ResultText.SetResourceReference(TextBlock.ForegroundProperty, "ProblemForeBrush");
                 // Irreparável: oferecer o último recurso (reconstruir o log).
                 ShowLogRebuildOption(db);
                 break;

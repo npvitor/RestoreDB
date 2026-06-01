@@ -279,6 +279,12 @@ dotnet test tests/RestoreDB.IntegrationTests
 
 > Validado contra **SQL Server 2022 (Developer Edition)**: 41 testes de lógica + 10 de integração,
 > todos aprovados.
+>
+> **Também validado em produção contra SQL Server 2008 R2 SP3 (Express Edition, 10.50.6000.34)**
+> com **autenticação do Windows**: 41 testes de lógica + 10 de integração aprovados, e os fluxos de
+> reparo exercitados com **corrupção física real** (`DBCC WRITEPAGE`) sobre uma cópia de um banco de
+> produção (≈900 MB) — ver abaixo. O `Microsoft.Data.SqlClient` conecta-se ao 2008 R2 negociando
+> TLS 1.0 (emite apenas um **aviso** benigno; `Encrypt=Optional` torna a conexão possível).
 
 ### Validação com corrupção real
 
@@ -292,7 +298,11 @@ num banco de produção de teste, com backup prévio e restauração ao final:
 - **Restaurar de backup** ⇒ recupera 100% dos dados; corrige usuários órfãos.
 - O diagnóstico **reconcilia histórico × estado atual**: entradas antigas de `msdb.suspect_pages`
   e do log de erros não geram falso positivo quando o `DBCC CHECKDB` ao vivo está limpo.
+- **Reconstrução de log (último recurso)** sem privilégio de Administrador ⇒ a ferramenta **aborta
+  ANTES de desanexar** (pré-checagem de elevação), deixa o banco **intacto** e imprime as instruções
+  de recuperação manual — confirmando a garantia de "não piorar o estado".
+- Estados `OFFLINE` e `RESTORING` ⇒ religados sem perda (`SET ONLINE` / `RESTORE WITH RECOVERY`).
 
 O utilitário [`tools/RestoreDB.Probe`](tools/RestoreDB.Probe) é um runner de linha de comando que
-invoca os serviços reais (`diagnose`/`repair-indexes`/`repair`/`restore`) — usado nessa validação
-e útil para operar a ferramenta sem a interface gráfica.
+invoca os serviços reais (`diagnose`/`repair-indexes`/`repair`/`rebuild-log`/`restore`) — usado nessa
+validação e útil para operar a ferramenta sem a interface gráfica.
