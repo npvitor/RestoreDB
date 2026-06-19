@@ -104,6 +104,39 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         catch { /* best-effort */ }
     }
 
+    /// <summary>Lê o modelo de recuperação do banco (FULL / BULK_LOGGED / SIMPLE). Best-effort.</summary>
+    public async Task<string> GetRecoveryModelAsync(string databaseName, CancellationToken ct = default)
+    {
+        try
+        {
+            await using var cmd = new SqlCommand(
+                "SELECT recovery_model_desc FROM sys.databases WHERE name = @db;", _connection)
+            { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            return (await cmd.ExecuteScalarAsync(ct)) as string ?? string.Empty;
+        }
+        catch { return string.Empty; }
+    }
+
+    /// <summary>
+    /// Diretório utilizável para arquivos de um banco DESCARTÁVEL de teste — a pasta de dados do
+    /// tempdb, que existe e é gravável pela conta de serviço do SQL em qualquer versão (2008 R2+).
+    /// Devolve vazio se não for possível determinar.
+    /// </summary>
+    public async Task<string> GetScratchDataDirAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            const string sql =
+                "SELECT TOP (1) physical_name FROM sys.master_files " +
+                "WHERE database_id = DB_ID(N'tempdb') AND type = 0 ORDER BY file_id;";
+            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            var path = (await cmd.ExecuteScalarAsync(ct)) as string;
+            return string.IsNullOrEmpty(path) ? string.Empty : (System.IO.Path.GetDirectoryName(path) ?? string.Empty);
+        }
+        catch { return string.Empty; }
+    }
+
     /// <summary>Lê a opção PAGE_VERIFY do banco (NONE / TORN_PAGE_DETECTION / CHECKSUM). Best-effort.</summary>
     public async Task<string> GetPageVerifyOptionAsync(string databaseName, CancellationToken ct = default)
     {
@@ -271,6 +304,153 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
             // Banco inacessível / sem permissão: relatório fica vazio (Executed = false).
         }
         return report;
+    }
+
+    /// <summary>
+    /// Executa DBCC CHECKCONSTRAINTS WITH ALL_CONSTRAINTS, ALL_ERRORMSGS, TABLERESULTS no contexto
+    /// do banco alvo e devolve as violações de integridade LÓGICA (FK/CHECK) — que o CHECKDB NÃO
+    /// detecta. Resolve, para cada violação, se a constraint é uma chave estrangeira (sys.foreign_keys),
+    /// pois só FKs têm remoção automática de linhas órfãs. Best-effort. Compatível com 2008 R2.
+    /// </summary>
+    public async Task<List<ConstraintViolation>> CheckConstraintsAsync(string databaseName, CancellationToken ct = default)
+    {
+        var list = new List<ConstraintViolation>();
+        try
+        {
+            // CHECKCONSTRAINTS roda no banco CORRENTE; executamos no contexto do banco alvo.
+            const string sql =
+                "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
+                "DECLARE @stmt nvarchar(max) = N'DBCC CHECKCONSTRAINTS WITH ALL_CONSTRAINTS, ALL_ERRORMSGS, TABLERESULTS;';\n" +
+                "EXEC @proc @stmt;";
+            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+            var oTable = Ordinal(reader, "Table");
+            var oConstraint = Ordinal(reader, "Constraint");
+            var oWhere = Ordinal(reader, "Where");
+            while (await reader.ReadAsync(ct))
+            {
+                list.Add(new ConstraintViolation
+                {
+                    Table = GetStr(reader, oTable),
+                    Constraint = GetStr(reader, oConstraint),
+                    Where = GetStr(reader, oWhere)
+                });
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { return list; /* banco inacessível / sem permissão */ }
+
+        if (list.Count > 0)
+            await ResolveForeignKeyFlagsAsync(databaseName, list, ct);
+        return list;
+    }
+
+    /// <summary>Marca quais violações pertencem a chaves estrangeiras (sys.foreign_keys do banco alvo).</summary>
+    private async Task ResolveForeignKeyFlagsAsync(string databaseName, List<ConstraintViolation> violations, CancellationToken ct)
+    {
+        var fkNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            const string sql =
+                "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
+                "DECLARE @stmt nvarchar(max) = N'SELECT name FROM sys.foreign_keys;';\n" +
+                "EXEC @proc @stmt;";
+            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+                if (!r.IsDBNull(0)) fkNames.Add(r.GetString(0));
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* best-effort */ }
+
+        foreach (var v in violations)
+            v.IsForeignKey = fkNames.Contains(v.Constraint);
+    }
+
+    /// <summary>Lista os nomes de constraints (FK/CHECK) marcadas como NÃO confiáveis no banco alvo. Best-effort.</summary>
+    public async Task<List<string>> GetUntrustedConstraintsAsync(string databaseName, CancellationToken ct = default)
+    {
+        var list = new List<string>();
+        try
+        {
+            const string sql =
+                "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
+                "DECLARE @stmt nvarchar(max) = N'SELECT name FROM sys.foreign_keys WHERE is_not_trusted = 1 " +
+                "UNION ALL SELECT name FROM sys.check_constraints WHERE is_not_trusted = 1;';\n" +
+                "EXEC @proc @stmt;";
+            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+                if (!r.IsDBNull(0)) list.Add(r.GetString(0));
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* best-effort */ }
+        return list;
+    }
+
+    /// <summary>
+    /// Executa DBCC CHECKCATALOG (consistência de metadados) no banco alvo. Devolve as mensagens
+    /// de ERRO encontradas (vazio = catálogo íntegro). CHECKCATALOG não suporta TABLERESULTS;
+    /// capturamos as mensagens via InfoMessage/SqlException. Best-effort.
+    /// </summary>
+    public async Task<List<string>> CheckCatalogAsync(string databaseName, CancellationToken ct = default)
+    {
+        var errors = new List<string>();
+        void OnInfoMessage(object sender, SqlInfoMessageEventArgs e)
+        {
+            foreach (SqlError err in e.Errors)
+                if (err.Class > 10) errors.Add(FormatMessage(err)); // Class <= 10 = informativo (PRINT/DBCC ok)
+        }
+
+        _connection.InfoMessage += OnInfoMessage;
+        try
+        {
+            // CHECKCATALOG aceita o nome do banco diretamente (parametrizado via QUOTENAME).
+            const string sql =
+                "DECLARE @cmd nvarchar(max) = N'DBCC CHECKCATALOG (' + QUOTENAME(@db) + N') WITH NO_INFOMSGS;';\n" +
+                "EXEC sys.sp_executesql @cmd;";
+            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (SqlException ex)
+        {
+            foreach (SqlError err in ex.Errors)
+                errors.Add(FormatMessage(err));
+        }
+        catch { /* sem permissão / banco inacessível */ }
+        finally
+        {
+            _connection.InfoMessage -= OnInfoMessage;
+        }
+        return errors;
+    }
+
+    /// <summary>
+    /// Remove as linhas violadoras de uma constraint (DELETE FROM tabela WHERE predicado), no
+    /// contexto do banco alvo, usando o predicado gerado pelo próprio SQL Server (CHECKCONSTRAINTS).
+    /// Operação DESTRUTIVA — use apenas após confirmação. Devolve o nº de linhas removidas.
+    /// </summary>
+    public async Task<int> DeleteViolatingRowsAsync(string databaseName, ConstraintViolation violation, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(violation.Table) || string.IsNullOrWhiteSpace(violation.Where))
+            return 0;
+
+        // O DELETE roda NO CONTEXTO do banco alvo. Tabela e predicado vêm de metadados do servidor
+        // (DBCC CHECKCONSTRAINTS), não de entrada do usuário. Aspas simples são escapadas para o literal.
+        var inner = $"DELETE FROM {violation.Table} WHERE {violation.Where}";
+        var sql =
+            "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
+            "EXEC @proc @inner;";
+        await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
+        cmd.Parameters.AddWithValue("@db", databaseName);
+        cmd.Parameters.AddWithValue("@inner", inner);
+        return await cmd.ExecuteNonQueryAsync(ct);
     }
 
     /// <summary>Resolve o nome de um objeto (tabela/índice) a partir do object_id, dentro do banco alvo.</summary>
@@ -447,6 +627,8 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         var oServer = Ordinal(r, "ServerName");
         var oFirst = Ordinal(r, "FirstLSN");
         var oLast = Ordinal(r, "LastLSN");
+        var oDbBak = Ordinal(r, "DatabaseBackupLSN");
+        var oChk = Ordinal(r, "CheckpointLSN");
 
         while (await r.ReadAsync(ct))
         {
@@ -464,7 +646,9 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
                 ServerName = GetStr(r, oServer),
                 PhysicalDevice = diskPath,
                 FirstLsn = GetDecimal(r, oFirst),
-                LastLsn = GetDecimal(r, oLast)
+                LastLsn = GetDecimal(r, oLast),
+                DatabaseBackupLsn = GetDecimal(r, oDbBak),
+                CheckpointLsn = GetDecimal(r, oChk)
             });
         }
         return list;
@@ -503,11 +687,12 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
     {
         var list = new List<BackupSetInfo>();
         const string sql = @"
-SELECT TOP (50)
+SELECT TOP (100)
        bs.database_name, bs.type, bmf.physical_device_name,
        bs.backup_start_date, bs.backup_finish_date, bs.is_copy_only,
        bs.backup_size, ISNULL(bs.recovery_model, N''), ISNULL(bs.server_name, N''),
-       bs.first_lsn, bs.last_lsn
+       bs.first_lsn, bs.last_lsn, bs.database_backup_lsn, bs.checkpoint_lsn,
+       bs.position
 FROM   msdb.dbo.backupset AS bs
 JOIN   msdb.dbo.backupmediafamily AS bmf ON bmf.media_set_id = bs.media_set_id
 WHERE  bs.database_name = @db AND bmf.device_type IN (2, 102)  /* disco */
@@ -532,7 +717,9 @@ ORDER BY bs.backup_finish_date DESC;";
                     ServerName = r.IsDBNull(8) ? string.Empty : r.GetString(8),
                     FirstLsn = r.IsDBNull(9) ? 0 : Convert.ToDecimal(r.GetValue(9)),
                     LastLsn = r.IsDBNull(10) ? 0 : Convert.ToDecimal(r.GetValue(10)),
-                    Position = 1
+                    DatabaseBackupLsn = r.IsDBNull(11) ? 0 : Convert.ToDecimal(r.GetValue(11)),
+                    CheckpointLsn = r.IsDBNull(12) ? 0 : Convert.ToDecimal(r.GetValue(12)),
+                    Position = r.IsDBNull(13) ? 1 : Convert.ToInt32(r.GetValue(13))
                 });
             }
         }

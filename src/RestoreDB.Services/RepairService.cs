@@ -49,7 +49,7 @@ public sealed class RepairService
         {
             status = state.Trim().ToUpperInvariant() switch
             {
-                "ONLINE"           => RepairStatus.NoActionNeeded,
+                "ONLINE"           => await OnlineRepairFlowAsync(session, db, allowDataLoss, progress, ct),
                 "OFFLINE"          => await BringOnlineAsync(session, db, progress, ct),
                 "RESTORING"        => await RestoreWithRecoveryAsync(session, db, progress, ct),
                 "RECOVERING"       => await RestoreWithRecoveryAsync(session, db, progress, ct),
@@ -164,6 +164,10 @@ public sealed class RepairService
             await TryStructuredCheckDbAsync(session, db, diag, progress, ct);
             var checkDbClean = diag.CheckDb is { Executed: true, HasErrors: false };
 
+            // Integridade LÓGICA (FK órfã / CHECK / catálogo) — o CHECKDB NÃO cobre isso. Roda
+            // sempre que o banco está acessível (mesmo ONLINE aparentemente saudável).
+            await TryLogicalIntegrityChecksAsync(session, db, diag, progress, ct);
+
             // Páginas suspeitas (msdb.dbo.suspect_pages). Reconciliadas com o CHECKDB: se o CHECKDB
             // está limpo, as entradas referem-se a corrupção JÁ RESOLVIDA (o SQL Server não as
             // remove automaticamente). Só são "corrupção ativa" se o CHECKDB também acusar (ou não
@@ -216,6 +220,9 @@ public sealed class RepairService
                 if (!checkDbClean && refLog) diag.LogCorruptionSuspected = true;
                 if (!checkDbClean && refData) diag.DataCorruptionSuspected = true;
             }
+
+            // Avaliação da política de backup/recuperação (RPO) — advisory, não muda a ação recomendada.
+            await TryAssessBackupPolicyAsync(session, db, diag, progress, ct);
 
             BuildConclusion(diag);
 
@@ -302,14 +309,97 @@ public sealed class RepairService
                 "Toda a corrupção está em índices NÃO clusterizados — reconstruíveis SEM perda de dados.");
     }
 
+    /// <summary>
+    /// Verifica a integridade LÓGICA do banco — o que o DBCC CHECKDB NÃO faz: consistência de
+    /// metadados (CHECKCATALOG), constraints não confiáveis e, principalmente, violações de chave
+    /// estrangeira / CHECK (CHECKCONSTRAINTS), como o registro órfão cuja FK aponta para uma PK
+    /// inexistente. Só roda quando o banco está acessível (o CHECKDB conseguiu executar).
+    /// </summary>
+    private async Task TryLogicalIntegrityChecksAsync(SqlSession session, DatabaseInfo db, DiagnosisResult diag, IProgress<RepairLogEntry> progress, CancellationToken ct)
+    {
+        if (diag.CheckDb is not { Executed: true })
+        {
+            Report(progress, db.Name, RepairLogLevel.Info,
+                "Verificação de integridade lógica adiada (banco inacessível neste estado).");
+            return;
+        }
+
+        Report(progress, db.Name, RepairLogLevel.Info, "Verificando integridade LÓGICA (DBCC CHECKCATALOG / CHECKCONSTRAINTS)...");
+
+        // Consistência de metadados.
+        var catalog = await session.CheckCatalogAsync(db.Name, ct);
+        if (catalog.Count > 0)
+        {
+            diag.CatalogErrors.AddRange(catalog);
+            diag.LogicalCorruptionSuspected = true;
+            Report(progress, db.Name, RepairLogLevel.Warning, $"DBCC CHECKCATALOG: {catalog.Count} inconsistência(s) de metadados.");
+            foreach (var e in catalog.Take(5)) Report(progress, db.Name, RepairLogLevel.Warning, "  • " + e);
+        }
+
+        // Constraints não confiáveis: integridade nunca validada (causa comum de FK órfã silenciosa).
+        var untrusted = await session.GetUntrustedConstraintsAsync(db.Name, ct);
+        if (untrusted.Count > 0)
+        {
+            diag.UntrustedConstraints.AddRange(untrusted);
+            Report(progress, db.Name, RepairLogLevel.Info,
+                $"{untrusted.Count} constraint(s) NÃO confiável(is) (is_not_trusted): {string.Join(", ", untrusted.Take(10))}.");
+        }
+
+        // Violações de FK/CHECK (o caso do registro órfão).
+        var violations = await session.CheckConstraintsAsync(db.Name, ct);
+        if (violations.Count > 0)
+        {
+            diag.ConstraintViolations.AddRange(violations);
+            diag.LogicalCorruptionSuspected = true;
+            var fk = violations.Count(v => v.IsForeignKey);
+            Report(progress, db.Name, RepairLogLevel.Warning,
+                $"DBCC CHECKCONSTRAINTS: {violations.Count} violação(ões) de integridade ({fk} de chave estrangeira).");
+            foreach (var v in violations.Take(8)) Report(progress, db.Name, RepairLogLevel.Warning, "  • " + v.Display);
+        }
+        else if (catalog.Count == 0)
+        {
+            Report(progress, db.Name, RepairLogLevel.Success, "Integridade lógica (constraints/catálogo) OK.");
+        }
+    }
+
+    /// <summary>
+    /// Avalia a política de backup/recuperação (modelo × histórico de backups) e registra os
+    /// achados de RPO no diagnóstico. Best-effort: sem permissão em msdb, apenas não contribui.
+    /// </summary>
+    private async Task TryAssessBackupPolicyAsync(SqlSession session, DatabaseInfo db, DiagnosisResult diag, IProgress<RepairLogEntry> progress, CancellationToken ct)
+    {
+        if (AppConstants.IsSystemDatabase(db.Name)) return;
+        try
+        {
+            var model = await session.GetRecoveryModelAsync(db.Name, ct);
+            var history = await session.GetBackupHistoryAsync(db.Name, ct);
+            var assess = BackupPolicyEvaluator.Evaluate(db.Name, model, history, DateTime.Now);
+            diag.BackupPolicy = assess;
+
+            Report(progress, db.Name, assess.HasRisk ? RepairLogLevel.Warning : RepairLogLevel.Info,
+                $"Política de backup (modelo {(model.Length > 0 ? model : "?")}): {assess.Summary}");
+            foreach (var f in assess.Findings)
+                Report(progress, db.Name, SeverityToLevel(f.Severity), "  • " + f.Message);
+        }
+        catch { /* best-effort */ }
+    }
+
+    private static RepairLogLevel SeverityToLevel(FindingSeverity s) => s switch
+    {
+        FindingSeverity.Critical => RepairLogLevel.Error,
+        FindingSeverity.High or FindingSeverity.Medium => RepairLogLevel.Warning,
+        _ => RepairLogLevel.Info
+    };
+
     private static void BuildConclusion(DiagnosisResult d)
     {
-        // Estado íntegro: CHECKDB ao vivo limpo e sem flags ativas (histórico já reconciliado).
+        // Estado íntegro: CHECKDB ao vivo limpo, integridade lógica OK e sem flags ativas.
         if (d.CheckDb is { Executed: true, HasErrors: false }
-            && !d.DataCorruptionSuspected && !d.LogCorruptionSuspected && !d.LogFull)
+            && !d.DataCorruptionSuspected && !d.LogCorruptionSuspected && !d.LogFull
+            && !d.LogicalCorruptionSuspected)
         {
             d.RecommendedAction = RecommendedActionKind.NoAction;
-            d.Summary = "Nenhuma corrupção detectada — DBCC CHECKDB íntegro.";
+            d.Summary = "Nenhuma corrupção detectada — DBCC CHECKDB e integridade lógica íntegros.";
             d.Recommendation = string.Empty;
             return;
         }
@@ -324,6 +414,21 @@ public sealed class RepairService
             d.RecommendedAction = RecommendedActionKind.RebuildIndexesOnly;
             d.Summary = "A corrupção está restrita a índices NÃO clusterizados.";
             d.Recommendation = "Use 'Reparar índices (sem perda de dados)': basta reconstruir os índices afetados (ALTER INDEX REBUILD). Nenhum dado é perdido." + topoNote;
+            return;
+        }
+
+        // 1b) Integridade LÓGICA comprometida (FK órfã / constraint) com os arquivos FÍSICOS
+        //     íntegros → remover as linhas violadoras. O CHECKDB não conserta isso. Físico tem
+        //     prioridade: só recomenda esta correção quando não há corrupção de dados/log.
+        if (d.LogicalCorruptionSuspected && !d.DataCorruptionSuspected && !d.LogCorruptionSuspected && !d.LogFull)
+        {
+            var fk = d.ForeignKeyViolations.Count;
+            d.RecommendedAction = RecommendedActionKind.FixConstraints;
+            d.Summary = "Integridade LÓGICA comprometida: há violações de constraint (arquivos físicos íntegros).";
+            d.Recommendation = (fk > 0
+                ? $"Há {fk} violação(ões) de chave estrangeira (registros órfãos). Use 'Corrigir integridade (remover registros órfãos)' — operação destrutiva, com backup de segurança antes. "
+                : "Há violações de CHECK e/ou inconsistências de catálogo; revise os dados. ")
+                + "Para preservar 100% dos registros, prefira RESTAURAR de backup." + topoNote;
             return;
         }
 
@@ -548,8 +653,189 @@ public sealed class RepairService
         var verifyFinal = await RunStepAsync(s, db, p, "Verificação final (DBCC CHECKDB)",
             Dbcc(db.Name, repairOption: null, noInfoMsgs: true), ct);
 
+        // O REPAIR_ALLOW_DATA_LOSS desaloca páginas SEM respeitar constraints — pode deixar
+        // chaves estrangeiras órfãs. Como a perda de dados já foi autorizada, reconciliamos.
+        await TryReconcileConstraintsAsync(s, db, p, allowDataLoss: true, ct);
+
         await TrySetMultiUserAsync(s, db, p, ct);
         return verifyFinal.Success ? RepairStatus.Success : RepairStatus.Failed;
+    }
+
+    /// <summary>
+    /// Banco ONLINE: pode estar realmente saudável OU corrompido sem o estado indicar (corrupção
+    /// física que só o CHECKDB revela, ou FK órfã que só o CHECKCONSTRAINTS revela). Verifica e,
+    /// se houver corrupção, repara em SINGLE_USER (sem precisar de EMERGENCY, pois já está ONLINE):
+    /// índices não-clusterizados / REPAIR_REBUILD (sem perda) → e, só com confirmação,
+    /// REPAIR_ALLOW_DATA_LOSS / remoção de órfãos (com perda).
+    /// </summary>
+    private async Task<RepairStatus> OnlineRepairFlowAsync(SqlSession s, DatabaseInfo db, bool allowDataLoss, IProgress<RepairLogEntry> p, CancellationToken ct)
+    {
+        Report(p, db.Name, RepairLogLevel.Info, "Banco ONLINE: verificando consistência física e lógica antes de decidir...");
+        var report = await s.CheckDbWithResultsAsync(db.Name, repairOption: null, ct);
+        var hasPhysical = report is { Executed: true, HasErrors: true };
+
+        var violations = await s.CheckConstraintsAsync(db.Name, ct);
+        var fkViolations = violations.Where(v => v.IsForeignKey).ToList();
+
+        if (!hasPhysical && violations.Count == 0)
+        {
+            Report(p, db.Name, RepairLogLevel.Success, "DBCC CHECKDB e CHECKCONSTRAINTS sem erros — banco íntegro.");
+            return RepairStatus.NoActionNeeded;
+        }
+
+        if (AppConstants.IsSystemDatabase(db.Name))
+        {
+            Report(p, db.Name, RepairLogLevel.Error,
+                "Banco de sistema corrompido: não pode ser reparado por esta ferramenta. Acione o DBA/suporte.");
+            return RepairStatus.Failed;
+        }
+        if (await IsTopologyRiskyAsync(s, db, p, ct))
+            return RepairStatus.Failed;
+
+        // ---- Corrupção FÍSICA presente ----
+        if (hasPhysical)
+        {
+            Report(p, db.Name, RepairLogLevel.Warning,
+                $"DBCC CHECKDB acusou {report.ErrorCount} erro(s) num banco ONLINE. Reparando em acesso exclusivo...");
+            var single = await RunStepAsync(s, db, p,
+                "Obtendo acesso exclusivo (SINGLE_USER WITH ROLLBACK IMMEDIATE)",
+                AlterDatabase(db.Name, "SET SINGLE_USER WITH ROLLBACK IMMEDIATE"), ct);
+            if (!single.Success)
+            {
+                Report(p, db.Name, RepairLogLevel.Error, "Não foi possível obter acesso exclusivo ao banco.");
+                await TrySetMultiUserAsync(s, db, p, ct);
+                return RepairStatus.Failed;
+            }
+
+            try
+            {
+                // a) Corrupção só em índices não-clusterizados → reconstrução SEM perda.
+                if (report.AllErrorsAreNonClusteredIndex)
+                {
+                    Report(p, db.Name, RepairLogLevel.Info,
+                        "Corrupção restrita a índices não-clusterizados — reconstruindo (SEM perda de dados)...");
+                    var rebuilt = await RebuildNonClusteredIndexesAsync(s, db, report, p, ct);
+                    var verifyIdx = await RunStepAsync(s, db, p, "Verificação pós-reconstrução de índices (DBCC CHECKDB)",
+                        Dbcc(db.Name, repairOption: null, noInfoMsgs: true), ct);
+                    if (rebuilt && verifyIdx.Success)
+                    {
+                        await s.ClearSuspectPagesAsync(db.Name, ct);
+                        return RepairStatus.Success;
+                    }
+                }
+
+                // b) REPAIR_REBUILD (sem perda; exige ONLINE + SINGLE_USER — ambos satisfeitos).
+                Report(p, db.Name, RepairLogLevel.Info, "Tentando reparo SEM perda de dados (REPAIR_REBUILD)...");
+                var rebuild = await RunStepAsync(s, db, p, "Reparo SEM perda (REPAIR_REBUILD)",
+                    Dbcc(db.Name, "REPAIR_REBUILD", noInfoMsgs: false), ct);
+                var verify = await RunStepAsync(s, db, p, "Verificação pós-reparo (DBCC CHECKDB)",
+                    Dbcc(db.Name, repairOption: null, noInfoMsgs: true), ct);
+                if (rebuild.Success && verify.Success)
+                    return RepairStatus.Success;
+
+                // c) Precisa de REPAIR_ALLOW_DATA_LOSS.
+                if (!allowDataLoss)
+                {
+                    Report(p, db.Name, RepairLogLevel.Warning,
+                        "O reparo SEM perda não foi suficiente. É necessária CONFIRMAÇÃO para o reparo COM possível perda de dados.");
+                    return RepairStatus.NeedsDataLossConfirmation;
+                }
+
+                Report(p, db.Name, RepairLogLevel.Warning, "ATENÇÃO: reparo COM POSSÍVEL PERDA DE DADOS (autorizado).");
+                await TrySafetyNetAsync(s, db, p, ct);
+                await RunStepAsync(s, db, p, "Reparo COM possível PERDA DE DADOS (REPAIR_ALLOW_DATA_LOSS)",
+                    Dbcc(db.Name, "REPAIR_ALLOW_DATA_LOSS", noInfoMsgs: false), ct);
+                var verifyFinal = await RunStepAsync(s, db, p, "Verificação final (DBCC CHECKDB)",
+                    Dbcc(db.Name, repairOption: null, noInfoMsgs: true), ct);
+                await TryReconcileConstraintsAsync(s, db, p, allowDataLoss: true, ct);
+                return verifyFinal.Success ? RepairStatus.Success : RepairStatus.Failed;
+            }
+            finally
+            {
+                await TrySetMultiUserAsync(s, db, p, ct);
+            }
+        }
+
+        // ---- Apenas corrupção LÓGICA (físico íntegro) ----
+        if (fkViolations.Count == 0)
+        {
+            Report(p, db.Name, RepairLogLevel.Warning,
+                "Há violações de CHECK e/ou catálogo (sem FK órfã removível automaticamente). Revise os dados ou restaure de backup.");
+            return RepairStatus.Failed;
+        }
+
+        if (!allowDataLoss)
+        {
+            Report(p, db.Name, RepairLogLevel.Warning,
+                $"Encontrados {fkViolations.Count} registro(s) órfão(s) de chave estrangeira. A remoção é destrutiva e requer CONFIRMAÇÃO.");
+            return RepairStatus.NeedsDataLossConfirmation;
+        }
+
+        var singleL = await RunStepAsync(s, db, p,
+            "Obtendo acesso exclusivo (SINGLE_USER WITH ROLLBACK IMMEDIATE)",
+            AlterDatabase(db.Name, "SET SINGLE_USER WITH ROLLBACK IMMEDIATE"), ct);
+        if (!singleL.Success)
+        {
+            await TrySetMultiUserAsync(s, db, p, ct);
+            return RepairStatus.Failed;
+        }
+        try
+        {
+            await TrySafetyNetAsync(s, db, p, ct);
+            await TryReconcileConstraintsAsync(s, db, p, allowDataLoss: true, ct);
+            var remaining = await s.CheckConstraintsAsync(db.Name, ct);
+            return remaining.Count(v => v.IsForeignKey) == 0 ? RepairStatus.Success : RepairStatus.Failed;
+        }
+        finally
+        {
+            await TrySetMultiUserAsync(s, db, p, ct);
+        }
+    }
+
+    /// <summary>
+    /// Reconciliação de integridade referencial após um reparo com perda de dados: localiza as
+    /// linhas que violam chaves estrangeiras (registros órfãos) e, quando a perda já foi
+    /// autorizada, remove-as. Best-effort — nunca derruba o fluxo de reparo.
+    /// </summary>
+    private async Task TryReconcileConstraintsAsync(SqlSession s, DatabaseInfo db, IProgress<RepairLogEntry> p, bool allowDataLoss, CancellationToken ct)
+    {
+        try
+        {
+            var violations = await s.CheckConstraintsAsync(db.Name, ct);
+            var fk = violations.Where(v => v.IsForeignKey).ToList();
+            if (fk.Count == 0) return;
+
+            Report(p, db.Name, RepairLogLevel.Warning,
+                $"Integridade referencial: {fk.Count} violação(ões) de chave estrangeira (registros órfãos) após o reparo.");
+
+            if (!allowDataLoss)
+            {
+                Report(p, db.Name, RepairLogLevel.Info,
+                    "Use 'Corrigir integridade (remover registros órfãos)' para resolvê-las (operação destrutiva, requer confirmação).");
+                return;
+            }
+
+            var total = 0;
+            foreach (var v in fk)
+            {
+                try
+                {
+                    var removed = await s.DeleteViolatingRowsAsync(db.Name, v, ct);
+                    total += removed;
+                    Report(p, db.Name, RepairLogLevel.Success, $"  ✔ {removed} registro(s) órfão(s) removido(s) — {v.Display}");
+                }
+                catch (Exception ex)
+                {
+                    Report(p, db.Name, RepairLogLevel.Warning, $"  ⚠ Não foi possível remover órfãos de {v.Constraint}: {ex.Message}");
+                }
+            }
+            Report(p, db.Name, total > 0 ? RepairLogLevel.Success : RepairLogLevel.Info,
+                $"Reconciliação de integridade concluída: {total} registro(s) órfão(s) removido(s).");
+        }
+        catch
+        {
+            // best-effort: a reconciliação nunca deve derrubar o reparo.
+        }
     }
 
     // ----------------------------------------------------------------------------------
@@ -1026,6 +1312,108 @@ public sealed class RepairService
             // 1) Religa na PRÓPRIA sessão (que é a dona do slot SINGLE_USER quando viva).
             await TrySetMultiUserAsync(session, db, progress, CancellationToken.None);
             // 2) Backstop em conexão NOVA, caso a sessão tenha sido derrubada por um erro severo (824).
+            result.FinalStateDesc = await ForceMultiUserAsync(connectionString, db, progress);
+            db.StateDesc = result.FinalStateDesc;
+        }
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Correção de integridade LÓGICA: remoção de registros órfãos (violação de FK)
+    // ----------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Corrige a integridade referencial removendo os registros órfãos (linhas cuja chave
+    /// estrangeira aponta para uma chave primária inexistente), detectados por DBCC CHECKCONSTRAINTS.
+    /// Operação DESTRUTIVA (descarta linhas) — a UI exige confirmação explícita. Obtém acesso
+    /// exclusivo, faz backup/cópia de segurança, remove as linhas violadoras e reverifica.
+    /// Violações de CHECK constraint são apenas reportadas (não removidas automaticamente).
+    /// </summary>
+    public async Task<RepairResult> FixConstraintViolationsAsync(
+        DatabaseInfo db, string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default)
+    {
+        var result = new RepairResult();
+        Report(progress, db.Name, RepairLogLevel.Warning,
+            $"════════ Correção de integridade lógica (remoção de registros órfãos) de [{db.Name}] ════════");
+
+        if (AppConstants.IsSystemDatabase(db.Name))
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = "Banco de sistema: a correção de integridade não é permitida por esta ferramenta.";
+            Report(progress, db.Name, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+
+        await using var session = await _data.OpenSessionAsync(connectionString, ct);
+
+        if (await IsTopologyRiskyAsync(session, db, progress, ct))
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = "Operação bloqueada pela topologia de alta disponibilidade/replicação.";
+            return result;
+        }
+
+        try
+        {
+            await RunStepAsync(session, db, progress, "Obtendo acesso exclusivo (SINGLE_USER WITH ROLLBACK IMMEDIATE)",
+                AlterDatabase(db.Name, "SET SINGLE_USER WITH ROLLBACK IMMEDIATE"), ct);
+
+            var violations = await session.CheckConstraintsAsync(db.Name, ct);
+            var fk = violations.Where(v => v.IsForeignKey).ToList();
+            var checkOnly = violations.Where(v => !v.IsForeignKey).ToList();
+
+            if (violations.Count == 0)
+            {
+                result.Status = RepairStatus.Success;
+                result.Message = "Nenhuma violação de integridade encontrada — nada a corrigir.";
+                Report(progress, db.Name, RepairLogLevel.Success, result.Message);
+                return result;
+            }
+
+            foreach (var v in checkOnly)
+                Report(progress, db.Name, RepairLogLevel.Warning,
+                    $"Violação de CHECK (NÃO removida automaticamente — revise): {v.Display}");
+
+            if (fk.Count == 0)
+            {
+                result.Status = RepairStatus.Failed;
+                result.Message = "Há apenas violações de CHECK constraint, que exigem revisão manual dos dados (ou restauração de backup).";
+                Report(progress, db.Name, RepairLogLevel.Warning, result.Message);
+                return result;
+            }
+
+            // Rede de segurança antes de descartar linhas.
+            await TrySafetyNetAsync(session, db, progress, ct);
+
+            var total = 0;
+            var ok = true;
+            foreach (var v in fk)
+            {
+                try
+                {
+                    var removed = await session.DeleteViolatingRowsAsync(db.Name, v, ct);
+                    total += removed;
+                    Report(progress, db.Name, RepairLogLevel.Success, $"Removidos {removed} registro(s) órfão(s) — {v.Display}");
+                }
+                catch (Exception ex)
+                {
+                    ok = false;
+                    Report(progress, db.Name, RepairLogLevel.Error, $"Falha ao remover órfãos de {v.Constraint}: {ex.Message}");
+                }
+            }
+
+            var remaining = await session.CheckConstraintsAsync(db.Name, ct);
+            var remainingFk = remaining.Count(v => v.IsForeignKey);
+
+            result.Status = ok && remainingFk == 0 ? RepairStatus.Success : RepairStatus.Failed;
+            result.Message = result.Status == RepairStatus.Success
+                ? $"Integridade referencial restaurada: {total} registro(s) órfão(s) removido(s)."
+                : $"Removidos {total} registro(s), mas ainda restam {remainingFk} violação(ões) de FK. Verifique o log.";
+            Report(progress, db.Name, result.Status == RepairStatus.Success ? RepairLogLevel.Success : RepairLogLevel.Warning, result.Message);
+            return result;
+        }
+        finally
+        {
+            await TrySetMultiUserAsync(session, db, progress, CancellationToken.None);
             result.FinalStateDesc = await ForceMultiUserAsync(connectionString, db, progress);
             db.StateDesc = result.FinalStateDesc;
         }

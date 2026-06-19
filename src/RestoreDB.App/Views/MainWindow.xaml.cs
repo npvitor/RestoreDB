@@ -158,13 +158,18 @@ public partial class MainWindow : Window
             DiagnosisResultPanel.Visibility = Visibility.Collapsed;
             TopologyWarnPanel.Visibility = Visibility.Collapsed;
             IndexRepairPanel.Visibility = Visibility.Collapsed;
+            ConstraintFixPanel.Visibility = Visibility.Collapsed;
+            ConstraintFixConfirmCheck.IsChecked = false;
+            ConstraintFixButton.IsEnabled = false;
             RestorePanel.Visibility = Visibility.Collapsed;
             ViewScriptButton.Visibility = Visibility.Collapsed;
             _backupSets.Clear();
             BackupSourceText.Text = string.Empty;
 
-            DiagnosePanel.Visibility = db.IsProblematic ? Visibility.Visible : Visibility.Collapsed;
-            DiagnoseButton.IsEnabled = db.IsProblematic && !_busy;
+            // Qualquer banco pode ser diagnosticado — inclusive ONLINE: a corrupção física ou de
+            // integridade (FK órfã) nem sempre se reflete no estado do banco.
+            DiagnosePanel.Visibility = Visibility.Visible;
+            DiagnoseButton.IsEnabled = !_busy;
             HealthyPanel.Visibility = db.IsHealthy ? Visibility.Visible : Visibility.Collapsed;
             SystemDbPanel.Visibility = db is { IsProblematic: true, IsSystemDatabase: true }
                 ? Visibility.Visible : Visibility.Collapsed;
@@ -246,6 +251,7 @@ public partial class MainWindow : Window
     {
         // Estado inicial: tudo oculto; cada caso revela o que faz sentido.
         IndexRepairPanel.Visibility = Visibility.Collapsed;
+        ConstraintFixPanel.Visibility = Visibility.Collapsed;
         SafeRepairPanel.Visibility = Visibility.Collapsed;
         ViewScriptButton.Visibility = Visibility.Collapsed;
         RestorePanel.Visibility = Visibility.Collapsed;
@@ -280,10 +286,26 @@ public partial class MainWindow : Window
                 IndexRepairPanel.Visibility = Visibility.Visible;
                 break;
 
-            // Corrupção de DADOS → restaurar de backup é o caminho correto.
+            // Corrupção LÓGICA (FK órfã) com físico íntegro → remover registros órfãos.
+            case RecommendedActionKind.FixConstraints:
+                ConstraintFixPanel.Visibility = Visibility.Visible;
+                ConstraintFixConfirmCheck.IsChecked = false;
+                ConstraintFixButton.IsEnabled = false;
+                if (diag.ForeignKeyViolations.Count > 0)
+                    ConstraintFixText.Text =
+                        $"Foram encontrados {diag.ForeignKeyViolations.Count} registro(s) órfão(s) (chave estrangeira apontando para um registro inexistente) — o DBCC CHECKDB não detecta isso. " +
+                        "A correção REMOVE essas linhas para restaurar a integridade (operação destrutiva, com backup de segurança antes). Para preservar 100% dos registros, prefira restaurar de backup.";
+                // Restaurar de backup também é uma alternativa que preserva os dados.
+                await ShowRestoreOptionAsync(db);
+                break;
+
+            // Corrupção de DADOS → restaurar de backup é o caminho correto; o reparo (REPAIR_REBUILD →
+            // e, com confirmação, REPAIR_ALLOW_DATA_LOSS) fica disponível como alternativa.
             case RecommendedActionKind.RestoreFromBackup:
             case RecommendedActionKind.PageRestore:
                 await ShowRestoreOptionAsync(db);
+                SafeRepairPanel.Visibility = Visibility.Visible;
+                ViewScriptButton.Visibility = Visibility.Visible;
                 break;
 
             // Problema de LOG → reparo seguro (reconstrói o log sem Administrador) e, como
@@ -332,6 +354,7 @@ public partial class MainWindow : Window
         RecommendedActionKind.RestoreFromBackup => "→ Ação recomendada: restaurar de backup.",
         RecommendedActionKind.PageRestore => "→ Ação recomendada: restaurar as páginas afetadas (ou de backup).",
         RecommendedActionKind.RebuildLog => "→ Ação recomendada: reconstruir o log de transações.",
+        RecommendedActionKind.FixConstraints => "→ Ação recomendada: corrigir integridade lógica (remover registros órfãos).",
         RecommendedActionKind.FreeDiskSpace => "→ Ação recomendada: liberar espaço em disco e religar o banco.",
         RecommendedActionKind.ReviewTopology => "→ Ação recomendada: revisar a topologia antes de qualquer reparo.",
         _ => "→ Ação recomendada: reparo no modo seguro."
@@ -345,6 +368,7 @@ public partial class MainWindow : Window
         RecommendedActionKind.SafeRepair => ("OkBackBrush", "OkForeBrush"),
         RecommendedActionKind.RestoreFromBackup => ("ProblemBackBrush", "ProblemForeBrush"),
         RecommendedActionKind.PageRestore => ("ProblemBackBrush", "ProblemForeBrush"),
+        RecommendedActionKind.FixConstraints => ("WarnBackBrush", "WarnForeBrush"),
         _ => ("WarnBackBrush", "WarnForeBrush")
     };
 
@@ -372,6 +396,55 @@ public partial class MainWindow : Window
         {
             StatusText.Text = "Falha ao reparar índices.";
             ShowError("Não foi possível reparar os índices.", ex);
+        }
+        finally
+        {
+            SetBusy(false);
+            RefreshStateLabels(db);
+        }
+    }
+
+    // ------------------------------------------------------------------ Corrigir integridade lógica (FK órfã)
+
+    private void ConstraintFixConfirmCheck_Changed(object sender, RoutedEventArgs e)
+        => ConstraintFixButton.IsEnabled = ConstraintFixConfirmCheck.IsChecked == true && !_busy;
+
+    private void ConstraintFixButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+
+        var confirm = MessageBox.Show(
+            $"Corrigir a integridade do banco \"{db.Name}\" REMOVENDO os registros órfãos?\n\n" +
+            "As linhas cuja chave estrangeira aponta para um registro inexistente serão EXCLUÍDAS " +
+            "de forma irreversível. Será feito um backup de segurança antes.\n\n" +
+            "Para preservar 100% dos registros, prefira restaurar de backup. Deseja continuar?",
+            "Confirmar correção de integridade",
+            MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+
+        if (confirm == MessageBoxResult.Yes)
+            _ = RunFixConstraintsAsync(db);
+    }
+
+    private async Task RunFixConstraintsAsync(DatabaseInfo db)
+    {
+        if (_busy) return;
+
+        SetBusy(true);
+        ResultPanel.Visibility = Visibility.Collapsed;
+        StatusText.Text = $"Corrigindo integridade de \"{db.Name}\"...";
+        try
+        {
+            var result = await _repairService.FixConstraintViolationsAsync(db, _connectionString, _progress, _cts!.Token);
+            HandleRepairResult(db, result);
+            if (result.Status == RepairStatus.Success)
+                ConstraintFixPanel.Visibility = Visibility.Collapsed;
+            StatusText.Text = result.Message;
+        }
+        catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
+        catch (Exception ex)
+        {
+            StatusText.Text = "Falha ao corrigir a integridade.";
+            ShowError("Não foi possível corrigir a integridade do banco.", ex);
         }
         finally
         {
@@ -486,6 +559,92 @@ public partial class MainWindow : Window
         {
             StatusText.Text = "Falha na restauração.";
             ShowError("Não foi possível restaurar o banco.", ex);
+        }
+        finally
+        {
+            SetBusy(false);
+            RefreshStateLabels(db);
+        }
+    }
+
+    // ------------------------------------------------------------------ Testar backup / cadeia completa
+
+    private void TestRestoreButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+        if (BackupSetsList.SelectedItem is not BackupSetInfo set)
+        {
+            ShowError("Selecione um backup na lista para testar.", new InvalidOperationException("Nenhum backup selecionado."));
+            return;
+        }
+        _ = RunTestRestoreAsync(db, set);
+    }
+
+    private async Task RunTestRestoreAsync(DatabaseInfo db, BackupSetInfo set)
+    {
+        if (_busy) return;
+        SetBusy(true);
+        ResultPanel.Visibility = Visibility.Collapsed;
+        StatusText.Text = $"Testando o backup de \"{db.Name}\" (restauração de teste)...";
+        try
+        {
+            var pieces = new List<RestorePiece>
+            {
+                new() { DiskPath = set.PhysicalDevice, Position = set.Position, IsLog = false }
+            };
+            var result = await _restoreService.TestRestoreAsync(db.Name, pieces, _connectionString, _progress, _cts!.Token);
+            // É um teste: não altera o estado do banco real; mostra só o resultado.
+            ResultPanel.Visibility = Visibility.Visible;
+            ResultText.Text = result.Message;
+            var okKeys = result.Status == RepairStatus.Success;
+            ResultPanel.SetResourceReference(Border.BackgroundProperty, okKeys ? "OkBackBrush" : "WarnBackBrush");
+            ResultPanel.SetResourceReference(Border.BorderBrushProperty, okKeys ? "OkForeBrush" : "WarnLineBrush");
+            ResultText.SetResourceReference(TextBlock.ForegroundProperty, okKeys ? "OkForeBrush" : "WarnForeBrush");
+            StatusText.Text = result.Message;
+        }
+        catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
+        catch (Exception ex)
+        {
+            StatusText.Text = "Falha ao testar o backup.";
+            ShowError("Não foi possível testar o backup.", ex);
+        }
+        finally { SetBusy(false); }
+    }
+
+    private void RestoreChainButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+
+        var confirm = MessageBox.Show(
+            $"Restaurar o banco \"{db.Name}\" pela CADEIA COMPLETA até o ponto mais recente?\n\n" +
+            "A ferramenta monta automaticamente FULL → diferencial → logs do histórico (msdb), captura o " +
+            "tail-log das transações mais recentes e SUBSTITUI o banco atual. A cadeia é validada antes de executar.\n\n" +
+            "Deseja continuar?",
+            "Confirmar restauração da cadeia completa",
+            MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+
+        if (confirm == MessageBoxResult.Yes)
+            _ = RunRestoreChainAsync(db);
+    }
+
+    private async Task RunRestoreChainAsync(DatabaseInfo db)
+    {
+        if (_busy) return;
+        SetBusy(true);
+        ResultPanel.Visibility = Visibility.Collapsed;
+        StatusText.Text = $"Restaurando a cadeia completa de \"{db.Name}\"...";
+        try
+        {
+            var result = await _restoreService.RestoreToPointInTimeAsync(
+                db.Name, target: null, tailLogBackup: true, _connectionString, _progress, _cts!.Token);
+            HandleRepairResult(db, result);
+            StatusText.Text = result.Message;
+        }
+        catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
+        catch (Exception ex)
+        {
+            StatusText.Text = "Falha na restauração da cadeia.";
+            ShowError("Não foi possível restaurar a cadeia completa.", ex);
         }
         finally
         {
@@ -654,6 +813,7 @@ public partial class MainWindow : Window
                 DataLossPanel.Visibility = Visibility.Collapsed;
                 LogRebuildPanel.Visibility = Visibility.Collapsed;
                 IndexRepairPanel.Visibility = Visibility.Collapsed;
+                ConstraintFixPanel.Visibility = Visibility.Collapsed;
                 RestorePanel.Visibility = Visibility.Collapsed;
                 TopologyWarnPanel.Visibility = Visibility.Collapsed;
                 ViewScriptButton.Visibility = Visibility.Collapsed;
@@ -764,13 +924,17 @@ public partial class MainWindow : Window
         CancelButton.IsEnabled = busy;
 
         var db = DatabasesGrid.SelectedItem as DatabaseInfo;
-        DiagnoseButton.IsEnabled = !busy && db is { IsProblematic: true };
-        SafeRepairButton.IsEnabled = !busy && db is { IsProblematic: true };
+        // Qualquer banco selecionado pode ser diagnosticado (mesmo ONLINE aparentemente saudável).
+        DiagnoseButton.IsEnabled = !busy && db is not null;
+        SafeRepairButton.IsEnabled = !busy && db is not null;
         DataLossRepairButton.IsEnabled = !busy && DataLossConfirmCheck.IsChecked == true;
         LogRebuildButton.IsEnabled = !busy && LogRebuildConfirmCheck.IsChecked == true;
+        ConstraintFixButton.IsEnabled = !busy && ConstraintFixConfirmCheck.IsChecked == true;
         RepairIndexesButton.IsEnabled = !busy;
         ChooseBackupButton.IsEnabled = !busy;
         RestoreButton.IsEnabled = !busy;
+        TestRestoreButton.IsEnabled = !busy;
+        RestoreChainButton.IsEnabled = !busy;
         ViewScriptButton.IsEnabled = !busy;
 
         RepairBusyBar.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;

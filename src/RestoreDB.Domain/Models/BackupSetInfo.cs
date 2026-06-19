@@ -24,6 +24,17 @@ public sealed class BackupSetInfo
     public decimal FirstLsn { get; init; }
     public decimal LastLsn { get; init; }
 
+    /// <summary>LSN do backup de base do qual este depende. Num DIFERENCIAL/LOG, liga-o ao FULL
+    /// correto (deve casar com o <see cref="CheckpointLsn"/> do full). 0 quando indisponível.</summary>
+    public decimal DatabaseBackupLsn { get; init; }
+
+    /// <summary>LSN do checkpoint do próprio backup (no FULL, é o elo que os diferenciais referenciam).</summary>
+    public decimal CheckpointLsn { get; init; }
+
+    public bool IsFull => BackupTypeCode.Equals("D", StringComparison.OrdinalIgnoreCase);
+    public bool IsDifferential => BackupTypeCode.Equals("I", StringComparison.OrdinalIgnoreCase);
+    public bool IsLog => BackupTypeCode.Equals("L", StringComparison.OrdinalIgnoreCase);
+
     public string BackupTypeFriendly => BackupTypeCode.ToUpperInvariant() switch
     {
         "D" => "Completo (Full)",

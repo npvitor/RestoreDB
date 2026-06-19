@@ -10,16 +10,36 @@ Todo o T-SQL é **compatível com SQL Server 2008 R2** (e versões superiores).
 > 📘 **Novo por aqui?** Comece pelo **Manual de Utilização** — guia passo a passo, em
 > linguagem acessível, para operar a ferramenta: [Markdown](docs/MANUAL.md) · [PDF](docs/MANUAL.pdf).
 
+> ⚠️ **Importante:** um banco pode estar **`ONLINE` e aparentemente saudável**, mas conter
+> corrupção física (que só o `DBCC CHECKDB` revela) ou **violações de integridade lógica** —
+> p.ex. uma chave estrangeira apontando para um registro inexistente (registro órfão), que o
+> CHECKDB **não** detecta. Por isso o **Diagnóstico** está disponível para **qualquer banco**,
+> não apenas os que estão em estado problemático, e a elegibilidade de reparo passa a depender do
+> **resultado do diagnóstico**, não do `state_desc`.
+
 **Recursos principais:**
 
-- **Diagnóstico autoritativo** (somente leitura): `msdb.dbo.suspect_pages`,
-  `DBCC CHECKDB ... WITH TABLERESULTS` (estruturado), log de erros, topologia,
-  espaço em disco e `PAGE_VERIFY`.
+- **Diagnóstico autoritativo** (somente leitura) e **abrangente**: `DBCC CHECKDB ... WITH
+  TABLERESULTS` (consistência física, estruturada), **`DBCC CHECKCONSTRAINTS`** (integridade
+  referencial — FK/CHECK), **`DBCC CHECKCATALOG`** (metadados), constraints **não confiáveis**
+  (`is_not_trusted`), `msdb.dbo.suspect_pages`, log de erros, topologia, espaço em disco e
+  `PAGE_VERIFY`.
+- **Diagnóstico de qualquer banco** — inclusive `ONLINE` — sem precisar forçar `EMERGENCY` na mão.
+- **Correção de integridade lógica**: remove os **registros órfãos** (violação de FK) detectados,
+  restaurando a integridade referencial — com backup de segurança antes (operação destrutiva,
+  exige confirmação).
 - **Escalonamento de reparo** do menos ao mais agressivo, **sempre primeiro SEM perda de dados**.
 - **Reparo SEM perda quando a corrupção está só em índices não-clusterizados**
   (reconstrói os índices em vez de descartar dados).
 - **Restaurar de backup** (full/diferencial/log), incluindo **restauração de página**
   e correção de usuários órfãos — o caminho correto para corrupção de dados.
+- **Restauração ponto-no-tempo com cadeia automática**: monta FULL → diferencial → logs a partir
+  do histórico (msdb), **valida a continuidade de LSN** e **aborta** se a cadeia estiver quebrada;
+  captura o **tail-log** antes de sobrescrever para minimizar a perda.
+- **Testar backup (restauração de teste)**: restaura em um banco **descartável** e roda DBCC CHECKDB,
+  comprovando que o backup é íntegro e restaurável **sem tocar no banco de produção**.
+- **Avaliação da política de backup/recuperação** no diagnóstico: alerta FULL **sem backup de log**,
+  última full muito antiga, etc., classificado por **severidade**.
 - **Guarda de topologia**: bloqueia reparo destrutivo em bancos espelhados, em Always On,
   log shipping ou replicação.
 - **Reconstrução do log de transações** como último recurso.
@@ -110,6 +130,11 @@ Sem modificar nada, ele cruza **fontes autoritativas** e recomenda o melhor cami
 - **`msdb.dbo.suspect_pages`** — lista oficial de páginas corrompidas (erros 823/824/825);
 - **`DBCC CHECKDB ... WITH TABLERESULTS`** (estruturado) — identifica **objeto e índice**
   afetados e o **nível mínimo de reparo**; resolve nomes de tabela/índice para leitura;
+- **`DBCC CHECKCONSTRAINTS`** — integridade **LÓGICA** (chaves estrangeiras e CHECK) que o
+  CHECKDB **não** verifica; localiza os **registros órfãos** (FK apontando para PK inexistente);
+- **`DBCC CHECKCATALOG`** — consistência dos **metadados** do banco;
+- **constraints não confiáveis** (`sys.foreign_keys`/`sys.check_constraints` com `is_not_trusted`)
+  — integridade que nunca foi validada (causa comum de FK órfã silenciosa);
 - **log de erros** (`sp_readerrorlog`, vários arquivos) — discrimina **DADOS** (`.mdf`/`.ndf`)
   × **LOG** (`.ldf`) pelo nome físico do arquivo (independe de idioma) e detecta **9002**
   (log cheio) e **823/824/825** (E/S);
@@ -121,6 +146,8 @@ A conclusão define a **ação recomendada** e a UI destaca o caminho certo:
 
 - corrupção **só em índices não-clusterizados** ⇒ **reparo SEM perda** (reconstruir índices);
 - corrupção de **dados** ⇒ **restaurar de backup** (ou **restauração de página**, se poucas);
+- **integridade lógica** (FK órfã / constraint) com físico íntegro ⇒ **corrigir integridade**
+  (remover registros órfãos) ou restaurar de backup para preservar tudo;
 - corrupção de **log** ⇒ **reconstruir o log**;
 - **log cheio (9002)** ⇒ liberar espaço / `BACKUP LOG` (não é corrupção);
 - **topologia de alta disponibilidade** ⇒ alerta para tratar antes de reparar.
@@ -129,6 +156,7 @@ A conclusão define a **ação recomendada** e a UI destaca o caminho certo:
 
 | Estado            | Ação                                                                              | Perda de dados |
 |-------------------|-----------------------------------------------------------------------------------|----------------|
+| `ONLINE` (verificado) | `DBCC CHECKDB` + `CHECKCONSTRAINTS`; se íntegro, nada a fazer. Se corrompido: `SINGLE_USER` → `REPAIR_REBUILD` (sem perda) → **(com confirmação)** `REPAIR_ALLOW_DATA_LOSS` → reconciliar FKs | Não → (talvez) |
 | `OFFLINE`         | `SET ONLINE` → `SET MULTI_USER`                                                    | Não            |
 | `RESTORING`/`RECOVERING` | `RESTORE DATABASE ... WITH RECOVERY`                                        | Não            |
 | `RECOVERY_PENDING`| Tenta `SET ONLINE`; se falhar, cai no fluxo de emergência abaixo                   | Não → (talvez) |
@@ -191,6 +219,58 @@ a corrupção está nesses índices, a ferramenta os **reconstrói** (`ALTER IND
 — **sem perder nenhum dado** — em vez de partir para o `REPAIR_ALLOW_DATA_LOSS`. O fluxo de
 emergência faz isso automaticamente antes de escalar, e o botão **"Reparar índices (sem perda
 de dados)"** fica disponível quando o diagnóstico identifica esse caso.
+
+### Restauração ponto-no-tempo, tail-log e teste de backup
+
+Para corrupção de DADOS, **restaurar de backup** é o caminho correto — e a ferramenta vai além do
+restore de peça única:
+
+- **Cadeia automática (`RestoreToPointInTimeAsync`)** — a partir do histórico em `msdb`, monta a
+  sequência **FULL → diferencial → logs** até um instante alvo (ou o ponto mais recente). A montagem
+  (`BackupChainPlanner`) **valida a continuidade de LSN**: o diferencial precisa casar com o
+  `checkpoint_lsn` do full e cada log precisa encadear (`first_lsn ≤ âncora < last_lsn`). Se houver
+  **quebra na cadeia** (log faltando, diferencial órfão), a operação é **abortada antes de executar**,
+  explicando o que falta — nunca deixa o banco num estado pior.
+- **Tail-log** — antes de sobrescrever, faz `BACKUP LOG ... WITH NORECOVERY, CONTINUE_AFTER_ERROR`
+  para capturar as transações mais recentes e anexá-las como último elo da cadeia (minimiza o RPO).
+- **Testar backup (`TestRestoreAsync`)** — restaura a cadeia para um banco **descartável** (com
+  `MOVE` para a pasta do `tempdb`), roda `DBCC CHECKDB` e **descarta** o banco de teste ao final
+  (mesmo em falha). Prova a restaurabilidade **sem tocar na produção**.
+
+### Avaliação da política de backup (RPO)
+
+O diagnóstico cruza o **modelo de recuperação** com o **histórico** (`BackupPolicyEvaluator`) e
+classifica os achados por severidade: **Crítico** (sem nenhum FULL — irrestaurável), **Alto**
+(modelo FULL/BULK_LOGGED **sem backup de log** → log cresce e perda potencial grande; ou última FULL
+> 30 dias), **Médio** (última FULL > 7 dias), **Informativo** (modelo SIMPLE → sem ponto-no-tempo).
+
+### Banco ONLINE porém corrompido
+
+Nem toda corrupção muda o `state_desc`: um banco pode permanecer **`ONLINE`** com páginas
+corrompidas (reveladas só pelo `DBCC CHECKDB`) ou com **integridade lógica** quebrada. Por isso o
+**Diagnóstico** roda em qualquer banco e o reparo passa a depender do que o diagnóstico encontra.
+Quando há corrupção física num banco já `ONLINE`, o reparo é feito em **`SINGLE_USER`** (sem
+precisar de `EMERGENCY`): tenta `REPAIR_REBUILD` (sem perda) e, só com confirmação explícita,
+`REPAIR_ALLOW_DATA_LOSS` — preferindo sempre **restaurar de backup** quando os dados estão
+corrompidos.
+
+### Corrigir integridade lógica (registros órfãos de chave estrangeira)
+
+O `DBCC CHECKDB` valida a estrutura **física**, mas **não** verifica chaves estrangeiras. Uma
+corrupção (ou um `REPAIR_ALLOW_DATA_LOSS` anterior, que desaloca páginas **sem** respeitar
+constraints) pode deixar uma linha cuja FK aponta para uma PK **inexistente** (registro órfão). O
+**`DBCC CHECKCONSTRAINTS`** detecta essas violações e devolve o predicado exato das linhas
+violadoras. A opção **"Corrigir integridade (remover registros órfãos)"**:
+
+- obtém acesso exclusivo (`SINGLE_USER`) e faz **backup/cópia de segurança** antes;
+- **remove** as linhas órfãs (apenas violações de **FK**; violações de **CHECK** são reportadas
+  para revisão manual), usando o predicado gerado pelo próprio SQL Server;
+- **reverifica** com `CHECKCONSTRAINTS` ao final.
+
+Além disso, após qualquer `REPAIR_ALLOW_DATA_LOSS`, a ferramenta **reconcilia automaticamente** as
+chaves estrangeiras órfãs que a desalocação possa ter criado — deixando o banco **logicamente**
+consistente, não só fisicamente. Para preservar 100% dos registros, **restaurar de backup**
+continua sendo o caminho preferido.
 
 ### Restaurar de backup (corrupção de dados)
 
@@ -307,5 +387,5 @@ num banco de produção de teste, com backup prévio e restauração ao final:
 - Estados `OFFLINE` e `RESTORING` ⇒ religados sem perda (`SET ONLINE` / `RESTORE WITH RECOVERY`).
 
 O utilitário [`tools/RestoreDB.Probe`](tools/RestoreDB.Probe) é um runner de linha de comando que
-invoca os serviços reais (`diagnose`/`repair-indexes`/`repair`/`rebuild-log`/`restore`) — usado nessa
+invoca os serviços reais (`diagnose`/`repair-indexes`/`repair`/`fix-constraints`/`restore`/`restore-pit`/`test-restore`/`rebuild-log`) — usado nessa
 validação e útil para operar a ferramenta sem a interface gráfica.

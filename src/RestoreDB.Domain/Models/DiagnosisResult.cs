@@ -12,7 +12,11 @@ public enum RecommendedActionKind
     RebuildLog,
     DataLossRepair,
     FreeDiskSpace,
-    ReviewTopology
+    ReviewTopology,
+
+    /// <summary>Integridade LÓGICA comprometida (FK órfã / violação de constraint) com os
+    /// arquivos físicos íntegros — corrige-se removendo as linhas violadoras, não com CHECKDB.</summary>
+    FixConstraints
 }
 
 /// <summary>
@@ -29,6 +33,12 @@ public sealed class DiagnosisResult
     public bool LogCorruptionSuspected { get; set; }
     public bool DataCorruptionSuspected { get; set; }
 
+    /// <summary>
+    /// Corrupção LÓGICA (integridade referencial): há linhas violando chaves estrangeiras
+    /// ou CHECK constraints — detectada por DBCC CHECKCONSTRAINTS, não pelo CHECKDB.
+    /// </summary>
+    public bool LogicalCorruptionSuspected { get; set; }
+
     /// <summary>Log de transações cheio (erro 9002): não é corrupção; resolve-se com espaço/backup de log.</summary>
     public bool LogFull { get; set; }
 
@@ -43,6 +53,23 @@ public sealed class DiagnosisResult
     public List<SuspectPageInfo> SuspectPages { get; } = new();
     public CheckDbReport? CheckDb { get; set; }
     public List<DiskSpaceInfo> Disks { get; } = new();
+
+    /// <summary>Violações de integridade lógica encontradas por DBCC CHECKCONSTRAINTS.</summary>
+    public List<ConstraintViolation> ConstraintViolations { get; } = new();
+
+    /// <summary>Nomes de constraints marcadas como NÃO confiáveis (is_not_trusted) — indício de
+    /// integridade lógica que nunca foi validada (causa comum de FK órfã silenciosa).</summary>
+    public List<string> UntrustedConstraints { get; } = new();
+
+    /// <summary>Mensagens de erro de DBCC CHECKCATALOG (consistência de metadados), quando houver.</summary>
+    public List<string> CatalogErrors { get; } = new();
+
+    /// <summary>Avaliação da política de backup/recuperação (RPO): FULL sem log, full antiga, etc.</summary>
+    public BackupPolicyAssessment? BackupPolicy { get; set; }
+
+    /// <summary>Linhas violadoras de FK que podem ser removidas para restaurar a integridade.</summary>
+    public IReadOnlyList<ConstraintViolation> ForeignKeyViolations =>
+        ConstraintViolations.Where(c => c.IsForeignKey).ToList();
 
     /// <summary>Toda a corrupção encontrada está em índices não-clusterizados → reparável SEM perda.</summary>
     public bool IndexOnlyRepairPossible { get; set; }

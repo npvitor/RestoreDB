@@ -113,7 +113,7 @@
                             <Border x:Name="HealthyPanel" Visibility="Collapsed" Margin="0,16,0,0"
                                     Background="{DynamicResource OkBackBrush}" BorderBrush="{DynamicResource OkForeBrush}"
                                     BorderThickness="1" CornerRadius="6" Padding="12">
-                                <TextBlock Text="Este banco está saudável (ONLINE). Nenhum reparo é necessário."
+                                <TextBlock Text="Este banco está ONLINE. O estado aparenta saúde, mas pode haver corrupção que só uma verificação completa revela — use 'Diagnosticar' abaixo para uma checagem profunda (CHECKDB + CHECKCONSTRAINTS + CHECKCATALOG)."
                                            Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" />
                             </Border>
 
@@ -129,7 +129,7 @@
                             <StackPanel x:Name="DiagnosePanel" Visibility="Collapsed" Margin="0,18,0,0">
                                 <Button x:Name="DiagnoseButton" Content="Diagnosticar (sem alterar o banco)"
                                         Style="{StaticResource SecondaryButton}" Height="40" Click="DiagnoseButton_Click" />
-                                <TextBlock Text="Lê o log de erros do SQL Server e identifica se o problema está nos DADOS (.mdf/.ndf) ou no LOG de transações (.ldf). Não modifica nada."
+                                <TextBlock Text="Verificação completa SEM alterar nada: DBCC CHECKDB (consistência física), CHECKCONSTRAINTS (chaves estrangeiras/CHECK), CHECKCATALOG (metadados), páginas suspeitas e log de erros. Detecta corrupção mesmo em bancos que parecem saudáveis (ONLINE)."
                                            Foreground="{DynamicResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,8,0,0" />
                             </StackPanel>
 
@@ -174,6 +174,24 @@
                                 </StackPanel>
                             </Border>
 
+                            <!-- [PRIMÁRIO p/ corrupção LÓGICA] Corrigir integridade (remover registros órfãos) -->
+                            <Border x:Name="ConstraintFixPanel" Visibility="Collapsed" Margin="0,8,0,0"
+                                    Background="{DynamicResource WarnBackBrush}" BorderBrush="{DynamicResource WarnLineBrush}"
+                                    BorderThickness="1" CornerRadius="6" Padding="14">
+                                <StackPanel>
+                                    <TextBlock Text="⚠ INTEGRIDADE LÓGICA: REGISTROS ÓRFÃOS"
+                                               FontWeight="Bold" Foreground="{DynamicResource WarnForeBrush}" TextWrapping="Wrap" />
+                                    <TextBlock x:Name="ConstraintFixText" Margin="0,8,0,0" Foreground="{DynamicResource WarnForeBrush}" TextWrapping="Wrap"
+                                               Text="Há linhas cuja chave estrangeira aponta para um registro inexistente (o DBCC CHECKDB não detecta isso). A correção REMOVE essas linhas órfãs para restaurar a integridade — operação destrutiva, com backup de segurança antes. Para preservar 100% dos registros, prefira restaurar de backup." />
+                                    <CheckBox x:Name="ConstraintFixConfirmCheck" Margin="0,12,0,0" Foreground="{DynamicResource WarnForeBrush}"
+                                              Content="Entendo e autorizo a remoção dos registros órfãos."
+                                              Checked="ConstraintFixConfirmCheck_Changed" Unchecked="ConstraintFixConfirmCheck_Changed" />
+                                    <Button x:Name="ConstraintFixButton" Content="Corrigir integridade (remover registros órfãos)"
+                                            Style="{StaticResource DangerButton}" Height="42" Margin="0,12,0,0"
+                                            IsEnabled="False" Click="ConstraintFixButton_Click" />
+                                </StackPanel>
+                            </Border>
+
                             <!-- [PRIMÁRIO p/ OFFLINE/RESTORING/etc.] Reparo seguro -->
                             <StackPanel x:Name="SafeRepairPanel" Visibility="Collapsed" Margin="0,8,0,0">
                                 <Button x:Name="SafeRepairButton" Content="Reparar (modo seguro, sem perda de dados)"
@@ -204,6 +222,14 @@
                                 <Button x:Name="RestoreButton" Content="Restaurar o backup selecionado"
                                         Style="{StaticResource FlatButton}" Height="42" Margin="0,10,0,0"
                                         Click="RestoreButton_Click" />
+                                <Button x:Name="TestRestoreButton" Content="Testar backup (restauração de teste, não altera o banco)"
+                                        Style="{StaticResource SecondaryButton}" Height="40" Margin="0,8,0,0"
+                                        Click="TestRestoreButton_Click" />
+                                <Button x:Name="RestoreChainButton" Content="Restaurar cadeia completa até o ponto mais recente"
+                                        Style="{StaticResource SecondaryButton}" Height="40" Margin="0,6,0,0"
+                                        Click="RestoreChainButton_Click" />
+                                <TextBlock Text="A cadeia completa monta automaticamente FULL → diferencial → logs (com tail-log), validando a continuidade antes de executar."
+                                           Foreground="{DynamicResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,6,0,0" />
                             </StackPanel>
 
                             <!-- Reparo com perda de dados (confirmação) -->

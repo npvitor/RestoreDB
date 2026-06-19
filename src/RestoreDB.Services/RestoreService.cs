@@ -113,6 +113,203 @@ public sealed class RestoreService
     }
 
     /// <summary>
+    /// Restauração PONTO-NO-TEMPO com cadeia automática: monta (FULL → DIFERENCIAL → LOGs) a partir
+    /// do histórico (msdb) até <paramref name="target"/> (ou o ponto mais recente, se nulo), validando
+    /// a continuidade de LSN. Se a cadeia estiver quebrada/incompleta, ABORTA antes de executar.
+    /// Opcionalmente captura o tail-log (transações mais recentes) antes de sobrescrever o banco.
+    /// </summary>
+    public async Task<RepairResult> RestoreToPointInTimeAsync(
+        string databaseName, DateTime? target, bool tailLogBackup,
+        string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default)
+    {
+        var result = new RepairResult();
+        var alvo = target.HasValue ? target.Value.ToString("yyyy-MM-dd HH:mm:ss") : "ponto mais recente";
+        Report(progress, databaseName, RepairLogLevel.Info,
+            $"════════ Restauração ponto-no-tempo de [{databaseName}] → {alvo} ════════");
+
+        await using var session = await _data.OpenSessionAsync(connectionString, ct);
+
+        var history = await session.GetBackupHistoryAsync(databaseName, ct);
+        if (history.Count == 0)
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = "Sem histórico de backups em msdb para montar a cadeia. Use 'Escolher arquivo .bak' para restaurar manualmente.";
+            Report(progress, databaseName, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+
+        var plan = BackupChainPlanner.Plan(databaseName, history, target);
+        foreach (var w in plan.Warnings)
+            Report(progress, databaseName, RepairLogLevel.Warning, "  ⚠ " + w);
+
+        if (!plan.IsComplete || plan.BaseFull is null)
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = "Cadeia de backup INCOMPLETA — restauração abortada para não deixar o banco inconsistente. " + plan.Summary;
+            Report(progress, databaseName, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+        Report(progress, databaseName, RepairLogLevel.Info, plan.Summary);
+
+        // Tail-log (best-effort): captura as transações ainda não copiadas, minimizando a perda.
+        var pieces = new List<RestorePiece>(plan.Pieces);
+        if (tailLogBackup)
+        {
+            var tail = await TryBackupTailLogAsync(session, databaseName, progress, ct);
+            if (tail is not null) pieces.Add(tail);
+        }
+
+        var request = new RestoreRequest
+        {
+            DatabaseName = databaseName,
+            Replace = true,
+            StopAt = target,
+            Pieces = pieces
+        };
+        return await RestoreDatabaseAsync(request, connectionString, progress, ct);
+    }
+
+    /// <summary>
+    /// Captura o tail-log (BACKUP LOG ... WITH NORECOVERY) para preservar as transações mais
+    /// recentes antes de uma restauração. Best-effort: em modelo SIMPLE ou sem log, devolve null.
+    /// Usa CONTINUE_AFTER_ERROR para conseguir capturar mesmo com o log danificado.
+    /// </summary>
+    private async Task<RestorePiece?> TryBackupTailLogAsync(SqlSession session, string db, IProgress<RepairLogEntry> p, CancellationToken ct)
+    {
+        var model = await session.GetRecoveryModelAsync(db, ct);
+        if (model.Equals("SIMPLE", StringComparison.OrdinalIgnoreCase))
+        {
+            Report(p, db, RepairLogLevel.Info, "Tail-log não se aplica (modelo de recuperação SIMPLE).");
+            return null;
+        }
+
+        var file = $"{SanitizeToken(db)}_tail_{DateTime.Now:yyyyMMdd_HHmmss}.trn";
+        const string sql =
+            "DECLARE @cmd nvarchar(max);\n" +
+            "SET @cmd = N'BACKUP LOG ' + QUOTENAME(@db) + N' TO DISK = @f WITH NORECOVERY, CONTINUE_AFTER_ERROR, INIT, NAME = @n;';\n" +
+            "EXEC sys.sp_executesql @cmd, N'@f nvarchar(4000), @n nvarchar(256)', @f = @file, @n = @name;";
+        var r = await RunStepAsync(session, db, p, "Capturando o tail-log (BACKUP LOG ... WITH NORECOVERY)", sql,
+            new Dictionary<string, object?> { ["@db"] = db, ["@file"] = file, ["@name"] = $"RestoreDB tail-log de {db}" }, ct);
+        if (!r.Success)
+        {
+            Report(p, db, RepairLogLevel.Warning, "Não foi possível capturar o tail-log — a restauração prosseguirá sem as transações mais recentes.");
+            return null;
+        }
+        Report(p, db, RepairLogLevel.Success, $"Tail-log capturado: {file}");
+        return new RestorePiece { DiskPath = file, Position = 1, IsLog = true };
+    }
+
+    /// <summary>
+    /// TESTA a restaurabilidade de um backup SEM tocar no banco de produção: restaura a cadeia para
+    /// um banco DESCARTÁVEL (com MOVE para a pasta do tempdb), roda DBCC CHECKDB e descarta o banco
+    /// de teste ao final (mesmo em caso de falha). Prova que o backup é íntegro e restaurável.
+    /// </summary>
+    public async Task<RepairResult> TestRestoreAsync(
+        string databaseName, IReadOnlyList<RestorePiece> pieces,
+        string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default)
+    {
+        var result = new RepairResult();
+        var scratch = $"{SanitizeToken(databaseName)}_RestoreDB_TEST_{DateTime.Now:yyyyMMddHHmmss}";
+        Report(progress, databaseName, RepairLogLevel.Info,
+            $"════════ Teste de restauração (não altera [{databaseName}]) → destino temporário [{scratch}] ════════");
+
+        if (pieces.Count == 0)
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = "Informe ao menos o backup full para testar.";
+            Report(progress, databaseName, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+
+        await using var session = await _data.OpenSessionAsync(connectionString, ct);
+
+        var dir = await session.GetScratchDataDirAsync(ct);
+        if (string.IsNullOrEmpty(dir))
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = "Não foi possível determinar uma pasta temporária no servidor para o teste.";
+            Report(progress, databaseName, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+
+        // Mapeia os arquivos lógicos do full para destinos temporários (WITH MOVE).
+        var files = await session.RestoreFileListOnlyAsync(pieces[0].DiskPath, pieces[0].Position, ct);
+        if (files.Count == 0)
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = "Não foi possível ler a lista de arquivos do backup (FILELISTONLY).";
+            Report(progress, databaseName, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+
+        var move = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var dataIdx = 0;
+        foreach (var f in files)
+        {
+            var isLog = f.Type.Equals("L", StringComparison.OrdinalIgnoreCase);
+            var ext = isLog ? ".ldf" : (dataIdx++ == 0 ? ".mdf" : ".ndf");
+            move[f.LogicalName] = Path.Combine(dir, $"{scratch}_{move.Count}{ext}");
+        }
+
+        var request = new RestoreRequest
+        {
+            DatabaseName = scratch,
+            Replace = true,
+            MoveMap = move,
+            Pieces = new List<RestorePiece>(pieces)
+        };
+
+        try
+        {
+            var restore = await RestoreDatabaseAsync(request, connectionString, progress, ct);
+            if (restore.Status != RepairStatus.Success)
+            {
+                result.Status = RepairStatus.Failed;
+                result.Message = "O backup NÃO é restaurável: " + restore.Message;
+                Report(progress, databaseName, RepairLogLevel.Error, result.Message);
+                return result;
+            }
+
+            Report(progress, databaseName, RepairLogLevel.Info, "Restaurado no destino de teste — verificando consistência (DBCC CHECKDB)...");
+            var check = await session.CheckDbWithResultsAsync(scratch, repairOption: null, ct);
+            var ok = check.Executed && !check.HasErrors;
+
+            result.Status = ok ? RepairStatus.Success : RepairStatus.Failed;
+            result.Message = ok
+                ? "Backup VÁLIDO: restaurou com sucesso e o DBCC CHECKDB não encontrou erros."
+                : $"Backup restaurável, mas o DBCC CHECKDB acusou {check.ErrorCount} erro(s) no conteúdo — o backup contém corrupção.";
+            Report(progress, databaseName, ok ? RepairLogLevel.Success : RepairLogLevel.Warning, result.Message);
+            return result;
+        }
+        finally
+        {
+            await DropScratchDatabaseAsync(session, scratch, progress);
+        }
+    }
+
+    /// <summary>Descarta o banco de teste (SINGLE_USER + DROP), liberando também os arquivos movidos.</summary>
+    private async Task DropScratchDatabaseAsync(SqlSession session, string scratch, IProgress<RepairLogEntry> progress)
+    {
+        const string sql =
+            "IF DB_ID(@db) IS NOT NULL\n" +
+            "BEGIN\n" +
+            "  DECLARE @cmd nvarchar(max);\n" +
+            "  BEGIN TRY SET @cmd = N'ALTER DATABASE ' + QUOTENAME(@db) + N' SET SINGLE_USER WITH ROLLBACK IMMEDIATE;'; EXEC sys.sp_executesql @cmd; END TRY BEGIN CATCH END CATCH\n" +
+            "  SET @cmd = N'DROP DATABASE ' + QUOTENAME(@db) + N';'; EXEC sys.sp_executesql @cmd;\n" +
+            "END";
+        var r = await session.ExecuteAsync("Descartando o banco de teste", sql,
+            new Dictionary<string, object?> { ["@db"] = scratch }, AppConstants.RepairCommandTimeoutSeconds, CancellationToken.None);
+        Report(progress, scratch, r.Success ? RepairLogLevel.Info : RepairLogLevel.Warning,
+            r.Success ? $"Banco de teste [{scratch}] descartado." : $"Não foi possível descartar [{scratch}] — remova-o manualmente.");
+    }
+
+    private static string SanitizeToken(string name)
+    {
+        var token = new string(name.Select(c => char.IsLetterOrDigit(c) ? c : '_').ToArray()).Trim('_');
+        return string.IsNullOrEmpty(token) ? "banco" : token;
+    }
+
+    /// <summary>
     /// Restauração de PÁGINA: recupera apenas as páginas corrompidas indicadas, preservando o
     /// restante do banco. Exige a cadeia full + (diferencial) + logs até o presente e o modelo
     /// de recuperação FULL. <paramref name="pages"/> no formato "fileId:pageId" separados por vírgula.
