@@ -40,6 +40,29 @@ Todo o T-SQL é **compatível com SQL Server 2008 R2** (e versões superiores).
   comprovando que o backup é íntegro e restaurável **sem tocar no banco de produção**.
 - **Avaliação da política de backup/recuperação** no diagnóstico: alerta FULL **sem backup de log**,
   última full muito antiga, etc., classificado por **severidade**.
+- **Recuperar para cópia (salvamento cirúrgico)**: restaura num banco novo (`..._Recuperado`) para
+  **extrair dados** sem sobrescrever o original; assistente que **copia de volta as linhas faltantes**
+  (por chave primária, sem duplicar).
+- **Realocação automática de arquivos** (`WITH MOVE`): detecta pastas inexistentes no servidor e move
+  os arquivos para a pasta padrão da instância.
+- **Saúde dos backups**: `RESTORE VERIFYONLY` (com `CHECKSUM` quando disponível) em todo o histórico.
+- **Checagens granulares**: `DBCC CHECKTABLE` dirigido, `CHECKIDENT` (reseed de identidade) e
+  **verificação rápida `PHYSICAL_ONLY`** para bancos muito grandes.
+- **Restauração em STANDBY** (somente leitura entre logs) + **finalizar recuperação**: inspecionar os
+  dados antes de aplicar a recuperação definitiva.
+- **Mídias avançadas**: backups **divididos em vários arquivos (striped)** restaurados como um só;
+  backups **comprimidos** detectados/usados quando a edição permite.
+- **Saúde lógica adicional** no diagnóstico: índices **desabilitados** e **dependências quebradas**.
+- **Histórico de diagnósticos**: persiste cada verificação e aponta o que é **NOVO** desde a última
+  (detecção precoce de corrupção).
+- **Reparo por simulação**: pré-visualiza a **perda exata por tabela** rodando o reparo destrutivo
+  numa **cópia descartável**, sem tocar na produção — decide-se com conhecimento total.
+- **Monitoramento agendado** (via Probe `monitor` no Agendador) com **alerta** quando surge algo novo.
+- **Mais situações**: progresso de recuperação em andamento, **anexar `.mdf`** solto, runbook guiado
+  para bancos de **sistema**, aviso de **TDE** nos restores.
+- **Manutenção preventiva**: desfragmentação de índices + estatísticas; e **causa-raiz** (erros de
+  E/S, corrupção recorrente ⇒ suspeita de hardware).
+- **Forense de exclusão acidental**: lê o log (`fn_dblog`) e restaura até **logo antes** do DELETE/DROP.
 - **Guarda de topologia**: bloqueia reparo destrutivo em bancos espelhados, em Always On,
   log shipping ou replicação.
 - **Reconstrução do log de transações** como último recurso.
@@ -237,6 +260,48 @@ restore de peça única:
   `MOVE` para a pasta do `tempdb`), roda `DBCC CHECKDB` e **descarta** o banco de teste ao final
   (mesmo em falha). Prova a restaurabilidade **sem tocar na produção**.
 
+### Recuperar para cópia e salvamento cirúrgico
+
+Quando a maior parte do banco está sã e só alguns registros se perderam, sobrescrever tudo é
+desnecessário. **`RestoreAsCopyAsync`** restaura a cadeia mais recente para um banco de CÓPIA
+(`{original}_Recuperado`, com arquivos realocados e nomes novos para nunca colidir) **sem tocar no
+original**. Em seguida, **`SalvageTableAsync`** copia da cópia para o banco vivo apenas as linhas
+**que faltam** (por chave primária, preservando `IDENTITY`, sem duplicar). Assim dá para recuperar
+tabelas/linhas pontuais a partir de um backup íntegro.
+
+### Realocação automática de arquivos (WITH MOVE)
+
+Em `RestoreRequest.AutoRelocate`, a restauração lê os arquivos do backup (`FILELISTONLY`), checa no
+**servidor** (`xp_fileexist`) se a pasta original existe e, quando não, gera os `MOVE`
+automaticamente para a pasta padrão da instância (derivada do `master`). O `RestorePlanner` que
+decide isso é lógica pura e coberta por testes.
+
+### Checagens granulares (B1)
+
+Além do CHECKDB completo: **`DBCC CHECKTABLE`** dirigido a um objeto (mais rápido), **`DBCC
+CHECKIDENT ... RESEED`** para reajustar sementes de identidade após remoção de linhas, e a opção
+**`PHYSICAL_ONLY`** no diagnóstico (varredura rápida para bancos muito grandes; `DATA_PURITY`
+disponível na camada de dados).
+
+### Restauração em STANDBY e mídias avançadas
+
+- **STANDBY** (`RestoreToStandbyAsync`): restaura a cadeia deixando o banco em **somente leitura**,
+  consultável entre os logs, para achar o ponto certo; depois **`FinalizeRecoveryAsync`** aplica o
+  `RESTORE … WITH RECOVERY` definitivo. O arquivo de undo é criado na pasta padrão da instância.
+- **Striped** (vários arquivos por backup): o histórico agrupa os arquivos do mesmo conjunto e a
+  restauração monta `FROM DISK = …, DISK = …` automaticamente.
+- **Compressão**: backups comprimidos são detectados (histórico/`HEADERONLY`) e os backups que a
+  própria ferramenta gera (tail-log, COPY_ONLY de segurança) usam `COMPRESSION` quando a edição
+  suporta (Standard/Enterprise; Express não).
+
+### Saúde lógica adicional e histórico (detecção precoce)
+
+O diagnóstico agrega achados de **saúde lógica** (índices `is_disabled`, dependências quebradas em
+`sys.sql_expression_dependencies`, constraints não confiáveis), classificados por severidade. Cada
+diagnóstico é **persistido** (`%LOCALAPPDATA%\RestoreDB\History`) e comparado com o anterior: o que
+**piorou** (corrupção nova, mais violações de FK, mais páginas suspeitas) é destacado como **NOVO
+desde a última verificação**.
+
 ### Avaliação da política de backup (RPO)
 
 O diagnóstico cruza o **modelo de recuperação** com o **histórico** (`BackupPolicyEvaluator`) e
@@ -387,5 +452,5 @@ num banco de produção de teste, com backup prévio e restauração ao final:
 - Estados `OFFLINE` e `RESTORING` ⇒ religados sem perda (`SET ONLINE` / `RESTORE WITH RECOVERY`).
 
 O utilitário [`tools/RestoreDB.Probe`](tools/RestoreDB.Probe) é um runner de linha de comando que
-invoca os serviços reais (`diagnose`/`repair-indexes`/`repair`/`fix-constraints`/`restore`/`restore-pit`/`test-restore`/`rebuild-log`) — usado nessa
+invoca os serviços reais (`diagnose`/`repair`/`repair-indexes`/`fix-constraints`/`simulate-repair`/`monitor`/`maintain`/`fragmentation`/`forensic`/`attach`/`restore`/`restore-pit`/`restore-pages`/`restore-standby`/`finalize-recovery`/`test-restore`/`restore-copy`/`salvage-table`/`verify-backups`/`check-table`/`reseed`/`history`/`rebuild-log`) — usado nessa
 validação e útil para operar a ferramenta sem a interface gráfica.

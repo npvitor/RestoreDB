@@ -49,14 +49,14 @@ public sealed class RepairService
         {
             status = state.Trim().ToUpperInvariant() switch
             {
-                "ONLINE"           => await OnlineRepairFlowAsync(session, db, allowDataLoss, progress, ct),
-                "OFFLINE"          => await BringOnlineAsync(session, db, progress, ct),
-                "RESTORING"        => await RestoreWithRecoveryAsync(session, db, progress, ct),
-                "RECOVERING"       => await RestoreWithRecoveryAsync(session, db, progress, ct),
+                "ONLINE" => await OnlineRepairFlowAsync(session, db, allowDataLoss, progress, ct),
+                "OFFLINE" => await BringOnlineAsync(session, db, progress, ct),
+                "RESTORING" => await RestoreWithRecoveryAsync(session, db, progress, ct),
+                "RECOVERING" => await RestoreWithRecoveryAsync(session, db, progress, ct),
                 "RECOVERY_PENDING" => await RecoveryPendingAsync(session, db, allowDataLoss, progress, ct),
-                "SUSPECT"          => await EmergencyRepairFlowAsync(session, db, allowDataLoss, progress, ct),
-                "EMERGENCY"        => await EmergencyRepairFlowAsync(session, db, allowDataLoss, progress, ct),
-                _                  => RepairStatus.Failed
+                "SUSPECT" => await EmergencyRepairFlowAsync(session, db, allowDataLoss, progress, ct),
+                "EMERGENCY" => await EmergencyRepairFlowAsync(session, db, allowDataLoss, progress, ct),
+                _ => RepairStatus.Failed
             };
         }
         catch (OperationCanceledException)
@@ -118,10 +118,12 @@ public sealed class RepairService
     /// erros do SQL Server (sp_readerrorlog) e nos arquivos de sys.master_files.
     /// </summary>
     public async Task<DiagnosisResult> DiagnoseAsync(
-        DatabaseInfo db, string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default)
+        DatabaseInfo db, string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default,
+        bool physicalOnly = false)
     {
         var diag = new DiagnosisResult { DatabaseName = db.Name, StateDesc = db.StateDesc };
-        Report(progress, db.Name, RepairLogLevel.Info, $"──── Diagnóstico (somente leitura) de [{db.Name}] ────");
+        Report(progress, db.Name, RepairLogLevel.Info, $"──── Diagnóstico (somente leitura) de [{db.Name}]"
+            + (physicalOnly ? " — verificação rápida (PHYSICAL_ONLY)" : "") + " ────");
 
         try
         {
@@ -133,6 +135,20 @@ public sealed class RepairService
 
             await using var session = await _data.OpenSessionAsync(connectionString, ct);
             diag.StateDesc = await session.GetDatabaseStateAsync(db.Name, ct);
+
+            // TDE: avisa que restaurar em outra instância exige o certificado.
+            diag.IsEncrypted = await session.IsEncryptedAsync(db.Name, ct);
+            if (diag.IsEncrypted)
+                Report(progress, db.Name, RepairLogLevel.Warning,
+                    "Banco CRIPTOGRAFADO (TDE): restaurar em OUTRA instância exige o certificado/Chave Mestra do servidor de origem. Garanta o backup do certificado.");
+
+            // Operação demorada em andamento (recuperação/RESTORE) — informa o progresso.
+            if (diag.StateDesc.Trim().ToUpperInvariant() is "RECOVERING" or "RESTORING" or "RECOVERY_PENDING")
+            {
+                diag.Recovery = await session.GetRecoveryProgressAsync(db.Name, ct);
+                if (diag.Recovery is not null)
+                    Report(progress, db.Name, RepairLogLevel.Info, "Em andamento — " + diag.Recovery.Display + " (aguarde antes de intervir).");
+            }
 
             var files = await session.GetDatabaseFilesAsync(db.Name, ct);
             foreach (var f in files)
@@ -161,7 +177,7 @@ public sealed class RepairService
 
             // DBCC CHECKDB estruturado (somente leitura) — é a VERDADE do momento; roda antes de
             // interpretar as páginas suspeitas (que são um registro histórico).
-            await TryStructuredCheckDbAsync(session, db, diag, progress, ct);
+            await TryStructuredCheckDbAsync(session, db, diag, progress, ct, physicalOnly);
             var checkDbClean = diag.CheckDb is { Executed: true, HasErrors: false };
 
             // Integridade LÓGICA (FK órfã / CHECK / catálogo) — o CHECKDB NÃO cobre isso. Roda
@@ -224,7 +240,16 @@ public sealed class RepairService
             // Avaliação da política de backup/recuperação (RPO) — advisory, não muda a ação recomendada.
             await TryAssessBackupPolicyAsync(session, db, diag, progress, ct);
 
+            // Saúde lógica adicional (B4): índices desabilitados, dependências quebradas, constraints não confiáveis.
+            await TryLogicalHealthChecksAsync(session, db, diag, progress, ct);
+
+            // Causa-raiz: erros de E/S e corrupção recorrente (suspeita de hardware/volume).
+            TryRootCauseAnalysis(db, diag, progress);
+
             BuildConclusion(diag);
+
+            // Histórico (B5): compara com a última verificação para apontar o que é NOVO (detecção precoce).
+            TryRecordHistory(db, diag, progress);
 
             if (checkDbClean && diag.Evidence.Count > 0)
                 Report(progress, db.Name, RepairLogLevel.Info,
@@ -268,10 +293,10 @@ public sealed class RepairService
     /// dos objetos/índices envolvidos. Funciona quando o banco está acessível (ONLINE/EMERGENCY);
     /// em SUSPECT pode falhar — nesse caso o relatório fica vazio e o diagnóstico usa as demais fontes.
     /// </summary>
-    private async Task TryStructuredCheckDbAsync(SqlSession session, DatabaseInfo db, DiagnosisResult diag, IProgress<RepairLogEntry> progress, CancellationToken ct)
+    private async Task TryStructuredCheckDbAsync(SqlSession session, DatabaseInfo db, DiagnosisResult diag, IProgress<RepairLogEntry> progress, CancellationToken ct, bool physicalOnly = false)
     {
         Report(progress, db.Name, RepairLogLevel.Info, "Analisando consistência (DBCC CHECKDB ... WITH TABLERESULTS, somente leitura)...");
-        var report = await session.CheckDbWithResultsAsync(db.Name, repairOption: null, ct);
+        var report = await session.CheckDbWithResultsAsync(db.Name, repairOption: null, ct, physicalOnly: physicalOnly);
         diag.CheckDb = report;
 
         if (!report.Executed)
@@ -360,6 +385,85 @@ public sealed class RepairService
         {
             Report(progress, db.Name, RepairLogLevel.Success, "Integridade lógica (constraints/catálogo) OK.");
         }
+    }
+
+    /// <summary>
+    /// Saúde lógica adicional (B4), somente leitura: índices DESABILITADOS, dependências QUEBRADAS
+    /// (views/procs referenciando objetos inexistentes) e constraints NÃO confiáveis. Advisory.
+    /// </summary>
+    private async Task TryLogicalHealthChecksAsync(SqlSession session, DatabaseInfo db, DiagnosisResult diag, IProgress<RepairLogEntry> progress, CancellationToken ct)
+    {
+        if (diag.CheckDb is not { Executed: true }) return; // banco precisa estar acessível
+        try
+        {
+            var disabled = await session.GetDisabledIndexesAsync(db.Name, ct);
+            if (disabled.Count > 0)
+            {
+                diag.HealthFindings.Add(new PolicyFinding { Severity = FindingSeverity.Medium,
+                    Message = $"{disabled.Count} índice(s) DESABILITADO(s) (consultas podem estar lentas): {string.Join(", ", disabled.Take(8))}." });
+            }
+
+            var broken = await session.GetBrokenDependenciesAsync(db.Name, ct);
+            if (broken.Count > 0)
+            {
+                diag.HealthFindings.Add(new PolicyFinding { Severity = FindingSeverity.High,
+                    Message = $"{broken.Count} dependência(s) QUEBRADA(s) (objeto referenciado não existe): {string.Join("; ", broken.Take(6))}." });
+            }
+
+            if (diag.UntrustedConstraints.Count > 0)
+                diag.HealthFindings.Add(new PolicyFinding { Severity = FindingSeverity.Low,
+                    Message = $"{diag.UntrustedConstraints.Count} constraint(s) NÃO confiável(is) (is_not_trusted)." });
+
+            foreach (var f in diag.HealthFindings)
+                Report(progress, db.Name, SeverityToLevel(f.Severity), "  • Saúde lógica: " + f.Message);
+        }
+        catch { /* best-effort */ }
+    }
+
+    /// <summary>
+    /// Análise de CAUSA-RAIZ: erros de E/S físicos (823/824/825) apontam para storage/disco; e
+    /// corrupção RECORRENTE (presente também em verificações anteriores, via histórico) reforça a
+    /// suspeita de hardware. Apenas advisory.
+    /// </summary>
+    private void TryRootCauseAnalysis(DatabaseInfo db, DiagnosisResult diag, IProgress<RepairLogEntry> progress)
+    {
+        try
+        {
+            if (diag.IoErrors)
+                diag.RootCauseFindings.Add(new PolicyFinding { Severity = FindingSeverity.High,
+                    Message = "Erros de E/S físicos (823/824/825) no log do SQL — investigue discos/controladora/storage (possível falha de hardware)." });
+
+            var corruptNow = diag.DataCorruptionSuspected || (diag.CheckDb is { HasErrors: true });
+            if (corruptNow)
+            {
+                var priorCorrupt = new HistoryService().Load(db.Name).Count(s => s.PhysicalCorruption);
+                if (priorCorrupt >= 1)
+                    diag.RootCauseFindings.Add(new PolicyFinding { Severity = FindingSeverity.High,
+                        Message = $"Corrupção RECORRENTE: já apareceu em {priorCorrupt} verificação(ões) anterior(es) — suspeite do volume/hardware e considere migrar os arquivos." });
+            }
+
+            foreach (var f in diag.RootCauseFindings)
+                Report(progress, db.Name, RepairLogLevel.Warning, "  ⚠ Causa-raiz: " + f.Message);
+        }
+        catch { /* best-effort */ }
+    }
+
+    /// <summary>Persiste o snapshot do diagnóstico e reporta o que é NOVO desde a última verificação (B5).</summary>
+    private void TryRecordHistory(DatabaseInfo db, DiagnosisResult diag, IProgress<RepairLogEntry> progress)
+    {
+        try
+        {
+            var history = new HistoryService();
+            var previous = history.LoadLatest(db.Name);
+            var current = DiagnosisSnapshot.From(diag);
+            var news = HistoryService.Compare(previous, current);
+            diag.NewSinceLastRun.AddRange(news);
+            history.Save(db.Name, current);
+
+            foreach (var n in news)
+                Report(progress, db.Name, RepairLogLevel.Warning, "⚠ NOVO desde a última verificação: " + n);
+        }
+        catch { /* best-effort: histórico nunca derruba o diagnóstico */ }
     }
 
     /// <summary>
@@ -1419,6 +1523,168 @@ public sealed class RepairService
         }
     }
 
+    // ----------------------------------------------------------------------------------
+    // Reparo por SIMULAÇÃO: pré-visualiza a perda de dados numa CÓPIA, sem tocar na produção
+    // ----------------------------------------------------------------------------------
+
+    /// <summary>
+    /// SIMULA o reparo COM perda de dados numa CÓPIA descartável do banco (backup COPY_ONLY →
+    /// restauração para um banco temporário), executa o REPAIR_ALLOW_DATA_LOSS na cópia e quantifica
+    /// a perda por tabela (linhas antes × depois, via metadados). NÃO altera a produção. A cópia é
+    /// sempre descartada ao final. Permite ao usuário decidir com conhecimento total.
+    /// </summary>
+    public async Task<RepairSimulationResult> SimulateRepairAsync(
+        DatabaseInfo db, string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default)
+    {
+        var result = new RepairSimulationResult { DatabaseName = db.Name };
+        Report(progress, db.Name, RepairLogLevel.Info,
+            $"════════ Simulação de reparo (numa cópia, sem tocar em [{db.Name}]) ════════");
+
+        if (AppConstants.IsSystemDatabase(db.Name))
+        {
+            result.Message = "Banco de sistema: simulação não disponível.";
+            Report(progress, db.Name, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+
+        await using var session = await _data.OpenSessionAsync(connectionString, ct);
+
+        var dir = await session.GetScratchDataDirAsync(ct);
+        if (string.IsNullOrEmpty(dir))
+        {
+            result.Message = "Não foi possível determinar uma pasta temporária no servidor para a simulação.";
+            Report(progress, db.Name, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+
+        var stamp = DateTime.Now.ToString("yyyyMMddHHmmss");
+        var scratch = $"{AppConstants.SanitizeToken(db.Name, "banco")}_SimRepair_{stamp}";
+        var bak = Path.Combine(dir, $"{AppConstants.SanitizeToken(db.Name, "banco")}_sim_{stamp}.bak");
+
+        try
+        {
+            // 1) Backup COPY_ONLY do estado ATUAL (numa pasta temporária local da instância).
+            var backupSql =
+                "DECLARE @cmd nvarchar(max);\n" +
+                "SET @cmd = N'BACKUP DATABASE ' + QUOTENAME(@db) + N' TO DISK = @f WITH COPY_ONLY, INIT, NAME = @n;';\n" +
+                "EXEC sys.sp_executesql @cmd, N'@f nvarchar(4000), @n nvarchar(256)', @f = @file, @n = @name;";
+            var b = await RunStepAsync(session, db, progress, "Copiando o estado atual (BACKUP COPY_ONLY)", backupSql,
+                new Dictionary<string, object?> { ["@db"] = db.Name, ["@file"] = bak, ["@name"] = $"RestoreDB simulação de {db.Name}" }, ct);
+            if (!b.Success)
+            {
+                result.Message = "Não foi possível copiar o estado atual para simular (o banco pode estar inacessível para backup neste estado).";
+                Report(progress, db.Name, RepairLogLevel.Warning, result.Message);
+                return result;
+            }
+
+            // 2) MOVE dos arquivos para a pasta temporária e RESTORE para o banco de simulação.
+            var files = await session.RestoreFileListOnlyAsync(bak, 1, ct);
+            var moves = new List<string>();
+            var dataIdx = 0;
+            foreach (var f in files)
+            {
+                var isLog = f.Type.Equals("L", StringComparison.OrdinalIgnoreCase);
+                var ext = isLog ? ".ldf" : (dataIdx++ == 0 ? ".mdf" : ".ndf");
+                var dest = Path.Combine(dir, $"{scratch}_{moves.Count}{ext}");
+                moves.Add($"MOVE N'{f.LogicalName.Replace("'", "''")}' TO N'{dest.Replace("'", "''")}'");
+            }
+            var moveLiteral = string.Join(", ", moves).Replace("'", "''");
+
+            var restoreSql =
+                "DECLARE @cmd nvarchar(max);\n" +
+                "SET @cmd = N'RESTORE DATABASE ' + QUOTENAME(@s) + N' FROM DISK = @f WITH " + moveLiteral + ", REPLACE, RECOVERY;';\n" +
+                "EXEC sys.sp_executesql @cmd, N'@f nvarchar(4000)', @f = @file;";
+            var rr = await RunStepAsync(session, db, progress, "Restaurando a cópia de simulação", restoreSql,
+                new Dictionary<string, object?> { ["@s"] = scratch, ["@file"] = bak }, ct);
+            if (!rr.Success)
+            {
+                result.Message = "Não foi possível restaurar a cópia de simulação.";
+                Report(progress, db.Name, RepairLogLevel.Error, result.Message);
+                return result;
+            }
+
+            // 3) Contagem ANTES, reparo destrutivo NA CÓPIA, verificação, contagem DEPOIS.
+            var before = await session.GetTableRowCountsAsync(scratch, ct);
+
+            await RunStepAsync(session, db, progress, "Acesso exclusivo na cópia (SINGLE_USER)",
+                AlterDatabase(scratch, "SET SINGLE_USER WITH ROLLBACK IMMEDIATE"), ct);
+            await RunStepAsync(session, db, progress, "Reparo COM perda NA CÓPIA (REPAIR_ALLOW_DATA_LOSS)",
+                Dbcc(scratch, "REPAIR_ALLOW_DATA_LOSS", noInfoMsgs: false), ct);
+            var verify = await session.CheckDbWithResultsAsync(scratch, repairOption: null, ct);
+            result.CheckDbCleanAfter = verify.Executed && !verify.HasErrors;
+            await RunStepAsync(session, db, progress, "Liberando a cópia (MULTI_USER)",
+                AlterDatabase(scratch, "SET MULTI_USER"), ct);
+
+            var after = await session.GetTableRowCountsAsync(scratch, ct);
+
+            foreach (var kv in before)
+            {
+                after.TryGetValue(kv.Key, out var a);
+                result.TableLosses.Add(new TableLoss { Table = kv.Key, RowsBefore = kv.Value, RowsAfter = a });
+            }
+            result.Executed = true;
+            result.Message = result.TotalRowsLost == 0
+                ? $"Simulação: o reparo COM perda NÃO descartaria linhas. O CHECKDB {(result.CheckDbCleanAfter ? "ficaria limpo" : "AINDA acusaria erros")}."
+                : $"Simulação: o reparo COM perda descartaria {result.TotalRowsLost:N0} linha(s) em {result.AffectedTables.Count} tabela(s). O CHECKDB {(result.CheckDbCleanAfter ? "ficaria limpo" : "AINDA acusaria erros")}.";
+            Report(progress, db.Name, result.TotalRowsLost > 0 ? RepairLogLevel.Warning : RepairLogLevel.Success, result.Message);
+            foreach (var t in result.AffectedTables.Take(12))
+                Report(progress, db.Name, RepairLogLevel.Warning, "  • " + t.Display);
+            return result;
+        }
+        finally
+        {
+            await DropDbBestEffortAsync(session, scratch, progress);
+            try { await session.ExecuteAsync("Removendo backup de simulação", "EXEC master.sys.xp_delete_file 0, @p;",
+                new Dictionary<string, object?> { ["@p"] = bak }, AppConstants.QueryCommandTimeoutSeconds, CancellationToken.None); }
+            catch { /* best-effort */ }
+        }
+    }
+
+    private async Task DropDbBestEffortAsync(SqlSession s, string name, IProgress<RepairLogEntry> p)
+    {
+        var ok = await s.DropDatabaseBestEffortAsync(name, CancellationToken.None);
+        Report(p, name, ok ? RepairLogLevel.Info : RepairLogLevel.Warning,
+            ok ? $"Cópia de simulação [{name}] descartada." : $"Não foi possível descartar a cópia [{name}] — remova-a manualmente.");
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Checagens granulares (B1): CHECKTABLE dirigido e reseed de IDENTITY
+    // ----------------------------------------------------------------------------------
+
+    /// <summary>Verificação dirigida de UMA tabela (DBCC CHECKTABLE) — mais rápida que o CHECKDB completo.</summary>
+    public async Task<CheckDbReport> CheckTableAsync(DatabaseInfo db, string schemaTable, string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default)
+    {
+        Report(progress, db.Name, RepairLogLevel.Info, $"Verificação dirigida (DBCC CHECKTABLE) de {schemaTable}...");
+        await using var session = await _data.OpenSessionAsync(connectionString, ct);
+        var report = await session.CheckTableAsync(db.Name, schemaTable, ct);
+
+        if (!report.Executed)
+            Report(progress, db.Name, RepairLogLevel.Warning, "CHECKTABLE não pôde ser executado (banco/objeto inacessível).");
+        else if (!report.HasErrors)
+            Report(progress, db.Name, RepairLogLevel.Success, $"{schemaTable}: sem erros de consistência.");
+        else
+        {
+            Report(progress, db.Name, RepairLogLevel.Warning,
+                $"{schemaTable}: {report.ErrorCount} erro(s). Nível mínimo de reparo: {(report.MinRepairLevel.Length > 0 ? report.MinRepairLevel : "não reparável pelo DBCC")}.");
+            foreach (var d in report.Details.Where(x => x.Error != 0).Take(8))
+                Report(progress, db.Name, RepairLogLevel.Warning, "  • " + d.MessageText);
+        }
+        return report;
+    }
+
+    /// <summary>
+    /// Reajusta as sementes de IDENTITY (DBCC CHECKIDENT ... RESEED) de todas as tabelas — útil após
+    /// remoção de linhas (reparo com perda / salvamento) para evitar saltos/colisões de identidade.
+    /// </summary>
+    public async Task<int> ReseedIdentitiesAsync(DatabaseInfo db, string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default)
+    {
+        Report(progress, db.Name, RepairLogLevel.Info, "Reajustando sementes de IDENTITY (DBCC CHECKIDENT ... RESEED)...");
+        await using var session = await _data.OpenSessionAsync(connectionString, ct);
+        var n = await session.ReseedIdentitiesAsync(db.Name, ct);
+        Report(progress, db.Name, RepairLogLevel.Success, $"{n} tabela(s) com IDENTITY reajustada(s).");
+        return n;
+    }
+
     /// <summary>
     /// Garante o retorno do banco a MULTI_USER usando uma conexão NOVA — robusto mesmo que a
     /// sessão principal tenha sido derrubada por um erro severo. Só age se necessário e usa
@@ -1624,13 +1890,14 @@ public sealed class RepairService
     {
         Report(p, db.Name, RepairLogLevel.Info, "Tentando backup de segurança (COPY_ONLY) antes do reparo destrutivo...");
 
-        var fileName = $"{SanitizeFileToken(db.Name)}_RestoreDB_{DateTime.Now:yyyyMMdd_HHmmss}.bak";
+        var fileName = $"{AppConstants.SanitizeToken(db.Name, "banco")}_RestoreDB_{DateTime.Now:yyyyMMdd_HHmmss}.bak";
         var backupName = $"RestoreDB COPY_ONLY backup de {db.Name}";
 
         // O caminho relativo faz o SQL Server gravar na pasta padrão de backups da instância.
-        const string sql =
+        var comp = await s.SupportsBackupCompressionAsync(ct) ? ", COMPRESSION" : string.Empty;
+        var sql =
             "DECLARE @cmd nvarchar(max);\n" +
-            "SET @cmd = N'BACKUP DATABASE ' + QUOTENAME(@db) + N' TO DISK = @bkfile WITH COPY_ONLY, INIT, NAME = @bkname';\n" +
+            "SET @cmd = N'BACKUP DATABASE ' + QUOTENAME(@db) + N' TO DISK = @bkfile WITH COPY_ONLY, INIT" + comp + ", NAME = @bkname';\n" +
             "EXEC sys.sp_executesql @cmd, N'@bkfile nvarchar(4000), @bkname nvarchar(256)', @bkfile = @file, @bkname = @name;";
 
         var prm = new Dictionary<string, object?>
@@ -1717,11 +1984,45 @@ public sealed class RepairService
         return (sql, new Dictionary<string, object?> { ["@db"] = dbName });
     }
 
-    private static string SanitizeFileToken(string name)
+    /// <summary>
+    /// Runbook (somente leitura) para corrupção de banco de SISTEMA — que esta ferramenta não repara
+    /// automaticamente. Devolve os passos manuais a executar no servidor, conforme o banco.
+    /// </summary>
+    public static string BuildSystemDbRunbook(string dbName)
     {
-        var chars = name.Select(c => char.IsLetterOrDigit(c) ? c : '_').ToArray();
-        var token = new string(chars).Trim('_');
-        return string.IsNullOrEmpty(token) ? "banco" : token;
+        var n = dbName.Trim().ToLowerInvariant();
+        var sb = new StringBuilder();
+        sb.AppendLine($"Procedimento manual para o banco de SISTEMA [{dbName}] — execute no servidor, como administrador.");
+        sb.AppendLine("⚠ Não automatizado: bancos de sistema exigem cuidado e parada do serviço. Acione o DBA se possível.");
+        sb.AppendLine();
+        switch (n)
+        {
+            case "master":
+                sb.AppendLine("master corrompido (o SQL não inicia):");
+                sb.AppendLine("1) Inicie a instância em modo de usuário único: net start MSSQLSERVER /m\"SQLCMD\"  (ou via /m).");
+                sb.AppendLine("2) Conecte com sqlcmd -S .\\INSTANCIA e RESTORE DATABASE master FROM DISK='...' WITH REPLACE; (precisa de backup do master).");
+                sb.AppendLine("3) Sem backup do master: reconstrua os bancos de sistema com o setup do SQL Server (/ACTION=REBUILDDATABASE) e restaure msdb/model do backup.");
+                break;
+            case "model":
+                sb.AppendLine("model corrompido (tempdb não é criado, o SQL não sobe):");
+                sb.AppendLine("1) Inicie com flags de trace 3608 e 3609 e em /m para pular a recriação do tempdb.");
+                sb.AppendLine("2) RESTORE DATABASE model FROM DISK='...' WITH REPLACE; reinicie normalmente.");
+                break;
+            case "msdb":
+                sb.AppendLine("msdb corrompido (Agent/histórico de backup afetados; a instância sobe):");
+                sb.AppendLine("1) Pare o SQL Server Agent.");
+                sb.AppendLine("2) RESTORE DATABASE msdb FROM DISK='...' WITH REPLACE; reinicie o Agent.");
+                break;
+            case "tempdb":
+                sb.AppendLine("tempdb corrompido: o tempdb é recriado a cada inicialização.");
+                sb.AppendLine("1) Reinicie o serviço do SQL Server — o tempdb será recriado limpo.");
+                sb.AppendLine("2) Se persistir, mova os arquivos do tempdb para um volume saudável (ALTER DATABASE tempdb MODIFY FILE ...).");
+                break;
+            default:
+                sb.AppendLine("Banco de sistema não reconhecido — acione o DBA/suporte.");
+                break;
+        }
+        return sb.ToString();
     }
 
     private void Report(IProgress<RepairLogEntry> p, string db, RepairLogLevel level, string message)

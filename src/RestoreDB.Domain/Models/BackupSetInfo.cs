@@ -21,6 +21,17 @@ public sealed class BackupSetInfo
     public string RecoveryModel { get; init; } = string.Empty;
     public string ServerName { get; init; } = string.Empty;
     public string PhysicalDevice { get; init; } = string.Empty;
+
+    /// <summary>Todos os arquivos do conjunto quando dividido (striped). Vazio = usar PhysicalDevice.</summary>
+    public List<string> Devices { get; init; } = new();
+
+    /// <summary>Dispositivos efetivos (Devices se houver; senão o PhysicalDevice único).</summary>
+    public IReadOnlyList<string> AllDevices =>
+        Devices.Count > 0 ? Devices : (string.IsNullOrEmpty(PhysicalDevice) ? Array.Empty<string>() : new[] { PhysicalDevice });
+
+    /// <summary>Backup comprimido (compressed_backup_size &lt; backup_size).</summary>
+    public bool IsCompressed { get; init; }
+
     public decimal FirstLsn { get; init; }
     public decimal LastLsn { get; init; }
 
@@ -52,5 +63,8 @@ public sealed class BackupSetInfo
     /// <summary>Texto para exibição em lista (UI).</summary>
     public string Display =>
         $"{BackupTypeFriendly}  •  {(BackupFinishDate.HasValue ? BackupFinishDate.Value.ToString("yyyy-MM-dd HH:mm") : "?")}" +
-        $"  •  {BackupSizeMb:0.#} MB  •  pos {Position}{(IsCopyOnly ? "  •  COPY_ONLY" : string.Empty)}";
+        $"  •  {BackupSizeMb:0.#} MB  •  pos {Position}" +
+        (IsCopyOnly ? "  •  COPY_ONLY" : string.Empty) +
+        (IsCompressed ? "  •  comprimido" : string.Empty) +
+        (Devices.Count > 1 ? $"  •  {Devices.Count} arquivos (striped)" : string.Empty);
 }

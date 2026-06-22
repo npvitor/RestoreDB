@@ -64,16 +64,22 @@ public sealed class RestoreService
 
         await using var session = await _data.OpenSessionAsync(connectionString, ct);
 
+        // Realocação automática de arquivos (WITH MOVE) quando solicitado e sem mapa explícito:
+        // arquivos cuja pasta original não existe no servidor são movidos para a pasta padrão.
+        if (request.AutoRelocate && request.MoveMap.Count == 0)
+            await ApplyAutoRelocateAsync(session, request, progress, ct);
+
         for (var i = 0; i < request.Pieces.Count; i++)
         {
             var piece = request.Pieces[i];
             var isLast = i == request.Pieces.Count - 1;
 
-            // Verificação da mídia antes de aplicar (best-effort).
+            // Verificação da mídia antes de aplicar (best-effort) — todos os arquivos (striped).
+            var (vfrom, vprm) = DeviceFrom(piece.AllDevices);
+            vprm["@f"] = piece.Position;
             var verify = await RunStepAsync(session, db, progress,
                 $"Verificando o backup ({Path.GetFileName(piece.DiskPath)}, posição {piece.Position})",
-                "RESTORE VERIFYONLY FROM DISK = @p WITH FILE = @f;",
-                new Dictionary<string, object?> { ["@p"] = piece.DiskPath, ["@f"] = piece.Position }, ct);
+                $"RESTORE VERIFYONLY FROM {vfrom} WITH FILE = @f;", vprm, ct);
             if (!verify.Success)
                 Report(progress, db, RepairLogLevel.Warning, "VERIFYONLY acusou problema na mídia — a restauração será tentada mesmo assim.");
 
@@ -110,6 +116,244 @@ public sealed class RestoreService
 
         Report(progress, db, RepairLogLevel.Info, $"════════ Fim da restauração de [{db}] ════════");
         return result;
+    }
+
+    /// <summary>Resolve o WITH MOVE automaticamente a partir do FILELISTONLY do primeiro backup.</summary>
+    private async Task ApplyAutoRelocateAsync(SqlSession session, RestoreRequest request, IProgress<RepairLogEntry> progress, CancellationToken ct, bool forceRelocate = false)
+    {
+        var first = request.Pieces[0];
+        var files = await session.RestoreFileListOnlyAsync(first.DiskPath, first.Position, ct);
+        if (files.Count == 0) return;
+
+        var dataDir = await session.GetDefaultDataDirAsync(ct);
+        var logDir = await session.GetDefaultLogDirAsync(ct);
+
+        var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var dir in files.Select(f => Path.GetDirectoryName(f.PhysicalName) ?? string.Empty)
+                                  .Where(d => d.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase))
+            if (await session.PathExistsOnServerAsync(dir, ct)) existing.Add(dir);
+
+        var map = RestorePlanner.BuildMoveMap(files, existing, dataDir, logDir, request.DatabaseName, forceRelocate);
+        foreach (var kv in map) request.MoveMap[kv.Key] = kv.Value;
+
+        if (map.Count > 0)
+            Report(progress, request.DatabaseName, RepairLogLevel.Info,
+                $"Realocação automática de {map.Count} arquivo(s) para a pasta padrão da instância.");
+    }
+
+    /// <summary>
+    /// SALVAMENTO (restore-to-copy): restaura a cadeia mais recente de <paramref name="originalDb"/>
+    /// para um banco de CÓPIA (<paramref name="copyName"/>), com arquivos realocados, SEM tocar no
+    /// original. Permite extrair dados de um backup quando o banco vivo está corrompido. Não
+    /// sobrescreve um banco já existente de mesmo nome.
+    /// </summary>
+    public async Task<RepairResult> RestoreAsCopyAsync(
+        string originalDb, string? copyName, string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default)
+    {
+        var result = new RepairResult();
+        var copy = string.IsNullOrWhiteSpace(copyName) ? originalDb + "_Recuperado" : copyName!;
+        Report(progress, originalDb, RepairLogLevel.Info, $"════════ Recuperar para cópia: [{originalDb}] → [{copy}] (não altera o original) ════════");
+
+        await using var session = await _data.OpenSessionAsync(connectionString, ct);
+
+        if (!(await session.GetDatabaseStateAsync(copy, ct)).Equals("DESCONHECIDO", StringComparison.OrdinalIgnoreCase))
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = $"Já existe um banco chamado [{copy}]. Escolha outro nome para a cópia (o original não foi tocado).";
+            Report(progress, originalDb, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+
+        var history = await session.GetBackupHistoryAsync(originalDb, ct);
+        var plan = BackupChainPlanner.Plan(originalDb, history, target: null);
+        foreach (var w in plan.Warnings) Report(progress, originalDb, RepairLogLevel.Warning, "  ⚠ " + w);
+        if (!plan.IsComplete || plan.BaseFull is null)
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = "Sem cadeia de backup utilizável para criar a cópia. " + plan.Summary;
+            Report(progress, originalDb, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+
+        var request = new RestoreRequest
+        {
+            DatabaseName = copy,
+            Replace = true,
+            Pieces = new List<RestorePiece>(plan.Pieces)
+        };
+        // Força realocar TODOS os arquivos (com nomes novos) para nunca colidir com os do original.
+        await ApplyAutoRelocateAsync(session, request, progress, ct, forceRelocate: true);
+
+        var restore = await RestoreDatabaseAsync(request, connectionString, progress, ct);
+        if (restore.Status == RepairStatus.Success)
+        {
+            restore.Message = $"Cópia [{copy}] criada e ONLINE. Use-a para extrair/salvar dados sem afetar [{originalDb}].";
+            Report(progress, originalDb, RepairLogLevel.Success, restore.Message);
+        }
+        return restore;
+    }
+
+    /// <summary>
+    /// Anexa um banco a partir de arquivos físicos (.mdf [+ .ldf]). Sem o .ldf (ou com
+    /// <paramref name="rebuildLog"/>), recria o log via FOR ATTACH_REBUILD_LOG. Não sobrescreve um
+    /// banco existente de mesmo nome. Ao final, corrige usuários órfãos.
+    /// </summary>
+    public async Task<RepairResult> AttachDatabaseAsync(
+        string dbName, string mdfPath, string? ldfPath, bool rebuildLog,
+        string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default)
+    {
+        var result = new RepairResult();
+        Report(progress, dbName, RepairLogLevel.Info, $"════════ Anexando [{dbName}] a partir de arquivo ════════");
+
+        if (string.IsNullOrWhiteSpace(mdfPath))
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = "Informe o arquivo de dados (.mdf).";
+            Report(progress, dbName, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+
+        await using var session = await _data.OpenSessionAsync(connectionString, ct);
+
+        if (!(await session.GetDatabaseStateAsync(dbName, ct)).Equals("DESCONHECIDO", StringComparison.OrdinalIgnoreCase))
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = $"Já existe um banco chamado [{dbName}]. Escolha outro nome.";
+            Report(progress, dbName, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+
+        var withLog = !rebuildLog && !string.IsNullOrWhiteSpace(ldfPath);
+        var fileList = new List<string> { $"(FILENAME = N'{Escape(mdfPath)}')" };
+        if (withLog) fileList.Add($"(FILENAME = N'{Escape(ldfPath!)}')");
+        var clauseLiteral = string.Join(", ", fileList).Replace("'", "''");
+        var forClause = withLog ? "FOR ATTACH" : "FOR ATTACH_REBUILD_LOG";
+
+        var sql =
+            "DECLARE @cmd nvarchar(max);\n" +
+            "SET @cmd = N'CREATE DATABASE ' + QUOTENAME(@n) + N' ON " + clauseLiteral + " " + forClause + ";';\n" +
+            "EXEC sys.sp_executesql @cmd;";
+        var r = await RunStepAsync(session, dbName, progress,
+            withLog ? "Anexando (FOR ATTACH)" : "Anexando e recriando o log (FOR ATTACH_REBUILD_LOG)", sql,
+            new Dictionary<string, object?> { ["@n"] = dbName }, ct);
+
+        var state = await session.GetDatabaseStateAsync(dbName, ct);
+        result.FinalStateDesc = state;
+        if (r.Success && state.Equals("ONLINE", StringComparison.OrdinalIgnoreCase))
+        {
+            await FixOrphanedUsersAsync(session, dbName, progress, ct);
+            result.Status = RepairStatus.Success;
+            result.Message = $"Banco [{dbName}] anexado e ONLINE.";
+            Report(progress, dbName, RepairLogLevel.Success, result.Message);
+        }
+        else
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = $"Não foi possível anexar [{dbName}]. Estado: {state}. Verifique os caminhos e as permissões da conta de serviço do SQL.";
+            Report(progress, dbName, RepairLogLevel.Error, result.Message);
+        }
+        return result;
+    }
+
+    /// <summary>Lista as tabelas de usuário de um banco (para o assistente de salvamento).</summary>
+    public async Task<List<string>> ListUserTablesAsync(string databaseName, string connectionString, CancellationToken ct = default)
+    {
+        await using var session = await _data.OpenSessionAsync(connectionString, ct);
+        return await session.ListUserTablesAsync(databaseName, ct);
+    }
+
+    /// <summary>
+    /// Lista transações DESTRUTIVAS recentes (DELETE/DROP/TRUNCATE) do log — para investigar uma
+    /// exclusão acidental e, em seguida, restaurar até LOGO ANTES dela com
+    /// <see cref="RestoreToPointInTimeAsync"/> (target = início da transação menos um instante).
+    /// </summary>
+    public async Task<List<ForensicTransaction>> ListRecentDestructiveTransactionsAsync(
+        string databaseName, string connectionString, CancellationToken ct = default)
+    {
+        await using var session = await _data.OpenSessionAsync(connectionString, ct);
+        return await session.GetRecentDestructiveTransactionsAsync(databaseName, max: 50, ct);
+    }
+
+    /// <summary>
+    /// Copia de um banco de CÓPIA (recuperado) para o banco VIVO apenas as linhas que faltam (por
+    /// chave primária) de uma tabela — o "assistente de salvamento". Não duplica registros.
+    /// </summary>
+    public async Task<RepairResult> SalvageTableAsync(
+        string fromDb, string toDb, string schemaTable, string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default)
+    {
+        var result = new RepairResult();
+        Report(progress, toDb, RepairLogLevel.Info, $"Salvamento de dados: copiando linhas faltantes de [{fromDb}].{schemaTable} → [{toDb}].{schemaTable}...");
+        try
+        {
+            await using var session = await _data.OpenSessionAsync(connectionString, ct);
+            var rows = await session.SalvageTableAsync(fromDb, toDb, schemaTable, ct);
+            result.Status = RepairStatus.Success;
+            result.Message = $"{rows} linha(s) copiada(s) para [{toDb}].{schemaTable} (registros que faltavam).";
+            Report(progress, toDb, RepairLogLevel.Success, result.Message);
+        }
+        catch (Exception ex)
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = "Não foi possível salvar a tabela: " + ex.Message;
+            Report(progress, toDb, RepairLogLevel.Error, result.Message);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Verifica a SAÚDE dos backups recentes do banco: roda RESTORE VERIFYONLY ... WITH CHECKSUM em
+    /// cada conjunto do histórico, comprovando que a mídia é legível e consistente (sem restaurar).
+    /// </summary>
+    public async Task<List<BackupHealthItem>> VerifyBackupHealthAsync(
+        string databaseName, string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default, int max = 10)
+    {
+        var items = new List<BackupHealthItem>();
+        Report(progress, databaseName, RepairLogLevel.Info, $"════════ Saúde dos backups de [{databaseName}] (RESTORE VERIFYONLY WITH CHECKSUM) ════════");
+
+        await using var session = await _data.OpenSessionAsync(connectionString, ct);
+        var history = (await session.GetBackupHistoryAsync(databaseName, ct)).Take(max).ToList();
+        if (history.Count == 0)
+        {
+            Report(progress, databaseName, RepairLogLevel.Warning, "Sem histórico de backups para verificar.");
+            return items;
+        }
+
+        foreach (var set in history)
+        {
+            var label = $"VERIFYONLY {set.BackupTypeFriendly} ({Path.GetFileName(set.PhysicalDevice)}, pos {set.Position})";
+            var (from, prm) = DeviceFrom(set.AllDevices);
+            prm["@f"] = set.Position;
+
+            // Preferimos validar os page-checksums (WITH CHECKSUM); se a mídia não tiver checksums
+            // (backup feito sem CHECKSUM — comum), recai para o VERIFYONLY simples, que ainda
+            // comprova que o backup está completo e legível.
+            var withChecksum = await RunStepAsync(session, databaseName, progress, label + " [CHECKSUM]",
+                $"RESTORE VERIFYONLY FROM {from} WITH FILE = @f, CHECKSUM;", prm, ct);
+
+            bool verified;
+            string message;
+            if (withChecksum.Success)
+            {
+                verified = true;
+                message = "Íntegro (verificado com CHECKSUM).";
+            }
+            else
+            {
+                var plain = await RunStepAsync(session, databaseName, progress, label,
+                    $"RESTORE VERIFYONLY FROM {from} WITH FILE = @f;", prm, ct);
+                verified = plain.Success;
+                message = plain.Success
+                    ? "Íntegro (verificado; mídia sem page-checksum)."
+                    : "FALHOU na verificação — backup possivelmente danificado.";
+            }
+
+            items.Add(new BackupHealthItem { Set = set, Verified = verified, Message = message });
+        }
+
+        var ok = items.Count(i => i.Verified);
+        Report(progress, databaseName, ok == items.Count ? RepairLogLevel.Success : RepairLogLevel.Warning,
+            $"Saúde dos backups: {ok}/{items.Count} verificado(s) com sucesso.");
+        return items;
     }
 
     /// <summary>
@@ -170,6 +414,81 @@ public sealed class RestoreService
     }
 
     /// <summary>
+    /// Restaura a cadeia mais recente deixando o banco em STANDBY (somente leitura) em vez de
+    /// finalizar — permite CONSULTAR os dados para achar o ponto certo antes de aplicar a recuperação
+    /// definitiva (FinalizeRecoveryAsync). O arquivo de undo é criado na pasta padrão da instância.
+    /// </summary>
+    public async Task<RepairResult> RestoreToStandbyAsync(
+        string databaseName, DateTime? target, string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default)
+    {
+        var result = new RepairResult();
+        Report(progress, databaseName, RepairLogLevel.Info, $"════════ Restauração em STANDBY (somente leitura) de [{databaseName}] ════════");
+
+        await using var session = await _data.OpenSessionAsync(connectionString, ct);
+
+        var history = await session.GetBackupHistoryAsync(databaseName, ct);
+        var plan = BackupChainPlanner.Plan(databaseName, history, target);
+        foreach (var w in plan.Warnings) Report(progress, databaseName, RepairLogLevel.Warning, "  ⚠ " + w);
+        if (!plan.IsComplete || plan.BaseFull is null)
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = "Cadeia de backup incompleta — restauração em STANDBY abortada. " + plan.Summary;
+            Report(progress, databaseName, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+
+        var dataDir = await session.GetDefaultDataDirAsync(ct);
+        var undo = Path.Combine(string.IsNullOrEmpty(dataDir) ? "." : dataDir,
+            $"{AppConstants.SanitizeToken(databaseName, "banco")}_undo_{DateTime.Now:yyyyMMdd_HHmmss}.bak");
+
+        var request = new RestoreRequest
+        {
+            DatabaseName = databaseName,
+            Replace = true,
+            StopAt = target,
+            StandbyUndoFile = undo,
+            AutoRelocate = true,
+            Pieces = new List<RestorePiece>(plan.Pieces)
+        };
+
+        var restore = await RestoreDatabaseAsync(request, connectionString, progress, ct);
+        // Em STANDBY o estado fica STANDBY/RESTORING (não ONLINE) — isso é o esperado aqui.
+        var state = await session.GetDatabaseStateAsync(databaseName, ct);
+        result.FinalStateDesc = state;
+        if (restore.Status == RepairStatus.Failed)
+            return restore;
+
+        result.Status = RepairStatus.Success;
+        result.Message = $"Banco em STANDBY (somente leitura) — consulte os dados e finalize com 'Finalizar recuperação'. Estado: {state}.";
+        Report(progress, databaseName, RepairLogLevel.Success, result.Message);
+        return result;
+    }
+
+    /// <summary>Finaliza a recuperação de um banco que está em STANDBY/RESTORING: RESTORE ... WITH RECOVERY.</summary>
+    public async Task<RepairResult> FinalizeRecoveryAsync(
+        string databaseName, string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default)
+    {
+        var result = new RepairResult();
+        Report(progress, databaseName, RepairLogLevel.Info, $"Finalizando a recuperação de [{databaseName}] (WITH RECOVERY)...");
+        await using var session = await _data.OpenSessionAsync(connectionString, ct);
+
+        const string sql =
+            "DECLARE @cmd nvarchar(max) = N'RESTORE DATABASE ' + QUOTENAME(@db) + N' WITH RECOVERY;';\n" +
+            "EXEC sys.sp_executesql @cmd;";
+        var r = await RunStepAsync(session, databaseName, progress, "RESTORE WITH RECOVERY", sql,
+            new Dictionary<string, object?> { ["@db"] = databaseName }, ct);
+
+        var state = await session.GetDatabaseStateAsync(databaseName, ct);
+        result.FinalStateDesc = state;
+        var ok = state.Equals("ONLINE", StringComparison.OrdinalIgnoreCase);
+        result.Status = ok ? RepairStatus.Success : RepairStatus.Failed;
+        result.Message = ok ? "Recuperação finalizada — banco ONLINE."
+                            : $"Após finalizar, o banco está {state}." + (r.Success ? "" : " O comando retornou erros.");
+        Report(progress, databaseName, ok ? RepairLogLevel.Success : RepairLogLevel.Warning, result.Message);
+        return result;
+    }
+
+    /// <summary>
     /// Captura o tail-log (BACKUP LOG ... WITH NORECOVERY) para preservar as transações mais
     /// recentes antes de uma restauração. Best-effort: em modelo SIMPLE ou sem log, devolve null.
     /// Usa CONTINUE_AFTER_ERROR para conseguir capturar mesmo com o log danificado.
@@ -183,10 +502,11 @@ public sealed class RestoreService
             return null;
         }
 
-        var file = $"{SanitizeToken(db)}_tail_{DateTime.Now:yyyyMMdd_HHmmss}.trn";
-        const string sql =
+        var file = $"{AppConstants.SanitizeToken(db, "banco")}_tail_{DateTime.Now:yyyyMMdd_HHmmss}.trn";
+        var comp = await session.SupportsBackupCompressionAsync(ct) ? ", COMPRESSION" : string.Empty;
+        var sql =
             "DECLARE @cmd nvarchar(max);\n" +
-            "SET @cmd = N'BACKUP LOG ' + QUOTENAME(@db) + N' TO DISK = @f WITH NORECOVERY, CONTINUE_AFTER_ERROR, INIT, NAME = @n;';\n" +
+            "SET @cmd = N'BACKUP LOG ' + QUOTENAME(@db) + N' TO DISK = @f WITH NORECOVERY, CONTINUE_AFTER_ERROR, INIT" + comp + ", NAME = @n;';\n" +
             "EXEC sys.sp_executesql @cmd, N'@f nvarchar(4000), @n nvarchar(256)', @f = @file, @n = @name;";
         var r = await RunStepAsync(session, db, p, "Capturando o tail-log (BACKUP LOG ... WITH NORECOVERY)", sql,
             new Dictionary<string, object?> { ["@db"] = db, ["@file"] = file, ["@name"] = $"RestoreDB tail-log de {db}" }, ct);
@@ -209,7 +529,7 @@ public sealed class RestoreService
         string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default)
     {
         var result = new RepairResult();
-        var scratch = $"{SanitizeToken(databaseName)}_RestoreDB_TEST_{DateTime.Now:yyyyMMddHHmmss}";
+        var scratch = $"{AppConstants.SanitizeToken(databaseName, "banco")}_RestoreDB_TEST_{DateTime.Now:yyyyMMddHHmmss}";
         Report(progress, databaseName, RepairLogLevel.Info,
             $"════════ Teste de restauração (não altera [{databaseName}]) → destino temporário [{scratch}] ════════");
 
@@ -287,27 +607,91 @@ public sealed class RestoreService
         }
     }
 
-    /// <summary>Descarta o banco de teste (SINGLE_USER + DROP), liberando também os arquivos movidos.</summary>
+    /// <summary>Descarta o banco de teste (liberando também os arquivos movidos). Best-effort.</summary>
     private async Task DropScratchDatabaseAsync(SqlSession session, string scratch, IProgress<RepairLogEntry> progress)
     {
-        const string sql =
-            "IF DB_ID(@db) IS NOT NULL\n" +
-            "BEGIN\n" +
-            "  DECLARE @cmd nvarchar(max);\n" +
-            "  BEGIN TRY SET @cmd = N'ALTER DATABASE ' + QUOTENAME(@db) + N' SET SINGLE_USER WITH ROLLBACK IMMEDIATE;'; EXEC sys.sp_executesql @cmd; END TRY BEGIN CATCH END CATCH\n" +
-            "  SET @cmd = N'DROP DATABASE ' + QUOTENAME(@db) + N';'; EXEC sys.sp_executesql @cmd;\n" +
-            "END";
-        var r = await session.ExecuteAsync("Descartando o banco de teste", sql,
-            new Dictionary<string, object?> { ["@db"] = scratch }, AppConstants.RepairCommandTimeoutSeconds, CancellationToken.None);
-        Report(progress, scratch, r.Success ? RepairLogLevel.Info : RepairLogLevel.Warning,
-            r.Success ? $"Banco de teste [{scratch}] descartado." : $"Não foi possível descartar [{scratch}] — remova-o manualmente.");
+        var ok = await session.DropDatabaseBestEffortAsync(scratch, CancellationToken.None);
+        Report(progress, scratch, ok ? RepairLogLevel.Info : RepairLogLevel.Warning,
+            ok ? $"Banco de teste [{scratch}] descartado." : $"Não foi possível descartar [{scratch}] — remova-o manualmente.");
     }
 
-    private static string SanitizeToken(string name)
+    /// <summary>
+    /// Restauração de PÁGINA montando a cadeia AUTOMATICAMENTE a partir do histórico (msdb): usa o
+    /// último FULL + toda a cadeia de LOGs e, por fim, captura um BACKUP LOG novo (aplicado WITH
+    /// RECOVERY) para concluir. Exige modelo FULL/BULK_LOGGED. <paramref name="pages"/> no formato
+    /// "fileId:pageId" separados por vírgula.
+    /// </summary>
+    public async Task<RepairResult> RestorePagesFromHistoryAsync(
+        string databaseName, string pages, string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default)
     {
-        var token = new string(name.Select(c => char.IsLetterOrDigit(c) ? c : '_').ToArray()).Trim('_');
-        return string.IsNullOrEmpty(token) ? "banco" : token;
+        var result = new RepairResult();
+        Report(progress, databaseName, RepairLogLevel.Info, $"════════ Restauração de página (cadeia automática) de [{databaseName}] ════════");
+
+        if (string.IsNullOrWhiteSpace(pages) || RestoreService.SanitizePages(pages).Length == 0)
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = "Informe as páginas corrompidas no formato fileId:pageId (ex.: 1:57,1:58).";
+            Report(progress, databaseName, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+
+        await using var session = await _data.OpenSessionAsync(connectionString, ct);
+
+        var model = await session.GetRecoveryModelAsync(databaseName, ct);
+        if (model.Equals("SIMPLE", StringComparison.OrdinalIgnoreCase))
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = "A restauração de página exige o modelo de recuperação FULL ou BULK_LOGGED. Em SIMPLE, restaure o banco inteiro de backup.";
+            Report(progress, databaseName, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+
+        var history = await session.GetBackupHistoryAsync(databaseName, ct);
+        var full = history.Where(b => b.IsFull).OrderByDescending(b => b.BackupFinishDate ?? DateTime.MinValue).FirstOrDefault();
+        if (full is null)
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = "Sem backup FULL no histórico — a restauração de página não é possível.";
+            Report(progress, databaseName, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+
+        // Cadeia de LOGs contígua a partir do FULL (ignora diferencial: o full + logs completos basta).
+        var pieces = new List<RestorePiece> { BackupChainPlanner.ToPiece(full, isLog: false) };
+        var anchor = full.LastLsn;
+        foreach (var lg in history.Where(b => b.IsLog).OrderBy(b => b.LastLsn))
+        {
+            if (anchor > 0 && lg.LastLsn > 0 && lg.LastLsn <= anchor) continue;
+            if (anchor > 0 && lg.FirstLsn > 0 && lg.FirstLsn > anchor)
+            {
+                Report(progress, databaseName, RepairLogLevel.Warning, "Quebra na cadeia de LOG — a restauração de página pode não cobrir até o presente.");
+                break;
+            }
+            pieces.Add(BackupChainPlanner.ToPiece(lg, isLog: true));
+            if (lg.LastLsn > anchor) anchor = lg.LastLsn;
+        }
+
+        // BACKUP LOG novo (não-NORECOVERY): captura o estado atual e será o último elo (WITH RECOVERY).
+        var tail = await BackupCurrentLogAsync(session, databaseName, progress, ct);
+        if (tail is not null) pieces.Add(tail);
+
+        return await RestorePagesAsync(databaseName, pages, pieces, connectionString, progress, ct);
     }
+
+    /// <summary>BACKUP LOG normal (sem NORECOVERY) para um arquivo novo — último elo da restauração de página.</summary>
+    private async Task<RestorePiece?> BackupCurrentLogAsync(SqlSession session, string db, IProgress<RepairLogEntry> p, CancellationToken ct)
+    {
+        var file = $"{AppConstants.SanitizeToken(db, "banco")}_pagelog_{DateTime.Now:yyyyMMdd_HHmmss}.trn";
+        var comp = await session.SupportsBackupCompressionAsync(ct) ? ", COMPRESSION" : string.Empty;
+        var sql =
+            "DECLARE @cmd nvarchar(max);\n" +
+            "SET @cmd = N'BACKUP LOG ' + QUOTENAME(@db) + N' TO DISK = @f WITH INIT" + comp + ", NAME = @n;';\n" +
+            "EXEC sys.sp_executesql @cmd, N'@f nvarchar(4000), @n nvarchar(256)', @f = @file, @n = @name;";
+        var r = await RunStepAsync(session, db, p, "Backup de log atual (para concluir a restauração de página)", sql,
+            new Dictionary<string, object?> { ["@db"] = db, ["@file"] = file, ["@name"] = $"RestoreDB page-restore log de {db}" }, ct);
+        return r.Success ? new RestorePiece { DiskPath = file, Position = 1, IsLog = true } : null;
+    }
+
 
     /// <summary>
     /// Restauração de PÁGINA: recupera apenas as páginas corrompidas indicadas, preservando o
@@ -380,7 +764,7 @@ public sealed class RestoreService
     /// Corrige usuários órfãos após um RESTORE: reassocia o usuário do banco ao login do servidor
     /// de mesmo nome (ALTER USER ... WITH LOGIN). Best-effort, não interrompe em caso de falha.
     /// </summary>
-    public async Task FixOrphanedUsersAsync(SqlSession session, string databaseName, IProgress<RepairLogEntry> progress, CancellationToken ct)
+    private async Task FixOrphanedUsersAsync(SqlSession session, string databaseName, IProgress<RepairLogEntry> progress, CancellationToken ct)
     {
         Report(progress, databaseName, RepairLogLevel.Info, "Verificando usuários órfãos pós-restauração...");
         // Reassocia automaticamente os usuários cujo login de mesmo nome já existe no servidor.
@@ -407,6 +791,18 @@ public sealed class RestoreService
     private static (string sql, Dictionary<string, object?> prm) BuildRestore(RestoreRequest req, RestorePiece piece, bool isFirst, bool isLast)
     {
         var verb = piece.IsLog ? "RESTORE LOG " : "RESTORE DATABASE ";
+        var prm = new Dictionary<string, object?> { ["@db"] = req.DatabaseName, ["@f"] = piece.Position };
+
+        // FROM DISK = @p0, DISK = @p1, ... — suporta backup dividido em vários arquivos (striped).
+        var devices = piece.AllDevices.Count > 0 ? piece.AllDevices : new List<string> { piece.DiskPath };
+        var diskClauses = new List<string>();
+        for (var i = 0; i < devices.Count; i++)
+        {
+            diskClauses.Add($"DISK = @p{i}");
+            prm[$"@p{i}"] = devices[i];
+        }
+        var fromClause = string.Join(", ", diskClauses);
+
         var options = new List<string> { "FILE = @f" };
 
         // MOVE (realocação de arquivos) — apenas na primeira peça (RESTORE DATABASE).
@@ -423,13 +819,25 @@ public sealed class RestoreService
         if (req.StopAt.HasValue && piece.IsLog)
             options.Add($"STOPAT = N'{req.StopAt.Value.ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture)}'");
 
-        options.Add(isLast ? "RECOVERY" : "NORECOVERY");
+        // Estado final da última peça: STANDBY (somente leitura entre logs) ou RECOVERY; senão NORECOVERY.
+        if (isLast && !string.IsNullOrWhiteSpace(req.StandbyUndoFile))
+            options.Add($"STANDBY = N'{Escape(req.StandbyUndoFile!)}'");
+        else
+            options.Add(isLast ? "RECOVERY" : "NORECOVERY");
+
+        // As opções (MOVE/STOPAT/STANDBY) podem conter aspas simples (delimitadores N'...' e caminhos).
+        // Como o conjunto inteiro é embutido num literal externo N'...', TODAS as aspas simples
+        // precisam ser duplicadas mais uma vez — senão um caminho como 'C:\' quebra o comando.
+        var optionsLiteral = string.Join(", ", options).Replace("'", "''");
+
+        var paramDecl = "@f int" + string.Concat(devices.Select((_, i) => $", @p{i} nvarchar(4000)"));
+        var paramPass = "@f = @f" + string.Concat(devices.Select((_, i) => $", @p{i} = @p{i}"));
 
         var sql =
             "DECLARE @cmd nvarchar(max);\n" +
-            "SET @cmd = N'" + verb + "' + QUOTENAME(@db) + N' FROM DISK = @p WITH " + string.Join(", ", options) + ";';\n" +
-            "EXEC sys.sp_executesql @cmd, N'@p nvarchar(4000), @f int', @p = @path, @f = @pos;";
-        return (sql, new Dictionary<string, object?> { ["@db"] = req.DatabaseName, ["@path"] = piece.DiskPath, ["@pos"] = piece.Position });
+            "SET @cmd = N'" + verb + "' + QUOTENAME(@db) + N' FROM " + fromClause + " WITH " + optionsLiteral + ";';\n" +
+            "EXEC sys.sp_executesql @cmd, N'" + paramDecl + "', " + paramPass + ";";
+        return (sql, prm);
     }
 
     private static (string sql, Dictionary<string, object?> prm) BuildPageRestore(string db, string pages, RestorePiece full)
@@ -448,6 +856,19 @@ public sealed class RestoreService
         => new string(pages.Where(c => char.IsDigit(c) || c == ':' || c == ',').ToArray());
 
     private static string Escape(string s) => s.Replace("'", "''");
+
+    /// <summary>Monta "DISK = @p0, DISK = @p1, ..." e preenche os parâmetros (suporta striped).</summary>
+    private static (string from, Dictionary<string, object?> prm) DeviceFrom(IReadOnlyList<string> devices)
+    {
+        var prm = new Dictionary<string, object?>();
+        var clauses = new List<string>();
+        for (var i = 0; i < devices.Count; i++)
+        {
+            clauses.Add($"DISK = @p{i}");
+            prm[$"@p{i}"] = devices[i];
+        }
+        return (string.Join(", ", clauses), prm);
+    }
 
     // ---- Execução + log ----
 

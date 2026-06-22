@@ -151,6 +151,249 @@ public sealed class RepairIntegrationTests
     }
 
     [IntegrationFact]
+    public async Task Forense_ListaExclusaoRecenteNoLog()
+    {
+        await using var db = await TestDatabase.CreateAsync("forense");
+        await It.ExecAsync($"ALTER DATABASE {It.Q(db.Name)} SET RECOVERY FULL;");
+        await db.BackupAsync();
+        await It.ExecAsync($"EXEC(N'USE {It.Q(db.Name)}; DELETE FROM dbo.NotaFiscal;');");
+
+        var txs = await Restore().ListRecentDestructiveTransactionsAsync(db.Name, It.Conn);
+
+        Assert.Contains(txs, t => t.Kind == "DELETE" && t.RowsAffected >= 1);
+    }
+
+    [IntegrationFact]
+    public async Task Manutencao_ExecutaSemErro()
+    {
+        await using var db = await TestDatabase.CreateAsync("maint");
+        var maint = new MaintenanceService(new LogService());
+
+        var frags = await maint.GetFragmentationAsync(db.Name, It.Conn); // roda (pode vir vazio em tabela pequena)
+        Assert.NotNull(frags);
+
+        var r = await maint.RunMaintenanceAsync(db.AsInfo("ONLINE"), It.Conn, It.NoProgress);
+        Assert.Equal(RepairStatus.Success, r.Status);
+    }
+
+    [IntegrationFact]
+    public async Task Anexar_BancoDesanexado_VoltaOnline()
+    {
+        await using var db = await TestDatabase.CreateAsync("attach");
+        var mdf = (await It.ScalarAsync("SELECT physical_name FROM sys.master_files WHERE database_id = DB_ID(@n) AND type = 0;", ("@n", db.Name))) as string;
+        var ldf = (await It.ScalarAsync("SELECT physical_name FROM sys.master_files WHERE database_id = DB_ID(@n) AND type = 1;", ("@n", db.Name))) as string;
+        Assert.False(string.IsNullOrEmpty(mdf));
+
+        await It.ExecAsync("EXEC master.dbo.sp_detach_db @dbname = @n;", ("@n", db.Name));
+        Assert.Equal("DESCONHECIDO", await It.GetStateAsync(db.Name)); // saiu do servidor
+
+        var r = await Restore().AttachDatabaseAsync(db.Name, mdf!, ldf, rebuildLog: false, It.Conn, It.NoProgress);
+
+        Assert.Equal(RepairStatus.Success, r.Status);
+        Assert.Equal("ONLINE", await It.GetStateAsync(db.Name));
+    }
+
+    [IntegrationFact]
+    public async Task SimulacaoDeReparo_NaoTocaOriginal_E_LimpaACopia()
+    {
+        await using var db = await TestDatabase.CreateAsync("simrep");
+        var linhasAntes = await It.RowCountAsync(db.Name);
+
+        var r = await Repair().SimulateRepairAsync(db.AsInfo("ONLINE"), It.Conn, It.NoProgress);
+
+        Assert.True(r.Executed);
+        Assert.True(r.CheckDbCleanAfter);               // banco saudável → cópia fica limpa
+        Assert.Equal(0, r.TotalRowsLost);               // nada a perder num banco íntegro
+        Assert.NotEmpty(r.TableLosses);                 // mediu as tabelas (NotaFiscal)
+        // Original intacto e a cópia de simulação foi descartada.
+        Assert.Equal("ONLINE", await It.GetStateAsync(db.Name));
+        Assert.Equal(linhasAntes, await It.RowCountAsync(db.Name));
+        var sobra = Convert.ToInt32(await It.ScalarAsync(
+            "SELECT COUNT(*) FROM sys.databases WHERE name LIKE @p;", ("@p", db.Name + "_SimRepair_%")));
+        Assert.Equal(0, sobra);
+    }
+
+    [IntegrationFact]
+    public async Task RestauracaoDePagina_DeBackup_PreservaDados()
+    {
+        await using var db = await TestDatabase.CreateAsync("pagerest");
+        await It.ExecAsync($"ALTER DATABASE {It.Q(db.Name)} SET RECOVERY FULL;");
+        await db.BackupAsync();
+
+        // Descobre uma página de DADOS real da tabela (formato "1:xxx").
+        var raw = (await It.ScalarAsync($"SELECT TOP 1 sys.fn_PhysLocFormatter(%%physloc%%) FROM {It.Q(db.Name)}.dbo.NotaFiscal;")) as string ?? string.Empty;
+        raw = raw.Trim('(', ')');
+        var parts = raw.Split(':');
+        var page = parts.Length >= 2 ? $"{parts[0]}:{parts[1]}" : string.Empty;
+        Assert.False(string.IsNullOrEmpty(page));
+
+        var r = await Restore().RestorePagesFromHistoryAsync(db.Name, page, It.Conn, It.NoProgress);
+
+        Assert.Equal(RepairStatus.Success, r.Status);
+        Assert.Equal("ONLINE", await It.GetStateAsync(db.Name));
+        Assert.Equal(3, await It.RowCountAsync(db.Name));
+    }
+
+    [IntegrationFact]
+    public async Task RestauracaoDePagina_ModeloSimple_AbortaSemAlterar()
+    {
+        await using var db = await TestDatabase.CreateAsync("pagesimple");
+        await It.ExecAsync($"ALTER DATABASE {It.Q(db.Name)} SET RECOVERY SIMPLE;");
+        await db.BackupAsync();
+
+        var r = await Restore().RestorePagesFromHistoryAsync(db.Name, "1:8", It.Conn, It.NoProgress);
+
+        Assert.Equal(RepairStatus.Failed, r.Status);
+        Assert.Equal("ONLINE", await It.GetStateAsync(db.Name)); // nada foi alterado
+    }
+
+    [IntegrationFact]
+    public async Task Standby_RestauraSomenteLeitura_E_Finaliza()
+    {
+        await using var db = await TestDatabase.CreateAsync("standby");
+        await It.ExecAsync($"ALTER DATABASE {It.Q(db.Name)} SET RECOVERY FULL;");
+        await db.BackupAsync();
+        await It.ExecAsync($"EXEC(N'USE {It.Q(db.Name)}; INSERT INTO dbo.NotaFiscal(Cliente,Valor) VALUES (N''D'',40);');");
+        await It.ExecAsync($"BACKUP LOG {It.Q(db.Name)} TO DISK = @f WITH INIT, NAME = N'IT_LOG';", ("@f", db.Name + "_sb_log.trn"));
+
+        var sb = await Restore().RestoreToStandbyAsync(db.Name, target: null, It.Conn, It.NoProgress);
+        Assert.Equal(RepairStatus.Success, sb.Status);
+        Assert.Equal(4, await It.RowCountAsync(db.Name)); // consultável em STANDBY (somente leitura)
+
+        var fin = await Restore().FinalizeRecoveryAsync(db.Name, It.Conn, It.NoProgress);
+        Assert.Equal(RepairStatus.Success, fin.Status);
+        Assert.Equal("ONLINE", await It.GetStateAsync(db.Name));
+        await It.TryDeleteBackupFileAsync(db.Name + "_sb_log.trn");
+    }
+
+    [IntegrationFact]
+    public async Task Striped_BackupEmDoisArquivos_AgrupaERestaura()
+    {
+        await using var db = await TestDatabase.CreateAsync("striped");
+        await It.ExecAsync($"BACKUP DATABASE {It.Q(db.Name)} TO DISK = @a, DISK = @b WITH INIT, FORMAT, NAME = N'IT_STRIPE';",
+            ("@a", db.Name + "_s1.bak"), ("@b", db.Name + "_s2.bak"));
+
+        // O histórico agrupa os dois arquivos do mesmo conjunto (striped).
+        var hist = await Restore().ListBackupHistoryAsync(db.Name, It.Conn);
+        var full = hist.First(h => h.IsFull);
+        Assert.True(full.AllDevices.Count >= 2);
+
+        await It.ExecAsync($"EXEC(N'USE {It.Q(db.Name)}; DELETE FROM dbo.NotaFiscal;');");
+        var r = await Restore().RestoreToPointInTimeAsync(db.Name, target: null, tailLogBackup: false, It.Conn, It.NoProgress);
+        Assert.Equal(RepairStatus.Success, r.Status);
+        Assert.Equal(3, await It.RowCountAsync(db.Name)); // restaurado a partir do conjunto striped
+
+        await It.TryDeleteBackupFileAsync(db.Name + "_s1.bak");
+        await It.TryDeleteBackupFileAsync(db.Name + "_s2.bak");
+    }
+
+    [IntegrationFact]
+    public async Task Diagnostico_SaudeLogica_DetectaIndiceDesabilitado()
+    {
+        await using var db = await TestDatabase.CreateAsync("saudelog");
+        await It.ExecAsync($"EXEC(N'USE {It.Q(db.Name)}; ALTER INDEX IX_NotaFiscal_Cliente ON dbo.NotaFiscal DISABLE;');");
+
+        var diag = await Repair().DiagnoseAsync(db.AsInfo("ONLINE"), It.Conn, It.NoProgress);
+
+        Assert.Contains(diag.HealthFindings, f => f.Message.Contains("DESABILITADO"));
+    }
+
+    [IntegrationFact]
+    public async Task Diagnostico_RegistraHistorico_SemNovidadesQuandoEstavel()
+    {
+        await using var db = await TestDatabase.CreateAsync("hist");
+        await Repair().DiagnoseAsync(db.AsInfo("ONLINE"), It.Conn, It.NoProgress);
+        var d2 = await Repair().DiagnoseAsync(db.AsInfo("ONLINE"), It.Conn, It.NoProgress);
+
+        // Banco saudável e estável: a 2ª verificação não acusa nada NOVO.
+        Assert.Empty(d2.NewSinceLastRun);
+    }
+
+    [IntegrationFact]
+    public async Task RecuperarParaCopia_CriaCopiaComDados_SemTocarNoOriginal()
+    {
+        await using var db = await TestDatabase.CreateAsync("copia");
+        await db.BackupAsync();
+        var copia = db.Name + "_Recuperado";
+        try
+        {
+            var result = await Restore().RestoreAsCopyAsync(db.Name, null, It.Conn, It.NoProgress);
+
+            Assert.Equal(RepairStatus.Success, result.Status);
+            Assert.Equal("ONLINE", await It.GetStateAsync(copia));
+            // A cópia tem os dados; o original continua intacto.
+            var copiaRows = Convert.ToInt32(await It.ScalarAsync($"SELECT COUNT(*) FROM {It.Q(copia)}.dbo.NotaFiscal;"));
+            Assert.Equal(3, copiaRows);
+            Assert.Equal("ONLINE", await It.GetStateAsync(db.Name));
+            Assert.Equal(3, await It.RowCountAsync(db.Name));
+        }
+        finally { await It.ForceDropAsync(copia); }
+    }
+
+    [IntegrationFact]
+    public async Task Salvamento_CopiaLinhasFaltantesDeVoltaAoOriginal()
+    {
+        await using var db = await TestDatabase.CreateAsync("salv");
+        await db.BackupAsync();
+        var copia = db.Name + "_Recuperado";
+        try
+        {
+            // Cópia recuperada com as 3 linhas originais.
+            var copy = await Restore().RestoreAsCopyAsync(db.Name, null, It.Conn, It.NoProgress);
+            Assert.Equal(RepairStatus.Success, copy.Status);
+
+            // Perde uma linha no banco VIVO (id 2).
+            await It.ExecAsync($"EXEC(N'USE {It.Q(db.Name)}; DELETE FROM dbo.NotaFiscal WHERE Id = 2;');");
+            Assert.Equal(2, await It.RowCountAsync(db.Name));
+
+            // Salvamento: copia da cópia para o vivo apenas a linha que falta (preservando o Id).
+            var salv = await Restore().SalvageTableAsync(copia, db.Name, "dbo.NotaFiscal", It.Conn, It.NoProgress);
+            Assert.Equal(RepairStatus.Success, salv.Status);
+
+            Assert.Equal(3, await It.RowCountAsync(db.Name));
+            var temId2 = Convert.ToInt32(await It.ScalarAsync($"SELECT COUNT(*) FROM {It.Q(db.Name)}.dbo.NotaFiscal WHERE Id = 2;"));
+            Assert.Equal(1, temId2);
+        }
+        finally { await It.ForceDropAsync(copia); }
+    }
+
+    [IntegrationFact]
+    public async Task SaudeDosBackups_VerifyOnly_RetornaIntegro()
+    {
+        await using var db = await TestDatabase.CreateAsync("saude");
+        await db.BackupAsync();
+
+        var items = await Restore().VerifyBackupHealthAsync(db.Name, It.Conn, It.NoProgress);
+
+        Assert.NotEmpty(items);
+        Assert.All(items, i => Assert.True(i.Verified));
+    }
+
+    [IntegrationFact]
+    public async Task DiagnosticoRapido_PhysicalOnly_Executa()
+    {
+        await using var db = await TestDatabase.CreateAsync("phys");
+        var diag = await Repair().DiagnoseAsync(db.AsInfo("ONLINE"), It.Conn, It.NoProgress, physicalOnly: true);
+
+        Assert.NotNull(diag.CheckDb);
+        Assert.True(diag.CheckDb!.Executed);
+        Assert.False(diag.CheckDb.HasErrors);
+    }
+
+    [IntegrationFact]
+    public async Task CheckTable_E_Reseed_Funcionam()
+    {
+        await using var db = await TestDatabase.CreateAsync("granular");
+
+        var rep = await Repair().CheckTableAsync(db.AsInfo("ONLINE"), "dbo.NotaFiscal", It.Conn, It.NoProgress);
+        Assert.True(rep.Executed);
+        Assert.False(rep.HasErrors);
+
+        var n = await Repair().ReseedIdentitiesAsync(db.AsInfo("ONLINE"), It.Conn, It.NoProgress);
+        Assert.True(n >= 1); // NotaFiscal tem coluna IDENTITY
+    }
+
+    [IntegrationFact]
     public async Task TestarBackup_RestauraEmCopiaDescartavel_SemTocarNoOriginal()
     {
         await using var db = await TestDatabase.CreateAsync("testrestore");

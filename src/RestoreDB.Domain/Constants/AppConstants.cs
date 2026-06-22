@@ -43,4 +43,15 @@ public static class AppConstants
     public static bool IsSystemDatabase(string? name) =>
         !string.IsNullOrWhiteSpace(name) &&
         SystemDatabases.Contains(name, StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Converte um nome (de banco, etc.) em um token seguro para nome de arquivo/banco temporário:
+    /// mantém letras e dígitos, troca o resto por '_' e remove '_' das pontas. Helper único usado por
+    /// toda a aplicação (backups de segurança, cópias de simulação, histórico, alertas).
+    /// </summary>
+    public static string SanitizeToken(string? name, string fallback = "x")
+    {
+        var token = new string((name ?? string.Empty).Select(c => char.IsLetterOrDigit(c) ? c : '_').ToArray()).Trim('_');
+        return token.Length == 0 ? fallback : token;
+    }
 }

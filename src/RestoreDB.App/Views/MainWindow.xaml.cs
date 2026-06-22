@@ -20,6 +20,7 @@ public partial class MainWindow : Window
     private readonly LogService _logService = new();
     private readonly RepairService _repairService;
     private readonly RestoreService _restoreService;
+    private readonly MaintenanceService _maintenanceService;
     private readonly ReportService _reportService = new();
 
     private readonly ObservableCollection<DatabaseInfo> _databases = new();
@@ -30,6 +31,12 @@ public partial class MainWindow : Window
     private bool _busy;
     private CancellationTokenSource? _cts;
 
+    /// <summary>Nome do banco de cópia recuperada, para o assistente de salvamento (cópia → vivo).</summary>
+    private string? _salvageCopyName;
+
+    /// <summary>Transações destrutivas listadas pela forense, para a restauração ponto-no-tempo.</summary>
+    private List<ForensicTransaction> _forensicTx = new();
+
     public MainWindow(string connectionString, string serverName, ServerInfo? serverInfo = null)
     {
         InitializeComponent();
@@ -39,6 +46,7 @@ public partial class MainWindow : Window
         _serverInfo = serverInfo ?? new ServerInfo();
         _repairService = new RepairService(_logService);
         _restoreService = new RestoreService(_logService);
+        _maintenanceService = new MaintenanceService(_logService);
         _progress = new Progress<RepairLogEntry>(OnLogEntry);
 
         DatabasesGrid.ItemsSource = _databases;
@@ -162,6 +170,13 @@ public partial class MainWindow : Window
             ConstraintFixConfirmCheck.IsChecked = false;
             ConstraintFixButton.IsEnabled = false;
             RestorePanel.Visibility = Visibility.Collapsed;
+            SalvagePanel.Visibility = Visibility.Collapsed;
+            _salvageCopyName = null;
+            PagesBox.Text = string.Empty;
+            SimulateResultText.Visibility = Visibility.Collapsed;
+            ForensicList.Visibility = Visibility.Collapsed;
+            ForensicRestoreButton.Visibility = Visibility.Collapsed;
+            ForensicList.ItemsSource = null;
             ViewScriptButton.Visibility = Visibility.Collapsed;
             _backupSets.Clear();
             BackupSourceText.Text = string.Empty;
@@ -206,13 +221,17 @@ public partial class MainWindow : Window
 
         try
         {
-            var diag = await _repairService.DiagnoseAsync(db, _connectionString, _progress, _cts!.Token);
+            var physicalOnly = PhysicalOnlyCheck.IsChecked == true;
+            var diag = await _repairService.DiagnoseAsync(db, _connectionString, _progress, _cts!.Token, physicalOnly);
 
             DiagnosisSummaryText.Text = diag.Summary;
             RecoActionNameText.Text = RecommendedActionLabel(diag.RecommendedAction);
             DiagnosisRecoText.Text = diag.Recommendation;
             DiagnosisRecoText.Visibility = string.IsNullOrEmpty(diag.Recommendation)
                 ? Visibility.Collapsed : Visibility.Visible;
+
+            // Surfacing: novidades (B5) + política de backup (B3) + saúde lógica (B4) no painel.
+            PopulateDiagnosisFindings(diag);
 
             // Cor conforme a severidade da conclusão.
             var (backKey, foreKey) = SeverityKeys(diag.RecommendedAction);
@@ -356,7 +375,6 @@ public partial class MainWindow : Window
         RecommendedActionKind.RebuildLog => "→ Ação recomendada: reconstruir o log de transações.",
         RecommendedActionKind.FixConstraints => "→ Ação recomendada: corrigir integridade lógica (remover registros órfãos).",
         RecommendedActionKind.FreeDiskSpace => "→ Ação recomendada: liberar espaço em disco e religar o banco.",
-        RecommendedActionKind.ReviewTopology => "→ Ação recomendada: revisar a topologia antes de qualquer reparo.",
         _ => "→ Ação recomendada: reparo no modo seguro."
     };
 
@@ -371,6 +389,91 @@ public partial class MainWindow : Window
         RecommendedActionKind.FixConstraints => ("WarnBackBrush", "WarnForeBrush"),
         _ => ("WarnBackBrush", "WarnForeBrush")
     };
+
+    /// <summary>Mostra no painel de diagnóstico as novidades (B5) e os achados de política/saúde (B3/B4).</summary>
+    private void PopulateDiagnosisFindings(DiagnosisResult diag)
+    {
+        NoveltyList.ItemsSource = diag.NewSinceLastRun;
+        NoveltyPanel.Visibility = diag.NewSinceLastRun.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+
+        var findings = new List<PolicyFinding>();
+        findings.AddRange(diag.RootCauseFindings);          // causa-raiz primeiro (mais crítico)
+        if (diag.BackupPolicy is not null) findings.AddRange(diag.BackupPolicy.Findings);
+        findings.AddRange(diag.HealthFindings);
+        FindingsList.ItemsSource = findings;
+        PolicyHeader.Visibility = findings.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    // ------------------------------------------------------------------ Verificações avançadas (CHECKTABLE / reseed)
+
+    private async void CheckTableCombo_DropDownOpened(object sender, EventArgs e)
+    {
+        if (CheckTableCombo.HasItems) return;
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+        try { CheckTableCombo.ItemsSource = await _restoreService.ListUserTablesAsync(db.Name, _connectionString); }
+        catch { /* best-effort */ }
+    }
+
+    private void CheckTableButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+        var table = (CheckTableCombo.SelectedItem as string) ?? CheckTableCombo.Text;
+        if (string.IsNullOrWhiteSpace(table))
+        {
+            ShowError("Informe ou selecione uma tabela (schema.tabela).", new InvalidOperationException("Tabela não informada."));
+            return;
+        }
+        _ = RunCheckTableAsync(db, table.Trim());
+    }
+
+    private async Task RunCheckTableAsync(DatabaseInfo db, string table)
+    {
+        if (_busy) return;
+        SetBusy(true);
+        StatusText.Text = $"Verificando a tabela {table}...";
+        try
+        {
+            var rep = await _repairService.CheckTableAsync(db, table, _connectionString, _progress, _cts!.Token);
+            ResultPanel.Visibility = Visibility.Visible;
+            var ok = rep.Executed && !rep.HasErrors;
+            ResultText.Text = !rep.Executed
+                ? $"Não foi possível verificar {table} (banco/objeto inacessível)."
+                : ok ? $"{table}: sem erros de consistência." : $"{table}: {rep.ErrorCount} erro(s) — veja o registro.";
+            ResultPanel.SetResourceReference(Border.BackgroundProperty, ok ? "OkBackBrush" : "WarnBackBrush");
+            ResultPanel.SetResourceReference(Border.BorderBrushProperty, ok ? "OkForeBrush" : "WarnLineBrush");
+            ResultText.SetResourceReference(TextBlock.ForegroundProperty, ok ? "OkForeBrush" : "WarnForeBrush");
+            StatusText.Text = ResultText.Text;
+        }
+        catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
+        catch (Exception ex) { StatusText.Text = "Falha ao verificar a tabela."; ShowError("Não foi possível verificar a tabela.", ex); }
+        finally { SetBusy(false); }
+    }
+
+    private void ReseedButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+        _ = RunReseedAsync(db);
+    }
+
+    private async Task RunReseedAsync(DatabaseInfo db)
+    {
+        if (_busy) return;
+        SetBusy(true);
+        StatusText.Text = $"Reajustando identidades de \"{db.Name}\"...";
+        try
+        {
+            var n = await _repairService.ReseedIdentitiesAsync(db, _connectionString, _progress, _cts!.Token);
+            ResultPanel.Visibility = Visibility.Visible;
+            ResultText.Text = $"{n} tabela(s) com IDENTITY reajustada(s).";
+            ResultPanel.SetResourceReference(Border.BackgroundProperty, "OkBackBrush");
+            ResultPanel.SetResourceReference(Border.BorderBrushProperty, "OkForeBrush");
+            ResultText.SetResourceReference(TextBlock.ForegroundProperty, "OkForeBrush");
+            StatusText.Text = ResultText.Text;
+        }
+        catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
+        catch (Exception ex) { StatusText.Text = "Falha ao reajustar identidades."; ShowError("Não foi possível reajustar as identidades.", ex); }
+        finally { SetBusy(false); }
+    }
 
     // ------------------------------------------------------------------ Reparo SEM perda: índices
 
@@ -611,12 +714,28 @@ public partial class MainWindow : Window
         finally { SetBusy(false); }
     }
 
+    // ------------------------------------------------------------------ Ponto-no-tempo (STOPAT)
+
+    private void PointInTimeCheck_Changed(object sender, RoutedEventArgs e)
+        => PointInTimeRow.Visibility = PointInTimeCheck.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
+
+    /// <summary>Alvo de ponto-no-tempo (STOPAT) quando o usuário marcou a opção; senão null (mais recente).</summary>
+    private DateTime? GetPointInTimeTarget()
+    {
+        if (PointInTimeCheck.IsChecked != true) return null;
+        if (StopAtDate.SelectedDate is not DateTime d) return null;
+        if (!TimeSpan.TryParse(StopAtTime.Text?.Trim(), out var t)) t = new TimeSpan(23, 59, 59);
+        return d.Date + t;
+    }
+
     private void RestoreChainButton_Click(object sender, RoutedEventArgs e)
     {
         if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
 
+        var target = GetPointInTimeTarget();
+        var alvo = target.HasValue ? $"até {target.Value:yyyy-MM-dd HH:mm:ss}" : "até o ponto mais recente";
         var confirm = MessageBox.Show(
-            $"Restaurar o banco \"{db.Name}\" pela CADEIA COMPLETA até o ponto mais recente?\n\n" +
+            $"Restaurar o banco \"{db.Name}\" pela CADEIA COMPLETA {alvo}?\n\n" +
             "A ferramenta monta automaticamente FULL → diferencial → logs do histórico (msdb), captura o " +
             "tail-log das transações mais recentes e SUBSTITUI o banco atual. A cadeia é validada antes de executar.\n\n" +
             "Deseja continuar?",
@@ -624,10 +743,10 @@ public partial class MainWindow : Window
             MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
 
         if (confirm == MessageBoxResult.Yes)
-            _ = RunRestoreChainAsync(db);
+            _ = RunRestoreChainAsync(db, target);
     }
 
-    private async Task RunRestoreChainAsync(DatabaseInfo db)
+    private async Task RunRestoreChainAsync(DatabaseInfo db, DateTime? target)
     {
         if (_busy) return;
         SetBusy(true);
@@ -636,7 +755,7 @@ public partial class MainWindow : Window
         try
         {
             var result = await _restoreService.RestoreToPointInTimeAsync(
-                db.Name, target: null, tailLogBackup: true, _connectionString, _progress, _cts!.Token);
+                db.Name, target, tailLogBackup: true, _connectionString, _progress, _cts!.Token);
             HandleRepairResult(db, result);
             StatusText.Text = result.Message;
         }
@@ -651,6 +770,442 @@ public partial class MainWindow : Window
             SetBusy(false);
             RefreshStateLabels(db);
         }
+    }
+
+    // ------------------------------------------------------------------ Recuperar para cópia / saúde de backups
+
+    private void RestoreCopyButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+
+        var confirm = MessageBox.Show(
+            $"Criar uma CÓPIA recuperada de \"{db.Name}\" (banco \"{db.Name}_Recuperado\") a partir do backup mais recente?\n\n" +
+            "O banco original NÃO é alterado. A cópia serve para extrair/salvar dados quando o banco vivo está corrompido.\n\n" +
+            "Deseja continuar?",
+            "Confirmar recuperação para cópia",
+            MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.Yes);
+
+        if (confirm == MessageBoxResult.Yes)
+            _ = RunRestoreCopyAsync(db);
+    }
+
+    private async Task RunRestoreCopyAsync(DatabaseInfo db)
+    {
+        if (_busy) return;
+        SetBusy(true);
+        ResultPanel.Visibility = Visibility.Collapsed;
+        StatusText.Text = $"Recuperando \"{db.Name}\" para uma cópia...";
+        try
+        {
+            var result = await _restoreService.RestoreAsCopyAsync(db.Name, copyName: null, _connectionString, _progress, _cts!.Token);
+            // É uma cópia: o estado do banco original não muda. Mostra só o resultado.
+            ResultPanel.Visibility = Visibility.Visible;
+            ResultText.Text = result.Message;
+            var ok = result.Status == RepairStatus.Success;
+            ResultPanel.SetResourceReference(Border.BackgroundProperty, ok ? "OkBackBrush" : "ProblemBackBrush");
+            ResultPanel.SetResourceReference(Border.BorderBrushProperty, ok ? "OkForeBrush" : "ProblemForeBrush");
+            ResultText.SetResourceReference(TextBlock.ForegroundProperty, ok ? "OkForeBrush" : "ProblemForeBrush");
+            StatusText.Text = result.Message;
+            if (ok)
+            {
+                _salvageCopyName = db.Name + "_Recuperado";
+                await LoadDatabasesAsync(); // a cópia aparece na lista (reseleciona e reseta os painéis)
+                // Mostra o assistente de salvamento DEPOIS do reload (que reseta os painéis).
+                SalvageHintText.Text = $"Cópia [{_salvageCopyName}] criada. Selecione uma tabela e traga de volta ao banco vivo \"{db.Name}\" as linhas que faltam (por chave primária, sem duplicar).";
+                await PopulateSalvageTablesAsync(db.Name);
+                RestorePanel.Visibility = Visibility.Visible;
+                SalvagePanel.Visibility = Visibility.Visible;
+            }
+        }
+        catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
+        catch (Exception ex)
+        {
+            StatusText.Text = "Falha ao recuperar para cópia.";
+            ShowError("Não foi possível recuperar para uma cópia.", ex);
+        }
+        finally { SetBusy(false); }
+    }
+
+    private async Task PopulateSalvageTablesAsync(string db)
+    {
+        try
+        {
+            var tables = await _restoreService.ListUserTablesAsync(db, _connectionString, _cts!.Token);
+            SalvageTableCombo.ItemsSource = tables;
+            if (tables.Count > 0) SalvageTableCombo.SelectedIndex = 0;
+        }
+        catch { /* best-effort */ }
+    }
+
+    private void SalvageButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+        if (_salvageCopyName is null) { ShowError("Crie a cópia recuperada primeiro.", new InvalidOperationException("Sem cópia.")); return; }
+        var table = SalvageTableCombo.SelectedItem as string;
+        if (string.IsNullOrWhiteSpace(table)) { ShowError("Selecione uma tabela.", new InvalidOperationException("Tabela não selecionada.")); return; }
+
+        var confirm = MessageBox.Show(
+            $"Copiar as linhas faltantes de '{table}' da cópia [{_salvageCopyName}] para o banco vivo \"{db.Name}\"?\n\n" +
+            "Apenas linhas que ainda não existem (por chave primária) são inseridas — nada é duplicado.",
+            "Confirmar salvamento de dados", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.Yes);
+
+        if (confirm == MessageBoxResult.Yes)
+            _ = RunSalvageAsync(db, table!);
+    }
+
+    private async Task RunSalvageAsync(DatabaseInfo db, string table)
+    {
+        if (_busy) return;
+        SetBusy(true);
+        StatusText.Text = $"Salvando dados de {table}...";
+        try
+        {
+            var result = await _restoreService.SalvageTableAsync(_salvageCopyName!, db.Name, table, _connectionString, _progress, _cts!.Token);
+            ResultPanel.Visibility = Visibility.Visible;
+            ResultText.Text = result.Message;
+            var ok = result.Status == RepairStatus.Success;
+            ResultPanel.SetResourceReference(Border.BackgroundProperty, ok ? "OkBackBrush" : "ProblemBackBrush");
+            ResultPanel.SetResourceReference(Border.BorderBrushProperty, ok ? "OkForeBrush" : "ProblemForeBrush");
+            ResultText.SetResourceReference(TextBlock.ForegroundProperty, ok ? "OkForeBrush" : "ProblemForeBrush");
+            StatusText.Text = result.Message;
+        }
+        catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
+        catch (Exception ex) { StatusText.Text = "Falha ao salvar a tabela."; ShowError("Não foi possível salvar a tabela.", ex); }
+        finally { SetBusy(false); }
+    }
+
+    // ------------------------------------------------------------------ Restauração de página
+
+    private void RestorePagesButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+        var pages = PagesBox.Text?.Trim() ?? string.Empty;
+        if (pages.Length == 0)
+        {
+            ShowError("Informe as páginas no formato fileId:pageId (ex.: 1:57,1:58).", new InvalidOperationException("Páginas não informadas."));
+            return;
+        }
+
+        var confirm = MessageBox.Show(
+            $"Restaurar apenas as páginas [{pages}] de \"{db.Name}\"?\n\n" +
+            "O restante do banco é preservado. Exige modelo FULL/BULK e a cadeia de backups (full + logs).\n\nDeseja continuar?",
+            "Confirmar restauração de página", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+
+        if (confirm == MessageBoxResult.Yes)
+            _ = RunRestorePagesAsync(db, pages);
+    }
+
+    private async Task RunRestorePagesAsync(DatabaseInfo db, string pages)
+    {
+        if (_busy) return;
+        SetBusy(true);
+        ResultPanel.Visibility = Visibility.Collapsed;
+        StatusText.Text = $"Restaurando páginas de \"{db.Name}\"...";
+        try
+        {
+            var result = await _restoreService.RestorePagesFromHistoryAsync(db.Name, pages, _connectionString, _progress, _cts!.Token);
+            HandleRepairResult(db, result);
+            StatusText.Text = result.Message;
+        }
+        catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
+        catch (Exception ex) { StatusText.Text = "Falha na restauração de página."; ShowError("Não foi possível restaurar as páginas.", ex); }
+        finally { SetBusy(false); RefreshStateLabels(db); }
+    }
+
+    private void VerifyBackupsButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+        _ = RunVerifyBackupsAsync(db);
+    }
+
+    private async Task RunVerifyBackupsAsync(DatabaseInfo db)
+    {
+        if (_busy) return;
+        SetBusy(true);
+        ResultPanel.Visibility = Visibility.Collapsed;
+        StatusText.Text = $"Verificando a saúde dos backups de \"{db.Name}\"...";
+        try
+        {
+            var items = await _restoreService.VerifyBackupHealthAsync(db.Name, _connectionString, _progress, _cts!.Token);
+            var ok = items.Count(i => i.Verified);
+            ResultPanel.Visibility = Visibility.Visible;
+            ResultText.Text = items.Count == 0
+                ? "Sem histórico de backups para verificar."
+                : $"Saúde dos backups: {ok}/{items.Count} verificado(s) com sucesso (detalhes no registro abaixo).";
+            var allOk = items.Count > 0 && ok == items.Count;
+            ResultPanel.SetResourceReference(Border.BackgroundProperty, allOk ? "OkBackBrush" : "WarnBackBrush");
+            ResultPanel.SetResourceReference(Border.BorderBrushProperty, allOk ? "OkForeBrush" : "WarnLineBrush");
+            ResultText.SetResourceReference(TextBlock.ForegroundProperty, allOk ? "OkForeBrush" : "WarnForeBrush");
+            StatusText.Text = ResultText.Text;
+        }
+        catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
+        catch (Exception ex)
+        {
+            StatusText.Text = "Falha ao verificar os backups.";
+            ShowError("Não foi possível verificar a saúde dos backups.", ex);
+        }
+        finally { SetBusy(false); }
+    }
+
+    // ------------------------------------------------------------------ STANDBY / finalizar recuperação
+
+    private void RestoreStandbyButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+
+        var confirm = MessageBox.Show(
+            $"Restaurar \"{db.Name}\" em modo STANDBY (somente leitura)?\n\n" +
+            "O banco fica CONSULTÁVEL entre os logs, para você inspecionar os dados e achar o ponto certo. " +
+            "O banco atual é SUBSTITUÍDO. Finalize depois com 'Finalizar recuperação'.\n\nDeseja continuar?",
+            "Confirmar restauração em STANDBY",
+            MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+
+        if (confirm == MessageBoxResult.Yes)
+            _ = RunStandbyAsync(db);
+    }
+
+    private async Task RunStandbyAsync(DatabaseInfo db)
+    {
+        if (_busy) return;
+        SetBusy(true);
+        ResultPanel.Visibility = Visibility.Collapsed;
+        StatusText.Text = $"Restaurando \"{db.Name}\" em STANDBY...";
+        try
+        {
+            var result = await _restoreService.RestoreToStandbyAsync(db.Name, GetPointInTimeTarget(), _connectionString, _progress, _cts!.Token);
+            HandleRepairResult(db, result);
+            StatusText.Text = result.Message;
+        }
+        catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
+        catch (Exception ex)
+        {
+            StatusText.Text = "Falha na restauração STANDBY.";
+            ShowError("Não foi possível restaurar em STANDBY.", ex);
+        }
+        finally { SetBusy(false); RefreshStateLabels(db); }
+    }
+
+    private void FinalizeRecoveryButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+        _ = RunFinalizeRecoveryAsync(db);
+    }
+
+    private async Task RunFinalizeRecoveryAsync(DatabaseInfo db)
+    {
+        if (_busy) return;
+        SetBusy(true);
+        ResultPanel.Visibility = Visibility.Collapsed;
+        StatusText.Text = $"Finalizando a recuperação de \"{db.Name}\"...";
+        try
+        {
+            var result = await _restoreService.FinalizeRecoveryAsync(db.Name, _connectionString, _progress, _cts!.Token);
+            HandleRepairResult(db, result);
+            StatusText.Text = result.Message;
+        }
+        catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
+        catch (Exception ex)
+        {
+            StatusText.Text = "Falha ao finalizar a recuperação.";
+            ShowError("Não foi possível finalizar a recuperação.", ex);
+        }
+        finally { SetBusy(false); RefreshStateLabels(db); }
+    }
+
+    // ------------------------------------------------------------------ Simular reparo (pré-visualizar perda)
+
+    private void SimulateRepairButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+        _ = RunSimulateRepairAsync(db);
+    }
+
+    private async Task RunSimulateRepairAsync(DatabaseInfo db)
+    {
+        if (_busy) return;
+        SetBusy(true);
+        SimulateResultText.Visibility = Visibility.Collapsed;
+        StatusText.Text = $"Simulando o reparo de \"{db.Name}\" numa cópia...";
+        try
+        {
+            var sim = await _repairService.SimulateRepairAsync(db, _connectionString, _progress, _cts!.Token);
+            SimulateResultText.Visibility = Visibility.Visible;
+            SimulateResultText.Text = sim.Executed
+                ? sim.Message + (sim.AffectedTables.Count > 0
+                    ? "\nTabelas afetadas: " + string.Join("; ", sim.AffectedTables.Take(6).Select(t => t.Display))
+                    : string.Empty)
+                : sim.Message;
+            StatusText.Text = sim.Message;
+        }
+        catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
+        catch (Exception ex) { StatusText.Text = "Falha na simulação."; ShowError("Não foi possível simular o reparo.", ex); }
+        finally { SetBusy(false); }
+    }
+
+    // ------------------------------------------------------------------ Runbook de banco de sistema
+
+    private void RunbookButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+        ShowTextDialog($"Procedimento manual — {db.Name}", RepairService.BuildSystemDbRunbook(db.Name));
+    }
+
+    // ------------------------------------------------------------------ Manutenção preventiva
+
+    private void MaintainButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+        var confirm = MessageBox.Show(
+            $"Otimizar índices e atualizar estatísticas de \"{db.Name}\"?\n\n" +
+            "Operação NÃO destrutiva (REORGANIZE/REBUILD de índices fragmentados + sp_updatestats). " +
+            "Pode levar tempo em bancos grandes.\n\nContinuar?",
+            "Confirmar manutenção", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.Yes);
+        if (confirm == MessageBoxResult.Yes) _ = RunMaintenanceAsync(db);
+    }
+
+    private async Task RunMaintenanceAsync(DatabaseInfo db)
+    {
+        if (_busy) return;
+        SetBusy(true);
+        ResultPanel.Visibility = Visibility.Collapsed;
+        StatusText.Text = $"Executando manutenção de \"{db.Name}\"...";
+        try
+        {
+            var r = await _maintenanceService.RunMaintenanceAsync(db, _connectionString, _progress, _cts!.Token);
+            HandleRepairResult(db, r);
+            StatusText.Text = r.Message;
+        }
+        catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
+        catch (Exception ex) { StatusText.Text = "Falha na manutenção."; ShowError("Não foi possível executar a manutenção.", ex); }
+        finally { SetBusy(false); }
+    }
+
+    // ------------------------------------------------------------------ Verificação agendada (gerar comando)
+
+    private void ScheduleButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+        var cmd =
+            "Para uma verificação diária automática, registre uma tarefa no Agendador do Windows usando o utilitário\n" +
+            "RestoreDB.Probe (comando 'monitor'). Ele faz um diagnóstico somente-leitura e grava um alerta quando\n" +
+            "aparece algo NOVO (código de saída 2). Exemplo (ajuste o caminho do .exe):\n\n" +
+            $"schtasks /Create /SC DAILY /ST 02:00 /TN \"RestoreDB_Monitor_{db.Name}\" ^\n" +
+            $"  /TR \"cmd /c set PROBE_SERVER={_serverName}&& \\\"C:\\Caminho\\RestoreDB.Probe.exe\\\" monitor {db.Name}\"\n\n" +
+            "Alertas são gravados em %LOCALAPPDATA%\\RestoreDB\\Alerts. Use a ação 'Enviar e-mail' do Agendador\n" +
+            "condicionada ao código de saída para notificar o suporte.";
+        ShowTextDialog($"Verificação agendada — {db.Name}", cmd);
+    }
+
+    // ------------------------------------------------------------------ Forense de exclusão acidental
+
+    private void ForensicButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+        _ = RunForensicSearchAsync(db);
+    }
+
+    private async Task RunForensicSearchAsync(DatabaseInfo db)
+    {
+        if (_busy) return;
+        SetBusy(true);
+        StatusText.Text = $"Procurando exclusões recentes no log de \"{db.Name}\"...";
+        try
+        {
+            _forensicTx = await _restoreService.ListRecentDestructiveTransactionsAsync(db.Name, _connectionString, _cts!.Token);
+            ForensicList.ItemsSource = _forensicTx;
+            ForensicList.Visibility = Visibility.Visible;
+            ForensicRestoreButton.Visibility = _forensicTx.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+            StatusText.Text = _forensicTx.Count > 0
+                ? $"{_forensicTx.Count} transação(ões) destrutiva(s) recente(s) no log ativo."
+                : "Nenhuma exclusão recente encontrada no log ativo (pode já ter sido truncado).";
+        }
+        catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
+        catch (Exception ex) { StatusText.Text = "Falha na busca forense."; ShowError("Não foi possível ler o log de transações.", ex); }
+        finally { SetBusy(false); }
+    }
+
+    private void ForensicRestoreButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+        if (ForensicList.SelectedItem is not ForensicTransaction tx) { ShowError("Selecione uma transação na lista.", new InvalidOperationException("Nenhuma transação selecionada.")); return; }
+        if (tx.BeginTime is not DateTime begin) { ShowError("Não foi possível determinar o instante da transação.", new InvalidOperationException("Sem horário.")); return; }
+
+        var target = begin.AddSeconds(-1);
+        var confirm = MessageBox.Show(
+            $"Restaurar \"{db.Name}\" até {target:yyyy-MM-dd HH:mm:ss} (logo ANTES da {tx.Kind} de {begin:HH:mm:ss})?\n\n" +
+            "O banco será SUBSTITUÍDO pela cadeia de backups até esse instante. Exige modelo FULL e a cadeia disponível.\n\nContinuar?",
+            "Confirmar recuperação ponto-no-tempo", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+        if (confirm == MessageBoxResult.Yes)
+            _ = RunRestoreChainAsync(db, target);
+    }
+
+    // ------------------------------------------------------------------ Anexar banco a partir de .mdf
+
+    private async void AttachButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_busy) return;
+        var dlg = new OpenFileDialog
+        {
+            Title = "Escolher o arquivo de dados (.mdf)",
+            Filter = "Arquivo de dados SQL (*.mdf)|*.mdf|Todos os arquivos (*.*)|*.*"
+        };
+        if (dlg.ShowDialog(this) != true) return;
+
+        var mdf = dlg.FileName;
+        var name = Path.GetFileNameWithoutExtension(mdf);
+        var dir = Path.GetDirectoryName(mdf) ?? string.Empty;
+        var ldfGuess = Path.Combine(dir, name + "_log.ldf");
+        string? ldf = File.Exists(ldfGuess) ? ldfGuess : null;
+        var rebuild = ldf is null;
+
+        var confirm = MessageBox.Show(
+            $"Anexar como banco \"{name}\"?\n\nDados: {mdf}\nLog: {(ldf ?? "(não encontrado — será recriado)")}\n\nContinuar?",
+            "Confirmar anexação", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.Yes);
+        if (confirm == MessageBoxResult.Yes)
+            await RunAttachAsync(name, mdf, ldf, rebuild);
+    }
+
+    private async Task RunAttachAsync(string name, string mdf, string? ldf, bool rebuild)
+    {
+        if (_busy) return;
+        SetBusy(true);
+        ResultPanel.Visibility = Visibility.Collapsed;
+        StatusText.Text = $"Anexando \"{name}\"...";
+        try
+        {
+            var r = await _restoreService.AttachDatabaseAsync(name, mdf, ldf, rebuild, _connectionString, _progress, _cts!.Token);
+            ResultPanel.Visibility = Visibility.Visible;
+            ResultText.Text = r.Message;
+            var ok = r.Status == RepairStatus.Success;
+            ResultPanel.SetResourceReference(Border.BackgroundProperty, ok ? "OkBackBrush" : "ProblemBackBrush");
+            ResultPanel.SetResourceReference(Border.BorderBrushProperty, ok ? "OkForeBrush" : "ProblemForeBrush");
+            ResultText.SetResourceReference(TextBlock.ForegroundProperty, ok ? "OkForeBrush" : "ProblemForeBrush");
+            StatusText.Text = r.Message;
+            if (ok) await LoadDatabasesAsync();
+        }
+        catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
+        catch (Exception ex) { StatusText.Text = "Falha ao anexar."; ShowError("Não foi possível anexar o banco.", ex); }
+        finally { SetBusy(false); }
+    }
+
+    /// <summary>Mostra um texto longo (runbook, comando, etc.) numa janela de leitura.</summary>
+    private void ShowTextDialog(string title, string text)
+    {
+        var window = new Window
+        {
+            Title = title, Width = 760, Height = 460, Owner = this,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Background = (Brush)Application.Current.FindResource("WindowBackBrush"),
+            Content = new TextBox
+            {
+                Text = text, IsReadOnly = true, FontFamily = new FontFamily("Consolas"), FontSize = 12,
+                AcceptsReturn = true, TextWrapping = TextWrapping.Wrap,
+                Background = (Brush)Application.Current.FindResource("CardBrush"),
+                Foreground = (Brush)Application.Current.FindResource("TextBrush"),
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Margin = new Thickness(8)
+            }
+        };
+        window.ShowDialog();
     }
 
     // ------------------------------------------------------------------ Ver script (dry-run)
@@ -935,6 +1490,21 @@ public partial class MainWindow : Window
         RestoreButton.IsEnabled = !busy;
         TestRestoreButton.IsEnabled = !busy;
         RestoreChainButton.IsEnabled = !busy;
+        RestoreCopyButton.IsEnabled = !busy;
+        VerifyBackupsButton.IsEnabled = !busy;
+        RestoreStandbyButton.IsEnabled = !busy;
+        FinalizeRecoveryButton.IsEnabled = !busy;
+        RestorePagesButton.IsEnabled = !busy;
+        SalvageButton.IsEnabled = !busy;
+        CheckTableButton.IsEnabled = !busy;
+        ReseedButton.IsEnabled = !busy;
+        SimulateRepairButton.IsEnabled = !busy;
+        RunbookButton.IsEnabled = !busy;
+        MaintainButton.IsEnabled = !busy;
+        ScheduleButton.IsEnabled = !busy;
+        ForensicButton.IsEnabled = !busy;
+        ForensicRestoreButton.IsEnabled = !busy;
+        AttachButton.IsEnabled = !busy;
         ViewScriptButton.IsEnabled = !busy;
 
         RepairBusyBar.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;

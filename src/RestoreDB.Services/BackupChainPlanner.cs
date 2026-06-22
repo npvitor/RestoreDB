@@ -115,6 +115,16 @@ public static class BackupChainPlanner
         => dependent.DatabaseBackupLsn == 0 || baseFull.CheckpointLsn == 0
            || dependent.DatabaseBackupLsn == baseFull.CheckpointLsn;
 
-    private static RestorePiece ToPiece(BackupSetInfo b, bool isLog) =>
-        new() { DiskPath = b.PhysicalDevice, Position = b.Position <= 0 ? 1 : b.Position, IsLog = isLog };
+    /// <summary>Converte um conjunto de backup em peça de restauração (preserva striped via AllDevices).</summary>
+    public static RestorePiece ToPiece(BackupSetInfo b, bool isLog)
+    {
+        var devices = b.AllDevices;
+        return new RestorePiece
+        {
+            DiskPath = devices.Count > 0 ? devices[0] : b.PhysicalDevice,
+            AdditionalDevices = devices.Skip(1).ToList(),
+            Position = b.Position <= 0 ? 1 : b.Position,
+            IsLog = isLog
+        };
+    }
 }

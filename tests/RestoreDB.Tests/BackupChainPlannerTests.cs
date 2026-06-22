@@ -109,6 +109,23 @@ public class BackupChainPlannerTests
     }
 
     [Fact]
+    public void Plan_StripedFull_CarriesAllDevicesIntoPiece()
+    {
+        var full = Full(1, first: 100, last: 200, checkpoint: 150);
+        full.Devices.Add(@"C:\bk\DB_1.bak");
+        full.Devices.Add(@"C:\bk\DB_2.bak");
+        full.Devices.Add(@"C:\bk\DB_3.bak");
+
+        var plan = BackupChainPlanner.Plan("DB", new List<BackupSetInfo> { full }, target: null);
+
+        Assert.Single(plan.Pieces);
+        var piece = plan.Pieces[0];
+        Assert.Equal(3, piece.AllDevices.Count);
+        Assert.Equal(@"C:\bk\DB_1.bak", piece.DiskPath);
+        Assert.Equal(2, piece.AdditionalDevices.Count);
+    }
+
+    [Fact]
     public void Plan_PointInTime_StopsAtTargetLog()
     {
         var history = new List<BackupSetInfo>

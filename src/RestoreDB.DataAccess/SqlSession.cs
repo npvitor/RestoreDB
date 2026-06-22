@@ -76,6 +76,29 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         return result;
     }
 
+    /// <summary>
+    /// Descarta um banco descartável (cópia de teste/simulação): força SINGLE_USER e DROP DATABASE.
+    /// Best-effort — usado nas limpezas em finally; nunca lança. Devolve true se o banco não existe mais.
+    /// </summary>
+    public async Task<bool> DropDatabaseBestEffortAsync(string databaseName, CancellationToken ct = default)
+    {
+        const string sql =
+            "IF DB_ID(@db) IS NOT NULL\n" +
+            "BEGIN\n" +
+            "  DECLARE @cmd nvarchar(max);\n" +
+            "  BEGIN TRY SET @cmd = N'ALTER DATABASE ' + QUOTENAME(@db) + N' SET SINGLE_USER WITH ROLLBACK IMMEDIATE;'; EXEC sys.sp_executesql @cmd; END TRY BEGIN CATCH END CATCH\n" +
+            "  SET @cmd = N'DROP DATABASE ' + QUOTENAME(@db) + N';'; EXEC sys.sp_executesql @cmd;\n" +
+            "END";
+        try
+        {
+            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            await cmd.ExecuteNonQueryAsync(ct);
+            return (await GetDatabaseStateAsync(databaseName, ct)) == "DESCONHECIDO";
+        }
+        catch { return false; }
+    }
+
     /// <summary>Lê o state_desc atual de um banco em sys.databases.</summary>
     public async Task<string> GetDatabaseStateAsync(string databaseName, CancellationToken ct = default)
     {
@@ -135,6 +158,50 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
             return string.IsNullOrEmpty(path) ? string.Empty : (System.IO.Path.GetDirectoryName(path) ?? string.Empty);
         }
         catch { return string.Empty; }
+    }
+
+    /// <summary>
+    /// Progresso de uma operação demorada em andamento no banco (recuperação/RESTORE/ROLLBACK), de
+    /// sys.dm_exec_requests. Devolve null quando não há nada em andamento. Best-effort.
+    /// </summary>
+    public async Task<RecoveryProgress?> GetRecoveryProgressAsync(string databaseName, CancellationToken ct = default)
+    {
+        try
+        {
+            const string sql =
+                "SELECT TOP (1) r.command, r.percent_complete, CAST(r.estimated_completion_time AS bigint) " +
+                "FROM sys.dm_exec_requests r " +
+                "WHERE r.database_id = DB_ID(@db) AND r.percent_complete > 0 " +
+                "ORDER BY r.percent_complete DESC;";
+            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            if (await r.ReadAsync(ct))
+            {
+                return new RecoveryProgress
+                {
+                    Command = r.IsDBNull(0) ? string.Empty : r.GetString(0),
+                    PercentComplete = r.IsDBNull(1) ? 0 : Convert.ToDouble(r.GetValue(1)),
+                    EstimatedRemainingMs = r.IsDBNull(2) ? 0 : Convert.ToInt64(r.GetValue(2))
+                };
+            }
+        }
+        catch { /* best-effort */ }
+        return null;
+    }
+
+    /// <summary>true se o banco está criptografado (TDE) — relevante para restaurar (exige o certificado).</summary>
+    public async Task<bool> IsEncryptedAsync(string databaseName, CancellationToken ct = default)
+    {
+        try
+        {
+            await using var cmd = new SqlCommand("SELECT is_encrypted FROM sys.databases WHERE name = @db;", _connection)
+            { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            var v = await cmd.ExecuteScalarAsync(ct);
+            return v is not null && v != DBNull.Value && Convert.ToInt32(v) == 1;
+        }
+        catch { return false; }
     }
 
     /// <summary>Lê a opção PAGE_VERIFY do banco (NONE / TORN_PAGE_DETECTION / CHECKSUM). Best-effort.</summary>
@@ -257,13 +324,20 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
     /// banco precisa estar ONLINE + SINGLE_USER. Sem opção, é somente leitura (diagnóstico).
     /// Lê colunas por nome (tolerante às variações entre versões do SQL Server).
     /// </summary>
-    public async Task<CheckDbReport> CheckDbWithResultsAsync(string databaseName, string? repairOption, CancellationToken ct = default)
+    public async Task<CheckDbReport> CheckDbWithResultsAsync(string databaseName, string? repairOption, CancellationToken ct = default,
+        bool physicalOnly = false, bool dataPurity = false)
     {
         var report = new CheckDbReport();
         var repairPart = repairOption is null ? string.Empty : ", " + repairOption;
+
+        // PHYSICAL_ONLY (varredura rápida) e DATA_PURITY só fazem sentido no diagnóstico (sem reparo).
+        var withOpts = "TABLERESULTS, ALL_ERRORMSGS, NO_INFOMSGS";
+        if (repairOption is null && physicalOnly) withOpts += ", PHYSICAL_ONLY";
+        else if (repairOption is null && dataPurity) withOpts += ", DATA_PURITY";
+
         var sql =
             "DECLARE @cmd nvarchar(max);\n" +
-            "SET @cmd = N'DBCC CHECKDB (' + QUOTENAME(@db) + N'" + repairPart + ") WITH TABLERESULTS, ALL_ERRORMSGS, NO_INFOMSGS;';\n" +
+            "SET @cmd = N'DBCC CHECKDB (' + QUOTENAME(@db) + N'" + repairPart + ") WITH " + withOpts + ";';\n" +
             "EXEC sys.sp_executesql @cmd;";
 
         try
@@ -307,7 +381,433 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Executa DBCC CHECKCONSTRAINTS WITH ALL_CONSTRAINTS, ALL_ERRORMSGS, TABLERESULTS no contexto
+    /// DBCC CHECKTABLE de UM objeto (verificação dirigida, mais rápida que o CHECKDB completo),
+    /// no contexto do banco alvo, com TABLERESULTS. <paramref name="schemaTable"/> ex.: "dbo.NotaFiscal".
+    /// </summary>
+    public async Task<CheckDbReport> CheckTableAsync(string databaseName, string schemaTable, CancellationToken ct = default)
+    {
+        var report = new CheckDbReport();
+        try
+        {
+            // O nome do objeto é validado/aspeado pelo chamador; ainda assim escapamos o literal.
+            var inner = $"DBCC CHECKTABLE ('{schemaTable.Replace("'", "''")}') WITH TABLERESULTS, ALL_ERRORMSGS, NO_INFOMSGS;";
+            const string sql =
+                "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
+                "EXEC @proc @stmt;";
+            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            cmd.Parameters.AddWithValue("@stmt", inner);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+            var oErr = Ordinal(reader, "Error");
+            var oLvl = Ordinal(reader, "Level");
+            var oState = Ordinal(reader, "State");
+            var oMsg = Ordinal(reader, "MessageText");
+            var oRepair = Ordinal(reader, "RepairLevel");
+            var oObj = Ordinal(reader, "ObjectId", "Id");
+            var oIdx = Ordinal(reader, "IndexId", "IndId");
+
+            report.Executed = true;
+            while (await reader.ReadAsync(ct))
+            {
+                report.Details.Add(new CorruptionDetail
+                {
+                    Error = GetInt(reader, oErr),
+                    Level = GetInt(reader, oLvl),
+                    State = GetInt(reader, oState),
+                    MessageText = GetStr(reader, oMsg),
+                    RepairLevel = GetStr(reader, oRepair),
+                    ObjectId = GetInt(reader, oObj),
+                    IndexId = GetInt(reader, oIdx)
+                });
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* banco/objeto inacessível */ }
+        return report;
+    }
+
+    /// <summary>
+    /// Lista as transações DESTRUTIVAS recentes (DELETE em massa / DROP / TRUNCATE) do log de
+    /// transações via fn_dblog — para investigar exclusões acidentais. Somente leitura; enxerga só a
+    /// parte ATIVA do log. Best-effort (função não documentada, porém disponível no 2008 R2).
+    /// </summary>
+    public async Task<List<ForensicTransaction>> GetRecentDestructiveTransactionsAsync(string databaseName, int max = 50, CancellationToken ct = default)
+    {
+        var list = new List<ForensicTransaction>();
+        try
+        {
+            const string sql =
+                "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
+                "DECLARE @stmt nvarchar(max) = N'" +
+                "SELECT TOP (@m) [Transaction ID], MAX([Transaction Name]), MIN([Begin Time]), " +
+                "SUM(CASE WHEN Operation = ''LOP_DELETE_ROWS'' THEN 1 ELSE 0 END) " +
+                "FROM fn_dblog(NULL, NULL) " +
+                "GROUP BY [Transaction ID] " +
+                "HAVING SUM(CASE WHEN Operation = ''LOP_DELETE_ROWS'' THEN 1 ELSE 0 END) > 0 " +
+                "   OR MAX([Transaction Name]) IN (''DROPOBJ'', ''TRUNCATE'') " +
+                "ORDER BY MIN([Begin Time]) DESC;';\n" +
+                "EXEC @proc @stmt, N'@m int', @m = @max;";
+            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            cmd.Parameters.AddWithValue("@max", max);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+            {
+                var txName = r.IsDBNull(1) ? string.Empty : r.GetString(1);
+                var beginRaw = r.IsDBNull(2) ? string.Empty : Convert.ToString(r.GetValue(2)) ?? string.Empty;
+                var deletes = r.IsDBNull(3) ? 0 : Convert.ToInt32(r.GetValue(3));
+                var kind = txName.Equals("DROPOBJ", StringComparison.OrdinalIgnoreCase) ? "DROP"
+                         : txName.Equals("TRUNCATE", StringComparison.OrdinalIgnoreCase) ? "TRUNCATE"
+                         : "DELETE";
+                DateTime? begin = DateTime.TryParse(beginRaw.Replace('/', '-'), out var dt) ? dt : null;
+                list.Add(new ForensicTransaction
+                {
+                    TransactionId = r.IsDBNull(0) ? string.Empty : Convert.ToString(r.GetValue(0)) ?? string.Empty,
+                    Kind = kind,
+                    BeginTimeRaw = beginRaw,
+                    BeginTime = begin,
+                    RowsAffected = deletes
+                });
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* fn_dblog indisponível / sem permissão */ }
+        return list;
+    }
+
+    /// <summary>Lista os índices DESABILITADOS do banco (tabela.índice). Best-effort.</summary>
+    public async Task<List<string>> GetDisabledIndexesAsync(string databaseName, CancellationToken ct = default)
+    {
+        var list = new List<string>();
+        try
+        {
+            const string sql =
+                "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
+                "DECLARE @stmt nvarchar(max) = N'SELECT OBJECT_NAME(i.object_id) + N''.'' + i.name " +
+                "FROM sys.indexes i JOIN sys.tables t ON t.object_id = i.object_id " +
+                "WHERE i.is_disabled = 1 AND t.is_ms_shipped = 0;';\n" +
+                "EXEC @proc @stmt;";
+            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+                if (!r.IsDBNull(0)) list.Add(r.GetString(0));
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* best-effort */ }
+        return list;
+    }
+
+    /// <summary>
+    /// Lista referências QUEBRADAS de objetos (views/procedures que referenciam um objeto que não
+    /// existe mais), via sys.sql_expression_dependencies. Best-effort (2008+).
+    /// </summary>
+    public async Task<List<string>> GetBrokenDependenciesAsync(string databaseName, CancellationToken ct = default)
+    {
+        var list = new List<string>();
+        try
+        {
+            const string sql =
+                "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
+                "DECLARE @stmt nvarchar(max) = N'SELECT DISTINCT OBJECT_NAME(d.referencing_id) + N'' → '' + " +
+                "ISNULL(d.referenced_schema_name + N''.'', N'''') + d.referenced_entity_name " +
+                "FROM sys.sql_expression_dependencies d " +
+                "WHERE d.referenced_id IS NULL AND d.referenced_entity_name IS NOT NULL " +
+                "AND d.is_ambiguous = 0 AND OBJECT_NAME(d.referencing_id) IS NOT NULL " +
+                "AND OBJECT_ID(ISNULL(d.referenced_schema_name + N''.'', N'''') + d.referenced_entity_name) IS NULL;';\n" +
+                "EXEC @proc @stmt;";
+            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+                if (!r.IsDBNull(0)) list.Add(r.GetString(0));
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* DMV ausente / sem permissão */ }
+        return list;
+    }
+
+    /// <summary>
+    /// Fragmentação dos índices do banco (sys.dm_db_index_physical_stats, modo LIMITED) com pelo menos
+    /// <paramref name="minPages"/> páginas. Nomes já vêm com QUOTENAME. Best-effort.
+    /// </summary>
+    public async Task<List<IndexFragmentation>> GetFragmentationAsync(string databaseName, int minPages = 100, CancellationToken ct = default)
+    {
+        var list = new List<IndexFragmentation>();
+        try
+        {
+            const string sql =
+                "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
+                "DECLARE @stmt nvarchar(max) = N'" +
+                "SELECT QUOTENAME(s.name) + N''.'' + QUOTENAME(o.name), i.name, ips.avg_fragmentation_in_percent, ips.page_count " +
+                "FROM sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, ''LIMITED'') ips " +
+                "JOIN sys.indexes i ON i.object_id = ips.object_id AND i.index_id = ips.index_id " +
+                "JOIN sys.objects o ON o.object_id = ips.object_id " +
+                "JOIN sys.schemas s ON s.schema_id = o.schema_id " +
+                "WHERE ips.index_id > 0 AND ips.page_count >= @min AND i.name IS NOT NULL AND o.is_ms_shipped = 0 " +
+                "ORDER BY ips.avg_fragmentation_in_percent DESC;';\n" +
+                "EXEC @proc @stmt, N'@min int', @min = @minp;";
+            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            cmd.Parameters.AddWithValue("@minp", minPages);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+            {
+                list.Add(new IndexFragmentation
+                {
+                    Table = r.IsDBNull(0) ? string.Empty : r.GetString(0),
+                    Index = r.IsDBNull(1) ? string.Empty : r.GetString(1),
+                    FragmentationPercent = r.IsDBNull(2) ? 0 : Convert.ToDouble(r.GetValue(2)),
+                    PageCount = r.IsDBNull(3) ? 0 : Convert.ToInt64(r.GetValue(3))
+                });
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* DMF indisponível / sem permissão */ }
+        return list;
+    }
+
+    /// <summary>true quando a edição da instância suporta CRIAR backups com compressão (não-Express).</summary>
+    public async Task<bool> SupportsBackupCompressionAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            // EngineEdition: 2 = Standard, 3 = Enterprise/Developer (suportam). 4 = Express (não).
+            await using var cmd = new SqlCommand("SELECT CAST(SERVERPROPERTY('EngineEdition') AS int);", _connection)
+            { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            var v = await cmd.ExecuteScalarAsync(ct);
+            var edition = v is null || v == DBNull.Value ? 0 : Convert.ToInt32(v);
+            return edition == 2 || edition == 3;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// Contagem de linhas por tabela (schema.tabela → linhas) a partir de sys.dm_db_partition_stats —
+    /// usa METADADOS (não lê páginas), então funciona mesmo num banco corrompido. Usado pela
+    /// simulação de reparo para medir a perda (antes × depois). Best-effort.
+    /// </summary>
+    public async Task<Dictionary<string, long>> GetTableRowCountsAsync(string databaseName, CancellationToken ct = default)
+    {
+        var map = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            const string sql =
+                "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
+                "DECLARE @stmt nvarchar(max) = N'SELECT s.name + N''.'' + t.name, SUM(ps.row_count) " +
+                "FROM sys.dm_db_partition_stats ps " +
+                "JOIN sys.tables t ON t.object_id = ps.object_id " +
+                "JOIN sys.schemas s ON s.schema_id = t.schema_id " +
+                "WHERE ps.index_id IN (0,1) AND t.is_ms_shipped = 0 GROUP BY s.name, t.name;';\n" +
+                "EXEC @proc @stmt;";
+            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+                if (!r.IsDBNull(0)) map[r.GetString(0)] = r.IsDBNull(1) ? 0 : Convert.ToInt64(r.GetValue(1));
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* best-effort */ }
+        return map;
+    }
+
+    /// <summary>Lista as tabelas de usuário (schema.tabela) do banco alvo. Best-effort.</summary>
+    public async Task<List<string>> ListUserTablesAsync(string databaseName, CancellationToken ct = default)
+    {
+        var list = new List<string>();
+        try
+        {
+            const string sql =
+                "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
+                "DECLARE @stmt nvarchar(max) = N'SELECT s.name + N''.'' + t.name FROM sys.tables t " +
+                "JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE t.is_ms_shipped = 0 ORDER BY s.name, t.name;';\n" +
+                "EXEC @proc @stmt;";
+            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+                if (!r.IsDBNull(0)) list.Add(r.GetString(0));
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* best-effort */ }
+        return list;
+    }
+
+    /// <summary>
+    /// SALVAMENTO de dados: copia da tabela de <paramref name="fromDb"/> para a mesma tabela em
+    /// <paramref name="toDb"/> APENAS as linhas que ainda não existem (por chave primária). Preserva
+    /// IDENTITY (SET IDENTITY_INSERT) e não duplica registros. Exige PK. Devolve as linhas inseridas.
+    /// Roda no contexto de <paramref name="toDb"/>, referenciando a origem por nome de 3 partes.
+    /// </summary>
+    public async Task<int> SalvageTableAsync(string fromDb, string toDb, string schemaTable, CancellationToken ct = default)
+    {
+        var (schema, table) = SplitSchemaTable(schemaTable);
+        var qTarget = $"{Quote(schema)}.{Quote(table)}";                          // no contexto de toDb
+        var qSource = $"{Quote(fromDb)}.{Quote(schema)}.{Quote(table)}";          // 3 partes
+        var objRef = $"{schema}.{table}";
+
+        // Colunas não-computadas (na ordem) + se há IDENTITY.
+        var cols = new List<string>();
+        var hasIdentity = false;
+        {
+            var sql =
+                $"SELECT c.name, c.is_identity FROM {Quote(toDb)}.sys.columns c " +
+                $"WHERE c.object_id = OBJECT_ID(@o) AND c.is_computed = 0 ORDER BY c.column_id;";
+            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@o", $"{toDb}.{objRef}");
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+            {
+                cols.Add(r.GetString(0));
+                if (!r.IsDBNull(1) && r.GetBoolean(1)) hasIdentity = true;
+            }
+        }
+        if (cols.Count == 0)
+            throw new InvalidOperationException($"Tabela '{schemaTable}' não encontrada em [{toDb}].");
+
+        // Colunas da chave primária (para não duplicar).
+        var pk = new List<string>();
+        {
+            var sql =
+                $"SELECT c.name FROM {Quote(toDb)}.sys.indexes i " +
+                $"JOIN {Quote(toDb)}.sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id " +
+                $"JOIN {Quote(toDb)}.sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id " +
+                $"WHERE i.is_primary_key = 1 AND i.object_id = OBJECT_ID(@o) ORDER BY ic.key_ordinal;";
+            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@o", $"{toDb}.{objRef}");
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+                pk.Add(r.GetString(0));
+        }
+        if (pk.Count == 0)
+            throw new InvalidOperationException($"A tabela '{schemaTable}' não tem chave primária — o salvamento seguro (sem duplicar) não é possível.");
+
+        var colList = string.Join(", ", cols.Select(Quote));
+        var joinOn = string.Join(" AND ", pk.Select(p => $"dst.{Quote(p)} = src.{Quote(p)}"));
+        var idOn = hasIdentity ? $"SET IDENTITY_INSERT {qTarget} ON; " : string.Empty;
+        var idOff = hasIdentity ? $" SET IDENTITY_INSERT {qTarget} OFF;" : string.Empty;
+
+        var inner =
+            idOn +
+            $"INSERT INTO {qTarget} ({colList}) SELECT {colList} FROM {qSource} src " +
+            $"WHERE NOT EXISTS (SELECT 1 FROM {qTarget} dst WHERE {joinOn}); " +
+            "DECLARE @rc int = @@ROWCOUNT;" + idOff + " SELECT @rc;";
+
+        const string runner =
+            "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
+            "EXEC @proc @stmt;";
+        await using var run = new SqlCommand(runner, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
+        run.Parameters.AddWithValue("@db", toDb);
+        run.Parameters.AddWithValue("@stmt", inner);
+        var n = await run.ExecuteScalarAsync(ct);
+        return n is null || n == DBNull.Value ? 0 : Convert.ToInt32(n);
+    }
+
+    private static (string schema, string table) SplitSchemaTable(string schemaTable)
+    {
+        var s = schemaTable.Trim();
+        // remove colchetes externos se vierem
+        var idx = s.IndexOf('.');
+        if (idx <= 0) return ("dbo", Unbracket(s));
+        return (Unbracket(s[..idx]), Unbracket(s[(idx + 1)..]));
+    }
+
+    private static string Quote(string ident) => "[" + ident.Replace("]", "]]") + "]";
+
+    /// <summary>
+    /// Reseta a semente de IDENTITY de todas as tabelas do banco (DBCC CHECKIDENT ... RESEED) — útil
+    /// após perda de linhas, para evitar saltos/colisões de identidade. Best-effort; devolve quantas
+    /// tabelas foram processadas. Roda no contexto do banco alvo.
+    /// </summary>
+    public async Task<int> ReseedIdentitiesAsync(string databaseName, CancellationToken ct = default)
+    {
+        // 1) Tabelas com coluna IDENTITY (nome simples schema.tabela, para o literal do CHECKIDENT).
+        var tables = new List<string>();
+        try
+        {
+            const string q =
+                "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
+                "DECLARE @stmt nvarchar(max) = N'SELECT s.name + N''.'' + t.name FROM sys.tables t " +
+                "JOIN sys.schemas s ON s.schema_id = t.schema_id " +
+                "WHERE t.is_ms_shipped = 0 AND EXISTS (SELECT 1 FROM sys.identity_columns ic WHERE ic.object_id = t.object_id);';\n" +
+                "EXEC @proc @stmt;";
+            await using var cmd = new SqlCommand(q, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+                if (!r.IsDBNull(0)) tables.Add(r.GetString(0));
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { return 0; }
+
+        // 2) RESEED de cada uma (CHECKIDENT recebe o nome como string literal).
+        var done = 0;
+        foreach (var t in tables)
+        {
+            try
+            {
+                var inner = $"DBCC CHECKIDENT ('{t.Replace("'", "''")}', RESEED) WITH NO_INFOMSGS;";
+                const string sql =
+                    "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
+                    "EXEC @proc @stmt;";
+                await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
+                cmd.Parameters.AddWithValue("@db", databaseName);
+                cmd.Parameters.AddWithValue("@stmt", inner);
+                await cmd.ExecuteNonQueryAsync(ct);
+                done++;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch { /* tabela específica falhou: segue */ }
+        }
+        return done;
+    }
+
+    /// <summary>Pasta de DADOS padrão da instância (derivada do master). Robusto em qualquer versão.</summary>
+    public Task<string> GetDefaultDataDirAsync(CancellationToken ct = default) => GetMasterFileDirAsync(0, ct);
+
+    /// <summary>Pasta de LOG padrão da instância (derivada do master).</summary>
+    public Task<string> GetDefaultLogDirAsync(CancellationToken ct = default) => GetMasterFileDirAsync(1, ct);
+
+    private async Task<string> GetMasterFileDirAsync(int fileType, CancellationToken ct)
+    {
+        try
+        {
+            const string sql =
+                "SELECT TOP (1) physical_name FROM sys.master_files " +
+                "WHERE database_id = DB_ID(N'master') AND type = @t ORDER BY file_id;";
+            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@t", fileType);
+            var path = (await cmd.ExecuteScalarAsync(ct)) as string;
+            return string.IsNullOrEmpty(path) ? string.Empty : (System.IO.Path.GetDirectoryName(path) ?? string.Empty);
+        }
+        catch { return string.Empty; }
+    }
+
+    /// <summary>
+    /// Verifica se um arquivo OU pasta existe no sistema de arquivos DO SERVIDOR (xp_fileexist).
+    /// Usado para decidir realocação de arquivos numa restauração. Best-effort (sysadmin).
+    /// </summary>
+    public async Task<bool> PathExistsOnServerAsync(string path, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return false;
+        try
+        {
+            // xp_fileexist devolve: [File Exists], [File is a Directory], [Parent Directory Exists]
+            await using var cmd = new SqlCommand(
+                "DECLARE @r TABLE (FileExists int, IsDir int, ParentExists int);\n" +
+                "INSERT INTO @r EXEC master.dbo.xp_fileexist @p;\n" +
+                "SELECT CASE WHEN FileExists = 1 OR IsDir = 1 THEN 1 ELSE 0 END FROM @r;", _connection)
+            { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@p", path);
+            var v = await cmd.ExecuteScalarAsync(ct);
+            return v is not null && v != DBNull.Value && Convert.ToInt32(v) == 1;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// Executa DBCC CHECKCONSTRAINTS WITH ALL_CONSTRAINTS, ALL_ERRORMSGS no contexto
     /// do banco alvo e devolve as violações de integridade LÓGICA (FK/CHECK) — que o CHECKDB NÃO
     /// detecta. Resolve, para cada violação, se a constraint é uma chave estrangeira (sys.foreign_keys),
     /// pois só FKs têm remoção automática de linhas órfãs. Best-effort. Compatível com 2008 R2.
@@ -318,9 +818,11 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         try
         {
             // CHECKCONSTRAINTS roda no banco CORRENTE; executamos no contexto do banco alvo.
+            // IMPORTANTE: diferente do CHECKDB, o CHECKCONSTRAINTS NÃO aceita TABLERESULTS
+            // (Msg 2532 no 2008 R2) — ele já devolve o conjunto Table/Constraint/Where por padrão.
             const string sql =
                 "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
-                "DECLARE @stmt nvarchar(max) = N'DBCC CHECKCONSTRAINTS WITH ALL_CONSTRAINTS, ALL_ERRORMSGS, TABLERESULTS;';\n" +
+                "DECLARE @stmt nvarchar(max) = N'DBCC CHECKCONSTRAINTS WITH ALL_CONSTRAINTS, ALL_ERRORMSGS;';\n" +
                 "EXEC @proc @stmt;";
             await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@db", databaseName);
@@ -367,7 +869,16 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         catch { /* best-effort */ }
 
         foreach (var v in violations)
-            v.IsForeignKey = fkNames.Contains(v.Constraint);
+            v.IsForeignKey = fkNames.Contains(Unbracket(v.Constraint));
+    }
+
+    /// <summary>Remove um nível de QUOTENAME: "[Nome]]X]" → "Nome]X". A saída do CHECKCONSTRAINTS
+    /// devolve os nomes já entre colchetes (ex.: "[FK_Pedido_Cliente]").</summary>
+    private static string Unbracket(string name)
+    {
+        if (name.Length >= 2 && name[0] == '[' && name[^1] == ']')
+            return name[1..^1].Replace("]]", "]");
+        return name;
     }
 
     /// <summary>Lista os nomes de constraints (FK/CHECK) marcadas como NÃO confiáveis no banco alvo. Best-effort.</summary>
@@ -629,6 +1140,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         var oLast = Ordinal(r, "LastLSN");
         var oDbBak = Ordinal(r, "DatabaseBackupLSN");
         var oChk = Ordinal(r, "CheckpointLSN");
+        var oCompressed = Ordinal(r, "Compressed");
 
         while (await r.ReadAsync(ct))
         {
@@ -648,7 +1160,8 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
                 FirstLsn = GetDecimal(r, oFirst),
                 LastLsn = GetDecimal(r, oLast),
                 DatabaseBackupLsn = GetDecimal(r, oDbBak),
-                CheckpointLsn = GetDecimal(r, oChk)
+                CheckpointLsn = GetDecimal(r, oChk),
+                IsCompressed = GetInt(r, oCompressed) == 1
             });
         }
         return list;
@@ -686,41 +1199,67 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
     public async Task<List<BackupSetInfo>> GetBackupHistoryAsync(string databaseName, CancellationToken ct = default)
     {
         var list = new List<BackupSetInfo>();
+        // Um backup STRIPED tem várias linhas em backupmediafamily (uma por arquivo); agrupamos por
+        // backup_set_id e reunimos todos os dispositivos. compressed_backup_size < backup_size = comprimido.
         const string sql = @"
-SELECT TOP (100)
-       bs.database_name, bs.type, bmf.physical_device_name,
+SELECT TOP (300)
+       bs.backup_set_id, bs.database_name, bs.type, bmf.physical_device_name,
        bs.backup_start_date, bs.backup_finish_date, bs.is_copy_only,
        bs.backup_size, ISNULL(bs.recovery_model, N''), ISNULL(bs.server_name, N''),
        bs.first_lsn, bs.last_lsn, bs.database_backup_lsn, bs.checkpoint_lsn,
-       bs.position
+       bs.position, ISNULL(bs.compressed_backup_size, 0)
 FROM   msdb.dbo.backupset AS bs
 JOIN   msdb.dbo.backupmediafamily AS bmf ON bmf.media_set_id = bs.media_set_id
 WHERE  bs.database_name = @db AND bmf.device_type IN (2, 102)  /* disco */
-ORDER BY bs.backup_finish_date DESC;";
+ORDER BY bs.backup_finish_date DESC, bs.backup_set_id, bmf.family_sequence_number;";
         try
         {
+            // Acumula por backup_set_id preservando a ordem de chegada (mais recente primeiro).
+            var order = new List<int>();
+            var groups = new Dictionary<int, (BackupSetInfo info, List<string> devices)>();
+
             await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@db", databaseName);
             await using var r = await cmd.ExecuteReaderAsync(ct);
             while (await r.ReadAsync(ct))
             {
-                list.Add(new BackupSetInfo
+                var setId = r.IsDBNull(0) ? 0 : Convert.ToInt32(r.GetValue(0));
+                var device = r.IsDBNull(3) ? string.Empty : r.GetString(3);
+
+                if (!groups.TryGetValue(setId, out var g))
                 {
-                    DatabaseName = r.IsDBNull(0) ? string.Empty : r.GetString(0),
-                    BackupTypeCode = r.IsDBNull(1) ? string.Empty : r.GetString(1),
-                    PhysicalDevice = r.IsDBNull(2) ? string.Empty : r.GetString(2),
-                    BackupStartDate = r.IsDBNull(3) ? null : r.GetDateTime(3),
-                    BackupFinishDate = r.IsDBNull(4) ? null : r.GetDateTime(4),
-                    IsCopyOnly = !r.IsDBNull(5) && r.GetBoolean(5),
-                    BackupSizeBytes = r.IsDBNull(6) ? 0 : Convert.ToInt64(r.GetValue(6)),
-                    RecoveryModel = r.IsDBNull(7) ? string.Empty : r.GetString(7),
-                    ServerName = r.IsDBNull(8) ? string.Empty : r.GetString(8),
-                    FirstLsn = r.IsDBNull(9) ? 0 : Convert.ToDecimal(r.GetValue(9)),
-                    LastLsn = r.IsDBNull(10) ? 0 : Convert.ToDecimal(r.GetValue(10)),
-                    DatabaseBackupLsn = r.IsDBNull(11) ? 0 : Convert.ToDecimal(r.GetValue(11)),
-                    CheckpointLsn = r.IsDBNull(12) ? 0 : Convert.ToDecimal(r.GetValue(12)),
-                    Position = r.IsDBNull(13) ? 1 : Convert.ToInt32(r.GetValue(13))
-                });
+                    var size = r.IsDBNull(7) ? 0 : Convert.ToInt64(r.GetValue(7));
+                    var comp = r.IsDBNull(15) ? 0 : Convert.ToInt64(r.GetValue(15));
+                    var info = new BackupSetInfo
+                    {
+                        DatabaseName = r.IsDBNull(1) ? string.Empty : r.GetString(1),
+                        BackupTypeCode = r.IsDBNull(2) ? string.Empty : r.GetString(2),
+                        PhysicalDevice = device,
+                        BackupStartDate = r.IsDBNull(4) ? null : r.GetDateTime(4),
+                        BackupFinishDate = r.IsDBNull(5) ? null : r.GetDateTime(5),
+                        IsCopyOnly = !r.IsDBNull(6) && r.GetBoolean(6),
+                        BackupSizeBytes = size,
+                        RecoveryModel = r.IsDBNull(8) ? string.Empty : r.GetString(8),
+                        ServerName = r.IsDBNull(9) ? string.Empty : r.GetString(9),
+                        FirstLsn = r.IsDBNull(10) ? 0 : Convert.ToDecimal(r.GetValue(10)),
+                        LastLsn = r.IsDBNull(11) ? 0 : Convert.ToDecimal(r.GetValue(11)),
+                        DatabaseBackupLsn = r.IsDBNull(12) ? 0 : Convert.ToDecimal(r.GetValue(12)),
+                        CheckpointLsn = r.IsDBNull(13) ? 0 : Convert.ToDecimal(r.GetValue(13)),
+                        Position = r.IsDBNull(14) ? 1 : Convert.ToInt32(r.GetValue(14)),
+                        IsCompressed = comp > 0 && comp < size
+                    };
+                    g = (info, new List<string>());
+                    groups[setId] = g;
+                    order.Add(setId);
+                }
+                if (!string.IsNullOrEmpty(device)) g.devices.Add(device);
+            }
+
+            foreach (var id in order)
+            {
+                var (info, devices) = groups[id];
+                info.Devices.AddRange(devices.Distinct(StringComparer.OrdinalIgnoreCase));
+                list.Add(info);
             }
         }
         catch

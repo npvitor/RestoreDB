@@ -13,12 +13,20 @@ using RestoreDB.Services;
 //   restore <db> <bakPath> [replace]
 //   restore-pit <db> [yyyy-MM-ddTHH:mm:ss | now] [notail]
 //   test-restore <db> <bakPath>
+//   restore-copy <db> [copyName]
+//   salvage-table <fromDb> <toDb> <schema.table>
+//   verify-backups <db>
+//   restore-standby <db> [yyyy-MM-ddTHH:mm:ss | now]
+//   finalize-recovery <db>
+//   check-table <db> <schema.table>
+//   reseed <db>
+//   history <db>
 //   rebuild-log <db>
 //   state <db>
 
 if (args.Length < 2)
 {
-    Console.Error.WriteLine("uso: <diagnose|repair-indexes|repair|fix-constraints|restore|restore-pit|test-restore|rebuild-log|state> <db> [extra]");
+    Console.Error.WriteLine("uso: <diagnose|repair|repair-indexes|fix-constraints|simulate-repair|monitor|maintain|fragmentation|forensic|attach|restore|restore-pit|restore-pages|restore-standby|finalize-recovery|test-restore|restore-copy|salvage-table|verify-backups|check-table|reseed|history|rebuild-log|state> <db> [extra]");
     return 2;
 }
 
@@ -67,6 +75,34 @@ switch (cmd)
         break;
     }
 
+    case "monitor":
+    {
+        var svc = new MonitorService(log);
+        var targets = new List<DatabaseInfo>();
+        if (dbName.Equals("all", StringComparison.OrdinalIgnoreCase))
+            targets.AddRange((await new DatabaseService().ListDatabasesAsync(conn)).Where(d => !d.IsSystemDatabase));
+        else
+            targets.Add(db);
+
+        var anyNew = false;
+        foreach (var t in targets)
+        {
+            var m = await svc.RunCheckAsync(t, conn, progress);
+            Console.WriteLine($"  [{t.Name}] novoProblema={m.HasNewIssue} corrupcao={m.CorruptionPresent} acao={m.RecommendedAction}");
+            anyNew |= m.HasNewIssue;
+        }
+        Console.WriteLine($"RESULT: novidades={anyNew}");
+        return anyNew ? 2 : 0;   // código 2 = há novidade (Agendador pode disparar e-mail)
+    }
+
+    case "simulate-repair":
+    {
+        var r = await new RepairService(log).SimulateRepairAsync(db, conn, progress);
+        Console.WriteLine($"RESULT: executed={r.Executed} perdaTotal={r.TotalRowsLost} tabelasAfetadas={r.AffectedTables.Count} checkdbLimpoDepois={r.CheckDbCleanAfter}");
+        Console.WriteLine($"SUMMARY: {r.Message}");
+        return r.Executed ? 0 : 1;
+    }
+
     case "fix-constraints":
     {
         var r = await new RepairService(log).FixConstraintViolationsAsync(db, conn, progress);
@@ -87,6 +123,113 @@ switch (cmd)
         var r = await new RepairService(log).RepairAsync(db, conn, dataloss, progress);
         Console.WriteLine($"RESULT: {r.Status} | {r.Message}");
         return r.Status is RepairStatus.Success or RepairStatus.NoActionNeeded ? 0 : 1;
+    }
+
+    case "restore-copy":
+    {
+        var copyName = args.Length > 2 ? args[2] : null;
+        var r = await new RestoreService(log).RestoreAsCopyAsync(dbName, copyName, conn, progress);
+        Console.WriteLine($"RESULT: {r.Status} | {r.Message}");
+        return r.Status == RepairStatus.Success ? 0 : 1;
+    }
+
+    case "salvage-table":
+    {
+        if (args.Length < 4) { Console.Error.WriteLine("salvage-table exige <toDb> <schema.table>"); return 2; }
+        // args: [0]=cmd [1]=fromDb [2]=toDb [3]=schema.table
+        var r = await new RestoreService(log).SalvageTableAsync(dbName, args[2], args[3], conn, progress);
+        Console.WriteLine($"RESULT: {r.Status} | {r.Message}");
+        return r.Status == RepairStatus.Success ? 0 : 1;
+    }
+
+    case "verify-backups":
+    {
+        var items = await new RestoreService(log).VerifyBackupHealthAsync(dbName, conn, progress);
+        foreach (var it in items) Console.WriteLine("  " + it.Display);
+        Console.WriteLine($"RESULT: {items.Count(i => i.Verified)}/{items.Count} verificado(s)");
+        return items.All(i => i.Verified) ? 0 : 1;
+    }
+
+    case "attach":
+    {
+        if (args.Length < 3) { Console.Error.WriteLine("attach exige <mdfPath> [ldfPath]"); return 2; }
+        var ldf = args.Length > 3 ? args[3] : null;
+        var rebuild = string.IsNullOrEmpty(ldf);
+        var r = await new RestoreService(log).AttachDatabaseAsync(dbName, args[2], ldf, rebuild, conn, progress);
+        Console.WriteLine($"RESULT: {r.Status} | {r.Message}");
+        return r.Status == RepairStatus.Success ? 0 : 1;
+    }
+
+    case "restore-pages":
+    {
+        if (args.Length < 3) { Console.Error.WriteLine("restore-pages exige <fileId:pageId,...>"); return 2; }
+        var r = await new RestoreService(log).RestorePagesFromHistoryAsync(dbName, args[2], conn, progress);
+        Console.WriteLine($"RESULT: {r.Status} | {r.Message}");
+        return r.Status == RepairStatus.Success ? 0 : 1;
+    }
+
+    case "restore-standby":
+    {
+        DateTime? target = null;
+        if (args.Length > 2 && !args[2].Equals("now", StringComparison.OrdinalIgnoreCase))
+            target = DateTime.Parse(args[2], System.Globalization.CultureInfo.InvariantCulture);
+        var r = await new RestoreService(log).RestoreToStandbyAsync(dbName, target, conn, progress);
+        Console.WriteLine($"RESULT: {r.Status} | {r.Message}");
+        return r.Status == RepairStatus.Success ? 0 : 1;
+    }
+
+    case "finalize-recovery":
+    {
+        var r = await new RestoreService(log).FinalizeRecoveryAsync(dbName, conn, progress);
+        Console.WriteLine($"RESULT: {r.Status} | {r.Message}");
+        return r.Status == RepairStatus.Success ? 0 : 1;
+    }
+
+    case "forensic":
+    {
+        var txs = await new RestoreService(log).ListRecentDestructiveTransactionsAsync(dbName, conn);
+        foreach (var t in txs.Take(30)) Console.WriteLine("  " + t.Display);
+        Console.WriteLine($"RESULT: {txs.Count} transação(ões) destrutiva(s) recente(s) no log ativo");
+        return 0;
+    }
+
+    case "history":
+    {
+        var snaps = new HistoryService().Load(dbName);
+        foreach (var s in snaps.TakeLast(10))
+            Console.WriteLine($"  {s.TimestampUtc:yyyy-MM-dd HH:mm:ss}Z  estado={s.StateDesc}  checkdbErros={s.CheckDbErrors}  fk={s.ForeignKeyViolations}  acao={s.RecommendedAction}");
+        Console.WriteLine($"RESULT: {snaps.Count} snapshot(s) no histórico");
+        return 0;
+    }
+
+    case "fragmentation":
+    {
+        var frags = await new MaintenanceService(log).GetFragmentationAsync(dbName, conn);
+        foreach (var f in frags.Take(30)) Console.WriteLine("  " + f.Display);
+        Console.WriteLine($"RESULT: {frags.Count(f => f.NeedsMaintenance)}/{frags.Count} índice(s) precisam de manutenção");
+        return 0;
+    }
+
+    case "maintain":
+    {
+        var r = await new MaintenanceService(log).RunMaintenanceAsync(db, conn, progress);
+        Console.WriteLine($"RESULT: {r.Status} | {r.Message}");
+        return r.Status == RepairStatus.Success ? 0 : 1;
+    }
+
+    case "check-table":
+    {
+        if (args.Length < 3) { Console.Error.WriteLine("check-table exige <schema.table>"); return 2; }
+        var rep = await new RepairService(log).CheckTableAsync(db, args[2], conn, progress);
+        Console.WriteLine($"RESULT: executed={rep.Executed} erros={rep.ErrorCount} minRepair={rep.MinRepairLevel}");
+        return rep.Executed && !rep.HasErrors ? 0 : 1;
+    }
+
+    case "reseed":
+    {
+        var n = await new RepairService(log).ReseedIdentitiesAsync(db, conn, progress);
+        Console.WriteLine($"RESULT: tabelas_reseed={n}");
+        return 0;
     }
 
     case "rebuild-log":

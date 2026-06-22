@@ -10,9 +10,7 @@ public enum RecommendedActionKind
     RestoreFromBackup,
     PageRestore,
     RebuildLog,
-    DataLossRepair,
     FreeDiskSpace,
-    ReviewTopology,
 
     /// <summary>Integridade LÓGICA comprometida (FK órfã / violação de constraint) com os
     /// arquivos físicos íntegros — corrige-se removendo as linhas violadoras, não com CHECKDB.</summary>
@@ -66,6 +64,21 @@ public sealed class DiagnosisResult
 
     /// <summary>Avaliação da política de backup/recuperação (RPO): FULL sem log, full antiga, etc.</summary>
     public BackupPolicyAssessment? BackupPolicy { get; set; }
+
+    /// <summary>Banco criptografado (TDE) — restaurar em outra instância exige o certificado.</summary>
+    public bool IsEncrypted { get; set; }
+
+    /// <summary>Operação demorada em andamento (recuperação/RESTORE) — para não parecer travado.</summary>
+    public RecoveryProgress? Recovery { get; set; }
+
+    /// <summary>Achados de SAÚDE LÓGICA adicionais (índices desabilitados, dependências quebradas, etc.).</summary>
+    public List<PolicyFinding> HealthFindings { get; } = new();
+
+    /// <summary>Achados de CAUSA-RAIZ (erros de E/S, corrupção recorrente ⇒ suspeita de hardware).</summary>
+    public List<PolicyFinding> RootCauseFindings { get; } = new();
+
+    /// <summary>Novidades em relação ao último diagnóstico (ex.: corrupção nova) — detecção precoce.</summary>
+    public List<string> NewSinceLastRun { get; } = new();
 
     /// <summary>Linhas violadoras de FK que podem ser removidas para restaurar a integridade.</summary>
     public IReadOnlyList<ConstraintViolation> ForeignKeyViolations =>
