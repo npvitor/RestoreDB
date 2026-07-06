@@ -171,9 +171,13 @@ Em **“PASSO 2 — COMO RESOLVER”**, a ferramenta exibe **apenas a(s) opção
 O diagnóstico cruza **fontes oficiais** e é **somente leitura**:
 
 - **Consistência física** — `DBCC CHECKDB` (estruturado): identifica objeto/índice afetado e o nível
-  mínimo de reparo. Opção **`PHYSICAL_ONLY`** para uma varredura rápida.
+  mínimo de reparo. A verificação completa inclui **valores inválidos** (`DATA_PURITY`) e, se o
+  disco estiver cheio demais para o snapshot interno, repete automaticamente de outro modo
+  (`TABLOCK`) em vez de falhar. Opção **`PHYSICAL_ONLY`** para uma varredura rápida.
 - **Integridade lógica** — `DBCC CHECKCONSTRAINTS`: encontra **registros órfãos** (chave estrangeira
-  apontando para um registro inexistente) — o que o CHECKDB **não** detecta.
+  apontando para um registro inexistente) — o que o CHECKDB **não** detecta. Quando há corrupção
+  **física**, esta checagem é **adiada** (ela lê os dados e poderia interromper a sessão) — repare o
+  físico primeiro e diagnostique de novo.
 - **Metadados** — `DBCC CHECKCATALOG`.
 - **Páginas suspeitas** (`msdb.suspect_pages`) e **log de erros** do SQL (erros 823/824/825 = E/S,
   9002 = log cheio), reconciliados com o estado atual (sem falso positivo de corrupção já resolvida).
@@ -214,21 +218,33 @@ violações de chave estrangeira; violações de CHECK são apenas reportadas), 
 prefira **restaurar de backup**.
 
 ### 8.4. Reparo COM possível perda de dados (exige confirmação)
-**Quando:** o reparo seguro não resolveu e não há (ou não se quer) restaurar de backup.
+**Quando:** o reparo seguro não resolveu e não há (ou não se quer) restaurar de backup. O painel
+de **restauração de backup** aparece lado a lado — é a alternativa que preserva 100% dos dados.
 **Simule antes:** clique em **“🔬 Simular antes (pré-visualizar a perda, sem tocar no banco)”** — a
 ferramenta restaura uma **cópia descartável**, executa o reparo **na cópia** e mostra a **perda exata
 por tabela** e se o banco ficaria limpo. **O banco real não é tocado.**
-**O que faz (ao confirmar):** tenta um backup de segurança e executa
-`DBCC CHECKDB … REPAIR_ALLOW_DATA_LOSS`, que **descarta** páginas corrompidas. Em seguida,
-**reconcilia** chaves estrangeiras que a operação possa ter deixado órfãs.
+**O que faz (ao confirmar):** primeiro a **rede de segurança automática** — captura as transações
+mais recentes (**tail-log**, que funciona mesmo com os arquivos de dados danificados) e um backup
+de segurança (`COPY_ONLY`); depois executa `DBCC CHECKDB … REPAIR_ALLOW_DATA_LOSS`, que
+**descarta** páginas corrompidas. Em seguida, **reconcilia** chaves estrangeiras que a operação
+possa ter deixado órfãs, **reajusta as identidades** e cria um **backup FULL novo** (os backups
+antigos deixam de ser confiáveis após o reparo). Os arquivos ficam na **pasta padrão de backups do
+servidor**.
 **Como usar:** marque **“Estou ciente e autorizo…”**, clique em **“Executar reparo COM perda de
 dados”** e confirme.
-> ⚠️ **Pode haver perda irreversível.** Prefira sempre **restaurar de backup**.
+> ⚠️ **Pode haver perda de dados** — prefira sempre **restaurar de backup**. Mas, se o banco tem
+> **cadeia de backups** (modelo FULL), o tail-log capturado antes do reparo permite depois
+> **restaurar até o instante imediatamente anterior** e recuperar 100% do que foi descartado
+> (peça ajuda ao suporte de nível 2/DBA usando a restauração ponto-no-tempo).
 
 ### 8.5. Reconstruir o log (último recurso)
-**Quando:** o problema está no **log de transações** (`.ldf` corrompido/ausente) e o reparo não resolveu.
+**Quando:** o problema está no **log de transações** (`.ldf` corrompido/ausente) e o reparo não
+resolveu. A opção só aparece quando o **estado do banco indica** problema de log/recuperação
+(`SUSPECT`, `RECOVERY_PENDING`, `EMERGENCY`) ou quando o diagnóstico a recomendou — nunca como
+"saída" genérica para outras falhas.
 **O que faz:** coloca em emergência, **desanexa**, **remove** o `.ldf` antigo (preservando-o como
 `.corrupt_AAAAMMDDHHMMSS`) e o **recria** (`FOR ATTACH_REBUILD_LOG`), forçando o retorno a `ONLINE`.
+Ao final, cria um **backup FULL novo** (a reconstrução quebra a cadeia de backups de log).
 **Requisitos:** arquivos **acessíveis nesta máquina** e ferramenta **como Administrador**.
 > 🔒 Sem Administrador, a operação é **abortada ANTES de desanexar** — o banco **não é alterado** — e
 > as instruções manuais são exibidas. Alternativa sem Administrador: o **reparo com perda de dados**
@@ -264,8 +280,12 @@ Recolhidas sob **“Mais opções de restauração (avançado)”**:
   vivo apenas as **linhas que faltam** (por chave primária, sem duplicar).
 - **Restaurar em STANDBY (somente leitura):** deixa o banco **consultável** entre os logs, para você
   inspecionar e achar o ponto certo; depois use **“Finalizar recuperação”**.
-- **Restaurar apenas as páginas afetadas:** quando poucas páginas estão corrompidas, informe-as no
-  formato `fileId:pageId` e recupere **só elas** (exige modelo FULL/BULK e a cadeia de backups).
+- **Restaurar apenas as páginas afetadas:** quando poucas páginas estão corrompidas, recupere
+  **só elas** (exige modelo FULL/BULK e a cadeia de backups). Quando o diagnóstico recomenda esse
+  caminho, o campo já vem **preenchido automaticamente** com as páginas corrompidas — normalmente
+  basta clicar em **“Restaurar apenas estas páginas”**. A cadeia (FULL → diferencial → logs + um
+  backup de log novo) é montada e validada automaticamente; se estiver incompleta, a operação é
+  abortada com explicação, sem alterar o banco.
 
 > Backups **divididos em vários arquivos (striped)** e **comprimidos** são reconhecidos e tratados
 > automaticamente.
@@ -311,8 +331,10 @@ No grupo **“Verificações avançadas”**:
 
 ### 11.4. Anexar um banco a partir de um arquivo `.mdf`
 Na barra superior, **“Anexar .mdf”** permite recuperar um banco a partir do arquivo de dados solto.
-A ferramenta procura o `.ldf` correspondente; se não houver, **recria o log** automaticamente
-(`FOR ATTACH_REBUILD_LOG`). Não sobrescreve um banco já existente de mesmo nome.
+A ferramenta procura o `.ldf` correspondente pelos padrões comuns; se não encontrar, **pergunta se
+você quer localizá-lo manualmente** — só recria o log (`FOR ATTACH_REBUILD_LOG`) se você optar por
+isso ou se o arquivo realmente não existir (recriar descarta transações não confirmadas). Não
+sobrescreve um banco já existente de mesmo nome.
 
 ### 11.5. Procedimento manual para bancos de sistema
 Bancos de sistema não são reparados automaticamente. **“Ver procedimento manual recomendado”** exibe
@@ -358,8 +380,17 @@ sessão a outra pessoa, use **Exportar relatório** (HTML).
   destrutivo, com orientação para tratar a topologia primeiro.
 - **Bancos de sistema** não sofrem reparo destrutivo automático (há runbook guiado).
 - **Sempre via `master`:** nunca se conecta diretamente ao banco quebrado.
-- **Rede de segurança:** backup/cópia de segurança antes de operações destrutivas (quando possível);
-  cadeias de restauração são **validadas** antes de executar.
+- **Rede de segurança automática antes do reparo destrutivo:** captura das transações mais
+  recentes (**tail-log**, mesmo com os dados danificados) + backup de segurança + cópia dos
+  arquivos (quando possível). Com cadeia de backups, o que o reparo descartar **pode ser
+  recuperado depois**.
+- **Backup FULL novo após reparo destrutivo/reconstrução de log** — nova base da cadeia de backups.
+- **Cadeias de restauração validadas** antes de executar; conjuntos que não podem ser restaurados
+  sozinhos (diferencial/log) geram **aviso com orientação**.
+- **Robustez a falhas graves:** se o SQL Server derrubar a conexão ao ler uma página corrompida
+  (erro 824), a ferramenta **reconecta sozinha** e continua; o acesso exclusivo é de fato mantido
+  pela sessão durante o reparo.
+- **Fechar durante uma operação pede confirmação** — evita abandonar o banco em acesso restrito.
 - **Confirmação explícita** para tudo que pode perder dados; **sem mensagens técnicas cruas**.
 
 ---
@@ -411,6 +442,26 @@ A ferramenta reconcilia histórico × estado atual: corrupção **já resolvida*
 
 **Aparece “Corrupção RECORRENTE” / erros de E/S.**
 É um alerta de **causa-raiz**: suspeite do disco/volume/storage e considere migrar os arquivos.
+
+**Autorizei o reparo com perda de dados — dá para recuperar o que foi descartado?**
+Se o banco usa o modelo de recuperação **FULL** e tem cadeia de backups, **sim**: antes do reparo
+a ferramenta capturou o **tail-log** (arquivo `*_tail_*.trn` na pasta padrão de backups do
+servidor). Uma **restauração ponto-no-tempo** até o instante imediatamente anterior ao reparo
+recupera 100% dos dados. Peça apoio ao nível 2/DBA e informe o horário do reparo (está no
+Registro de operações).
+
+**Posso fechar a ferramenta durante um reparo?**
+Evite. A ferramenta pede confirmação: fechar no meio pode deixar o banco em acesso restrito
+(`SINGLE_USER`). Prefira **Cancelar** e aguardar.
+
+**Selecionei um backup e a restauração diz que não é FULL.**
+Diferenciais e logs não se restauram sozinhos — precisam do FULL antes. Use **“Restaurar cadeia
+completa”**, que monta a sequência correta automaticamente.
+
+**Depois do reparo com perda, os backups antigos ainda valem?**
+Não confie neles: o reparo altera a estrutura do banco. A ferramenta cria automaticamente um
+**backup FULL novo** (arquivo `*_PosReparo_*.bak`) — ele é a nova base. Configure a rotina de
+backups a partir dele.
 
 ---
 

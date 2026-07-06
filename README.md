@@ -29,8 +29,23 @@ Todo o T-SQL é **compatível com SQL Server 2008 R2** (e versões superiores).
   restaurando a integridade referencial — com backup de segurança antes (operação destrutiva,
   exige confirmação).
 - **Escalonamento de reparo** do menos ao mais agressivo, **sempre primeiro SEM perda de dados**.
+- **Rede de segurança automática antes do reparo destrutivo**: captura o **tail-log WITH
+  NO_TRUNCATE** (funciona mesmo com os arquivos de DADOS danificados — junto com a cadeia de
+  backups, permite recuperar depois **100%** do que o reparo descartar), backup `COPY_ONLY` e
+  cópia física dos arquivos (quando locais).
+- **Backup FULL automático pós-reparo destrutivo**: após `REPAIR_ALLOW_DATA_LOSS` ou reconstrução
+  de log, a cadeia anterior deixa de ser confiável — a ferramenta cria a **nova base** na hora e
+  reajusta as sementes de **IDENTITY** (evita colisões após remoção de linhas).
 - **Reparo SEM perda quando a corrupção está só em índices não-clusterizados**
   (reconstrói os índices em vez de descartar dados).
+- **Resiliência a erros severos**: um erro **824** (leitura de página corrompida) derruba a conexão
+  do SQL Server — a sessão de reparo **reconecta automaticamente** e o fluxo continua; a vaga
+  `SINGLE_USER` é **ocupada de fato** pela sessão (`USE`), impedindo que outro processo a roube
+  entre os comandos.
+- **CHECKDB com fallback `TABLOCK`**: quando o snapshot interno não pode ser criado (disco cheio —
+  causa comum das próprias emergências), a verificação repete com `TABLOCK` em vez de abortar; e o
+  diagnóstico completo inclui **`DATA_PURITY`** (valores inválidos — relevante em bancos migrados
+  do SQL 2000).
 - **Restaurar de backup** (full/diferencial/log), incluindo **restauração de página**
   e correção de usuários órfãos — o caminho correto para corrupção de dados.
 - **Restauração ponto-no-tempo com cadeia automática**: monta FULL → diferencial → logs a partir
@@ -151,10 +166,14 @@ Para qualquer banco problemático há o botão **"Diagnosticar (sem alterar o ba
 Sem modificar nada, ele cruza **fontes autoritativas** e recomenda o melhor caminho:
 
 - **`msdb.dbo.suspect_pages`** — lista oficial de páginas corrompidas (erros 823/824/825);
-- **`DBCC CHECKDB ... WITH TABLERESULTS`** (estruturado) — identifica **objeto e índice**
-  afetados e o **nível mínimo de reparo**; resolve nomes de tabela/índice para leitura;
+- **`DBCC CHECKDB ... WITH TABLERESULTS`** (estruturado, com **`DATA_PURITY`** na verificação
+  completa) — identifica **objeto e índice** afetados e o **nível mínimo de reparo**; resolve
+  nomes de tabela/índice para leitura; se o snapshot interno falhar (disco cheio), repete
+  **`WITH TABLOCK`**;
 - **`DBCC CHECKCONSTRAINTS`** — integridade **LÓGICA** (chaves estrangeiras e CHECK) que o
-  CHECKDB **não** verifica; localiza os **registros órfãos** (FK apontando para PK inexistente);
+  CHECKDB **não** verifica; localiza os **registros órfãos** (FK apontando para PK inexistente).
+  **Adiado quando há corrupção física** (ler os dados por índices corrompidos derrubaria a
+  conexão — o físico é reparado primeiro);
 - **`DBCC CHECKCATALOG`** — consistência dos **metadados** do banco;
 - **constraints não confiáveis** (`sys.foreign_keys`/`sys.check_constraints` com `is_not_trusted`)
   — integridade que nunca foi validada (causa comum de FK órfã silenciosa);
@@ -185,14 +204,24 @@ A conclusão define a **ação recomendada** e a UI destaca o caminho certo:
 | `RECOVERY_PENDING`| Tenta `SET ONLINE`; se falhar, cai no fluxo de emergência abaixo                   | Não → (talvez) |
 | `SUSPECT`/`EMERGENCY` | `SET EMERGENCY` → `SET SINGLE_USER WITH ROLLBACK IMMEDIATE` → `DBCC CHECKDB` (diagnóstico) → `SET ONLINE` (recuperação) → `REPAIR_REBUILD` → verificação | Não |
 | ↳ se restar só corrupção de **índice não-clusterizado** | `ALTER INDEX ... REBUILD` (reconstrói os índices afetados) → verificação | **Não** |
-| ↳ se o reparo seguro não bastar | **(com confirmação)** `EMERGENCY` + `SINGLE_USER` → backup `COPY_ONLY` + **cópia física** dos arquivos → `REPAIR_ALLOW_DATA_LOSS` → verificação → `MULTI_USER` | **Sim** |
+| ↳ se o reparo seguro não bastar | **(com confirmação)** `EMERGENCY` + `SINGLE_USER` → **tail-log `NO_TRUNCATE`** + backup `COPY_ONLY` + **cópia física** dos arquivos → `REPAIR_ALLOW_DATA_LOSS` → verificação → reconciliar FKs + reseed de IDENTITY → `MULTI_USER` → **backup FULL pós-reparo** | **Sim*** |
 | **Corrupção de dados** (recomendado) | **Restaurar de backup** (`RESTORE`/`RESTORE ... PAGE`) → corrigir usuários órfãos | Não* |
 
+> \* O `REPAIR_ALLOW_DATA_LOSS` descarta o que está corrompido, **mas** o tail-log capturado
+> antes (`WITH NO_TRUNCATE` — funciona mesmo com o `.mdf` danificado, basta o `.ldf` legível)
+> permite, havendo cadeia de backups, **restaurar ponto-no-tempo até logo antes do reparo e
+> recuperar 100% dos dados** (validado em engine real — ver a seção de validação).
+>
 > **Detalhe validado em engine real:** o SQL Server rejeita `REPAIR_REBUILD` com o
 > banco em modo `EMERGENCY` (Msg 7901). Por isso o fluxo tenta a **recuperação
 > normal (`SET ONLINE`) primeiro**; com o banco ONLINE + `SINGLE_USER`, o
 > `REPAIR_REBUILD` (sem perda de dados) passa a ser permitido. O
 > `REPAIR_ALLOW_DATA_LOSS`, ao contrário, **é** permitido em `EMERGENCY`.
+>
+> **Outro detalhe validado:** um erro **824** (severidade 24) ao ler uma página corrompida
+> **derruba a conexão** — a `SqlSession` reconecta automaticamente antes de cada comando, e as
+> checagens lógicas (`CHECKCONSTRAINTS`, que lê os dados pelos índices) são **adiadas** quando o
+> CHECKDB acusa corrupção física, para não matar a sessão no meio do reparo.
 
 ### Último recurso: reconstruir o log de transações (recriar o `.ldf`)
 
@@ -224,12 +253,19 @@ bancos de usuário, com **confirmação explícita** — a reconstrução do log
 
 Detalhes importantes:
 
-- Toda a sequência roda na **mesma conexão** (`SqlSession`), garantindo que o
-  bloqueio `SINGLE_USER` seja detido por quem executa o `DBCC CHECKDB`.
+- Toda a sequência roda na **mesma conexão** (`SqlSession`); nos fluxos em que o banco
+  permanece ONLINE, a sessão **ocupa a vaga `SINGLE_USER`** com um `USE` durável — sem isso,
+  qualquer aplicação poderia roubar a única vaga entre um comando e outro. Se um erro severo
+  (824) derrubar a conexão, a sessão **reconecta automaticamente**.
 - A aplicação conecta-se sempre em **`master`** — nunca diretamente no banco
   quebrado.
-- Antes do reparo destrutivo, tenta-se **`BACKUP DATABASE ... WITH COPY_ONLY`**;
-  se não for possível (banco inacessível), o usuário é avisado.
+- Antes do reparo destrutivo, a **rede de segurança**: `BACKUP LOG ... WITH NO_TRUNCATE,
+  CONTINUE_AFTER_ERROR` (tail-log — funciona mesmo com os dados danificados),
+  `BACKUP DATABASE ... WITH COPY_ONLY` e cópia física dos arquivos (quando locais). Tudo
+  best-effort: o que não for possível é avisado, sem impedir o reparo autorizado.
+- Após um reparo destrutivo **bem-sucedido** (ou reconstrução de log), um **backup FULL novo**
+  é criado automaticamente — a cadeia de backups anterior deixa de ser confiável — e as
+  sementes de **IDENTITY** são reajustadas.
 - Ao final de qualquer caminho, o banco volta para **`MULTI_USER`**.
 - Bancos de **sistema** (`master`, `model`, `msdb`, `tempdb`) **não** são
   submetidos a reparo destrutivo automático.
@@ -254,8 +290,10 @@ restore de peça única:
   `checkpoint_lsn` do full e cada log precisa encadear (`first_lsn ≤ âncora < last_lsn`). Se houver
   **quebra na cadeia** (log faltando, diferencial órfão), a operação é **abortada antes de executar**,
   explicando o que falta — nunca deixa o banco num estado pior.
-- **Tail-log** — antes de sobrescrever, faz `BACKUP LOG ... WITH NORECOVERY, CONTINUE_AFTER_ERROR`
-  para capturar as transações mais recentes e anexá-las como último elo da cadeia (minimiza o RPO).
+- **Tail-log** — antes de sobrescrever, faz `BACKUP LOG ... WITH NORECOVERY, NO_TRUNCATE,
+  CONTINUE_AFTER_ERROR` para capturar as transações mais recentes e anexá-las como último elo da
+  cadeia (minimiza o RPO). O `NO_TRUNCATE` permite a captura **mesmo com os arquivos de dados
+  danificados/offline** — basta o `.ldf` legível.
 - **Testar backup (`TestRestoreAsync`)** — restaura a cadeia para um banco **descartável** (com
   `MOVE` para a pasta do `tempdb`), roda `DBCC CHECKDB` e **descarta** o banco de teste ao final
   (mesmo em falha). Prova a restaurabilidade **sem tocar na produção**.
@@ -279,9 +317,11 @@ decide isso é lógica pura e coberta por testes.
 ### Checagens granulares (B1)
 
 Além do CHECKDB completo: **`DBCC CHECKTABLE`** dirigido a um objeto (mais rápido), **`DBCC
-CHECKIDENT ... RESEED`** para reajustar sementes de identidade após remoção de linhas, e a opção
-**`PHYSICAL_ONLY`** no diagnóstico (varredura rápida para bancos muito grandes; `DATA_PURITY`
-disponível na camada de dados).
+CHECKIDENT ... RESEED`** para reajustar sementes de identidade após remoção de linhas (também
+executado **automaticamente** após um reparo com perda), e a opção **`PHYSICAL_ONLY`** no
+diagnóstico (varredura rápida para bancos muito grandes). O diagnóstico completo roda com
+**`DATA_PURITY`** (valida também os valores das colunas — em bancos migrados do SQL 2000 essa
+checagem não é automática).
 
 ### Restauração em STANDBY e mídias avançadas
 
@@ -351,6 +391,11 @@ backup"**:
 
 Também há **restauração de página** (`RESTORE ... PAGE`) para recuperar apenas as páginas
 corrompidas, preservando o restante (requer modelo de recuperação FULL e a cadeia de backups).
+A cadeia é montada pelo **`BackupChainPlanner`** (validação de LSN): usa o último FULL, o
+**diferencial** aplicável (encurta drasticamente a fila de logs em cadeias longas), os logs e um
+`BACKUP LOG` novo como elo final — e **aborta com explicação** se a cadeia estiver quebrada.
+Na UI, quando o diagnóstico recomenda a restauração de página, o campo `fileId:pageId` já vem
+**pré-preenchido** a partir de `msdb.suspect_pages`.
 
 ### Segurança de topologia
 
@@ -425,14 +470,12 @@ $env:RESTOREDB_IT_USE_WINDOWS  = "1"
 dotnet test tests/RestoreDB.IntegrationTests
 ```
 
-> Validado contra **SQL Server 2022 (Developer Edition)**: 41 testes de lógica + 10 de integração,
-> todos aprovados.
->
-> **Também validado em produção contra SQL Server 2008 R2 SP3 (Express Edition, 10.50.6000.34)**
-> com **autenticação do Windows**: 41 testes de lógica + 10 de integração aprovados, e os fluxos de
-> reparo exercitados com **corrupção física real** (`DBCC WRITEPAGE`) sobre uma cópia de um banco de
-> produção (≈900 MB) — ver abaixo. O `Microsoft.Data.SqlClient` conecta-se ao 2008 R2 negociando
-> TLS 1.0 (emite apenas um **aviso** benigno; `Encrypt=Optional` torna a conexão possível).
+> Validado contra **SQL Server 2022 (Developer Edition)** e, em produção, contra
+> **SQL Server 2008 R2 SP3 (Express Edition, 10.50.6000.34)** com **autenticação do Windows**:
+> **78 testes de lógica + 31 de integração** aprovados, e os fluxos de reparo exercitados com
+> **corrupção física real** (`DBCC WRITEPAGE`) sobre uma cópia de um banco de produção (≈900 MB)
+> — ver abaixo. O `Microsoft.Data.SqlClient` conecta-se ao 2008 R2 negociando TLS 1.0 (emite
+> apenas um **aviso** benigno; `Encrypt=Optional` torna a conexão possível).
 
 ### Validação com corrupção real
 
@@ -441,8 +484,15 @@ num banco de produção de teste, com backup prévio e restauração ao final:
 
 - **Índice não-clusterizado corrompido** ⇒ a ferramenta detecta "só índice", reconstrói
   (`DISABLE` + `REBUILD`) e verifica — **zero perda de dados** (checksum idêntico ao original).
-- **Página de dados corrompida** + `EMERGENCY` ⇒ `REPAIR_ALLOW_DATA_LOSS` torna o banco
-  consistente (perda mínima, registrada).
+  O erro 824 derrubou a conexão da sessão durante a checagem e a **reconexão automática**
+  manteve o fluxo até o fim.
+- **Página de dados corrompida** ⇒ **restauração de página** com cadeia automática
+  (FULL + **diferencial** + log novo) — **zero perda** (contagem e checksum idênticos).
+- **Página de dados corrompida** + reparo COM perda autorizado ⇒ a rede de segurança capturou o
+  **tail-log `NO_TRUNCATE`** e o backup `COPY_ONLY`; o `REPAIR_ALLOW_DATA_LOSS` descartou 106
+  linhas e o **backup FULL pós-reparo** foi criado. Em seguida, a **restauração ponto-no-tempo
+  usando o tail-log preservado** (STOPAT logo antes do reparo) **recuperou 100% dos dados**
+  (contagem e checksum idênticos ao original) — a perda do reparo é reversível quando há cadeia.
 - **Restaurar de backup** ⇒ recupera 100% dos dados; corrige usuários órfãos.
 - O diagnóstico **reconcilia histórico × estado atual**: entradas antigas de `msdb.suspect_pages`
   e do log de erros não geram falso positivo quando o `DBCC CHECKDB` ao vivo está limpo.
