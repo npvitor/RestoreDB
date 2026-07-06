@@ -335,49 +335,68 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         if (repairOption is null && physicalOnly) withOpts += ", PHYSICAL_ONLY";
         else if (repairOption is null && dataPurity) withOpts += ", DATA_PURITY";
 
-        var sql =
-            "DECLARE @cmd nvarchar(max);\n" +
-            "SET @cmd = N'DBCC CHECKDB (' + QUOTENAME(@db) + N'" + repairPart + ") WITH " + withOpts + ";';\n" +
-            "EXEC sys.sp_executesql @cmd;";
-
         try
         {
-            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
-            cmd.Parameters.AddWithValue("@db", databaseName);
-            await using var reader = await cmd.ExecuteReaderAsync(ct);
-
-            var oErr = Ordinal(reader, "Error");
-            var oLvl = Ordinal(reader, "Level");
-            var oState = Ordinal(reader, "State");
-            var oMsg = Ordinal(reader, "MessageText");
-            var oRepair = Ordinal(reader, "RepairLevel");
-            var oObj = Ordinal(reader, "ObjectId", "Id");
-            var oIdx = Ordinal(reader, "IndexId", "IndId");
-
-            report.Executed = true;
-            while (await reader.ReadAsync(ct))
-            {
-                report.Details.Add(new CorruptionDetail
-                {
-                    Error = GetInt(reader, oErr),
-                    Level = GetInt(reader, oLvl),
-                    State = GetInt(reader, oState),
-                    MessageText = GetStr(reader, oMsg),
-                    RepairLevel = GetStr(reader, oRepair),
-                    ObjectId = GetInt(reader, oObj),
-                    IndexId = GetInt(reader, oIdx)
-                });
-            }
+            await RunCheckDbReaderAsync(databaseName, repairPart, withOpts, report, ct);
         }
         catch (OperationCanceledException)
         {
             throw;
+        }
+        catch (SqlException ex) when (repairOption is null && ex.Errors.Cast<SqlError>().Any(e => e.Number is 1823 or 7928))
+        {
+            // O CHECKDB sem reparo usa um snapshot interno do banco; em disco cheio/sem permissão
+            // na pasta de dados ele falha (Msg 1823/7928). O TABLOCK dispensa o snapshot (usa
+            // bloqueios), permitindo verificar mesmo assim. TABLOCK não aceita DATA_PURITY.
+            try
+            {
+                report = new CheckDbReport();
+                await RunCheckDbReaderAsync(databaseName, repairPart, "TABLERESULTS, ALL_ERRORMSGS, NO_INFOMSGS, TABLOCK"
+                    + (physicalOnly ? ", PHYSICAL_ONLY" : string.Empty), report, ct);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch { /* segue com relatório vazio */ }
         }
         catch
         {
             // Banco inacessível / sem permissão: relatório fica vazio (Executed = false).
         }
         return report;
+    }
+
+    private async Task RunCheckDbReaderAsync(string databaseName, string repairPart, string withOpts, CheckDbReport report, CancellationToken ct)
+    {
+        var sql =
+            "DECLARE @cmd nvarchar(max);\n" +
+            "SET @cmd = N'DBCC CHECKDB (' + QUOTENAME(@db) + N'" + repairPart + ") WITH " + withOpts + ";';\n" +
+            "EXEC sys.sp_executesql @cmd;";
+
+        await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
+        cmd.Parameters.AddWithValue("@db", databaseName);
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+        var oErr = Ordinal(reader, "Error");
+        var oLvl = Ordinal(reader, "Level");
+        var oState = Ordinal(reader, "State");
+        var oMsg = Ordinal(reader, "MessageText");
+        var oRepair = Ordinal(reader, "RepairLevel");
+        var oObj = Ordinal(reader, "ObjectId", "Id");
+        var oIdx = Ordinal(reader, "IndexId", "IndId");
+
+        report.Executed = true;
+        while (await reader.ReadAsync(ct))
+        {
+            report.Details.Add(new CorruptionDetail
+            {
+                Error = GetInt(reader, oErr),
+                Level = GetInt(reader, oLvl),
+                State = GetInt(reader, oState),
+                MessageText = GetStr(reader, oMsg),
+                RepairLevel = GetStr(reader, oRepair),
+                ObjectId = GetInt(reader, oObj),
+                IndexId = GetInt(reader, oIdx)
+            });
+        }
     }
 
     /// <summary>

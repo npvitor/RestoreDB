@@ -491,7 +491,8 @@ public sealed class RestoreService
     /// <summary>
     /// Captura o tail-log (BACKUP LOG ... WITH NORECOVERY) para preservar as transações mais
     /// recentes antes de uma restauração. Best-effort: em modelo SIMPLE ou sem log, devolve null.
-    /// Usa CONTINUE_AFTER_ERROR para conseguir capturar mesmo com o log danificado.
+    /// NO_TRUNCATE permite capturar mesmo com os arquivos de DADOS danificados/offline (basta o
+    /// .ldf legível) e CONTINUE_AFTER_ERROR tolera dano no próprio log.
     /// </summary>
     private async Task<RestorePiece?> TryBackupTailLogAsync(SqlSession session, string db, IProgress<RepairLogEntry> p, CancellationToken ct)
     {
@@ -506,7 +507,7 @@ public sealed class RestoreService
         var comp = await session.SupportsBackupCompressionAsync(ct) ? ", COMPRESSION" : string.Empty;
         var sql =
             "DECLARE @cmd nvarchar(max);\n" +
-            "SET @cmd = N'BACKUP LOG ' + QUOTENAME(@db) + N' TO DISK = @f WITH NORECOVERY, CONTINUE_AFTER_ERROR, INIT" + comp + ", NAME = @n;';\n" +
+            "SET @cmd = N'BACKUP LOG ' + QUOTENAME(@db) + N' TO DISK = @f WITH NORECOVERY, NO_TRUNCATE, CONTINUE_AFTER_ERROR, INIT" + comp + ", NAME = @n;';\n" +
             "EXEC sys.sp_executesql @cmd, N'@f nvarchar(4000), @n nvarchar(256)', @f = @file, @n = @name;";
         var r = await RunStepAsync(session, db, p, "Capturando o tail-log (BACKUP LOG ... WITH NORECOVERY)", sql,
             new Dictionary<string, object?> { ["@db"] = db, ["@file"] = file, ["@name"] = $"RestoreDB tail-log de {db}" }, ct);
@@ -647,33 +648,28 @@ public sealed class RestoreService
         }
 
         var history = await session.GetBackupHistoryAsync(databaseName, ct);
-        var full = history.Where(b => b.IsFull).OrderByDescending(b => b.BackupFinishDate ?? DateTime.MinValue).FirstOrDefault();
-        if (full is null)
+
+        // Cadeia validada por LSN (FULL → DIFERENCIAL → LOGs). O diferencial encurta a fila de
+        // logs a aplicar — em cadeias longas, é a diferença entre minutos e horas.
+        var plan = BackupChainPlanner.Plan(databaseName, history, target: null);
+        foreach (var w in plan.Warnings)
+            Report(progress, databaseName, RepairLogLevel.Warning, "  ⚠ " + w);
+        if (!plan.IsComplete || plan.BaseFull is null)
         {
             result.Status = RepairStatus.Failed;
-            result.Message = "Sem backup FULL no histórico — a restauração de página não é possível.";
+            result.Message = "Cadeia de backup incompleta — a restauração de página exige FULL + logs contíguos até o presente. " + plan.Summary;
             Report(progress, databaseName, RepairLogLevel.Error, result.Message);
             return result;
         }
+        Report(progress, databaseName, RepairLogLevel.Info, plan.Summary);
 
-        // Cadeia de LOGs contígua a partir do FULL (ignora diferencial: o full + logs completos basta).
-        var pieces = new List<RestorePiece> { BackupChainPlanner.ToPiece(full, isLog: false) };
-        var anchor = full.LastLsn;
-        foreach (var lg in history.Where(b => b.IsLog).OrderBy(b => b.LastLsn))
-        {
-            if (anchor > 0 && lg.LastLsn > 0 && lg.LastLsn <= anchor) continue;
-            if (anchor > 0 && lg.FirstLsn > 0 && lg.FirstLsn > anchor)
-            {
-                Report(progress, databaseName, RepairLogLevel.Warning, "Quebra na cadeia de LOG — a restauração de página pode não cobrir até o presente.");
-                break;
-            }
-            pieces.Add(BackupChainPlanner.ToPiece(lg, isLog: true));
-            if (lg.LastLsn > anchor) anchor = lg.LastLsn;
-        }
+        var pieces = new List<RestorePiece>(plan.Pieces);
 
         // BACKUP LOG novo (não-NORECOVERY): captura o estado atual e será o último elo (WITH RECOVERY).
         var tail = await BackupCurrentLogAsync(session, databaseName, progress, ct);
         if (tail is not null) pieces.Add(tail);
+        else Report(progress, databaseName, RepairLogLevel.Warning,
+            "Não foi possível capturar um backup de log novo — a restauração de página pode não concluir (o último elo é obrigatório).");
 
         return await RestorePagesAsync(databaseName, pages, pieces, connectionString, progress, ct);
     }
@@ -728,23 +724,29 @@ public sealed class RestoreService
             return result;
         }
 
-        // 2) Aplicar logs subsequentes (NORECOVERY) e o último WITH RECOVERY.
+        // 2) Aplicar as peças subsequentes: diferencial com RESTORE DATABASE (o engine aplica só
+        //    as páginas em restauração), logs com RESTORE LOG; o último elo WITH RECOVERY.
         for (var i = 1; i < pieces.Count; i++)
         {
             var isLast = i == pieces.Count - 1;
             var p = pieces[i];
             var withClause = isLast ? "RECOVERY" : "NORECOVERY";
+            var verb = p.IsLog ? "RESTORE LOG " : "RESTORE DATABASE ";
+            var (from, stepPrm) = DeviceFrom(p.AllDevices.Count > 0 ? p.AllDevices : new List<string> { p.DiskPath });
+            var paramDecl = "@f int" + string.Concat(Enumerable.Range(0, stepPrm.Count).Select(j => $", @p{j} nvarchar(4000)"));
+            var paramPass = "@f = @pos" + string.Concat(Enumerable.Range(0, stepPrm.Count).Select(j => $", @p{j} = @p{j}"));
+            stepPrm["@db"] = databaseName;
+            stepPrm["@pos"] = p.Position;
             var stepSql =
                 "DECLARE @cmd nvarchar(max);\n" +
-                "SET @cmd = N'RESTORE LOG ' + QUOTENAME(@db) + N' FROM DISK = @p WITH FILE = @f, " + withClause + ";';\n" +
-                "EXEC sys.sp_executesql @cmd, N'@p nvarchar(4000), @f int', @p=@path, @f=@pos;";
+                "SET @cmd = N'" + verb + "' + QUOTENAME(@db) + N' FROM " + from + " WITH FILE = @f, " + withClause + ";';\n" +
+                "EXEC sys.sp_executesql @cmd, N'" + paramDecl + "', " + paramPass + ";";
             var lr = await RunStepAsync(session, databaseName, progress,
-                $"Aplicando log ({Path.GetFileName(p.DiskPath)}) {withClause}", stepSql,
-                new Dictionary<string, object?> { ["@db"] = databaseName, ["@path"] = p.DiskPath, ["@pos"] = p.Position }, ct);
+                $"Aplicando {(p.IsLog ? "log" : "diferencial")} ({Path.GetFileName(p.DiskPath)}) {withClause}", stepSql, stepPrm, ct);
             if (!lr.Success)
             {
                 result.Status = RepairStatus.Failed;
-                result.Message = "Falha ao aplicar o log na restauração de página.";
+                result.Message = $"Falha ao aplicar {(p.IsLog ? "o log" : "o diferencial")} na restauração de página.";
                 Report(progress, databaseName, RepairLogLevel.Error, result.Message);
                 return result;
             }
@@ -844,11 +846,16 @@ public sealed class RestoreService
     {
         // PAGE não pode ser parâmetro; é validado (apenas dígitos, ':' e ',') antes de montar.
         var safePages = SanitizePages(pages);
+        var (from, prm) = DeviceFrom(full.AllDevices.Count > 0 ? full.AllDevices : new List<string> { full.DiskPath });
+        var paramDecl = "@f int" + string.Concat(Enumerable.Range(0, prm.Count).Select(j => $", @p{j} nvarchar(4000)"));
+        var paramPass = "@f = @pos" + string.Concat(Enumerable.Range(0, prm.Count).Select(j => $", @p{j} = @p{j}"));
+        prm["@db"] = db;
+        prm["@pos"] = full.Position;
         var sql =
             "DECLARE @cmd nvarchar(max);\n" +
-            "SET @cmd = N'RESTORE DATABASE ' + QUOTENAME(@db) + N' PAGE = ''" + safePages + "'' FROM DISK = @p WITH FILE = @f, NORECOVERY;';\n" +
-            "EXEC sys.sp_executesql @cmd, N'@p nvarchar(4000), @f int', @p = @path, @f = @pos;";
-        return (sql, new Dictionary<string, object?> { ["@db"] = db, ["@path"] = full.DiskPath, ["@pos"] = full.Position });
+            "SET @cmd = N'RESTORE DATABASE ' + QUOTENAME(@db) + N' PAGE = ''" + safePages + "'' FROM " + from + " WITH FILE = @f, NORECOVERY;';\n" +
+            "EXEC sys.sp_executesql @cmd, N'" + paramDecl + "', " + paramPass + ";";
+        return (sql, prm);
     }
 
     /// <summary>Mantém apenas dígitos, ':' e ',' — formato "fileId:pageId,fileId:pageId".</summary>

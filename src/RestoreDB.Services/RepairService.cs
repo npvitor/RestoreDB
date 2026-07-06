@@ -296,7 +296,10 @@ public sealed class RepairService
     private async Task TryStructuredCheckDbAsync(SqlSession session, DatabaseInfo db, DiagnosisResult diag, IProgress<RepairLogEntry> progress, CancellationToken ct, bool physicalOnly = false)
     {
         Report(progress, db.Name, RepairLogLevel.Info, "Analisando consistência (DBCC CHECKDB ... WITH TABLERESULTS, somente leitura)...");
-        var report = await session.CheckDbWithResultsAsync(db.Name, repairOption: null, ct, physicalOnly: physicalOnly);
+        // DATA_PURITY: valida também os VALORES das colunas (fora de faixa/inválidos) — em bancos
+        // migrados do SQL 2000 essa checagem não é automática até rodar uma vez com sucesso.
+        var report = await session.CheckDbWithResultsAsync(db.Name, repairOption: null, ct,
+            physicalOnly: physicalOnly, dataPurity: !physicalOnly);
         diag.CheckDb = report;
 
         if (!report.Executed)
@@ -667,7 +670,7 @@ public sealed class RepairService
 
         // 3. Diagnóstico (somente leitura) — funciona em modo EMERGENCY
         Report(p, db.Name, RepairLogLevel.Info, "Executando diagnóstico (DBCC CHECKDB)...");
-        var diag = await RunStepAsync(s, db, p, "Diagnóstico DBCC CHECKDB", Dbcc(db.Name, repairOption: null, noInfoMsgs: true), ct);
+        var diag = await RunCheckDbStepAsync(s, db, p, "Diagnóstico DBCC CHECKDB", db.Name, ct);
         Report(p, db.Name, diag.Success ? RepairLogLevel.Success : RepairLogLevel.Warning,
             diag.Success
                 ? "Diagnóstico não encontrou erros de consistência."
@@ -686,8 +689,7 @@ public sealed class RepairService
                 "Banco recuperado para ONLINE. Aplicando REPAIR_REBUILD (sem perda) e verificando...");
             var rebuild = await RunStepAsync(s, db, p, "Reparo SEM perda de dados (REPAIR_REBUILD)",
                 Dbcc(db.Name, "REPAIR_REBUILD", noInfoMsgs: false), ct);
-            var verify = await RunStepAsync(s, db, p, "Verificação pós-reparo (DBCC CHECKDB)",
-                Dbcc(db.Name, repairOption: null, noInfoMsgs: true), ct);
+            var verify = await RunCheckDbStepAsync(s, db, p, "Verificação pós-reparo (DBCC CHECKDB)", db.Name, ct);
             safeOk = rebuild.Success && verify.Success;
         }
         else
@@ -713,8 +715,7 @@ public sealed class RepairService
                 Report(p, db.Name, RepairLogLevel.Info,
                     "Corrupção restrita a índices não-clusterizados — reconstruindo os índices (SEM perda de dados)...");
                 var rebuilt = await RebuildNonClusteredIndexesAsync(s, db, structured, p, ct);
-                var verifyIdx = await RunStepAsync(s, db, p, "Verificação pós-reconstrução de índices (DBCC CHECKDB)",
-                    Dbcc(db.Name, repairOption: null, noInfoMsgs: true), ct);
+                var verifyIdx = await RunCheckDbStepAsync(s, db, p, "Verificação pós-reconstrução de índices (DBCC CHECKDB)", db.Name, ct);
                 if (rebuilt && verifyIdx.Success)
                 {
                     await TrySetMultiUserAsync(s, db, p, ct);
@@ -754,14 +755,16 @@ public sealed class RepairService
         await RunStepAsync(s, db, p, "Reparo COM possível PERDA DE DADOS (REPAIR_ALLOW_DATA_LOSS)",
             Dbcc(db.Name, "REPAIR_ALLOW_DATA_LOSS", noInfoMsgs: false), ct);
 
-        var verifyFinal = await RunStepAsync(s, db, p, "Verificação final (DBCC CHECKDB)",
-            Dbcc(db.Name, repairOption: null, noInfoMsgs: true), ct);
+        var verifyFinal = await RunCheckDbStepAsync(s, db, p, "Verificação final (DBCC CHECKDB)", db.Name, ct);
 
         // O REPAIR_ALLOW_DATA_LOSS desaloca páginas SEM respeitar constraints — pode deixar
         // chaves estrangeiras órfãs. Como a perda de dados já foi autorizada, reconciliamos.
         await TryReconcileConstraintsAsync(s, db, p, allowDataLoss: true, ct);
+        await TryReseedIdentitiesAsync(s, db, p, ct);
 
         await TrySetMultiUserAsync(s, db, p, ct);
+        if (verifyFinal.Success)
+            await TryPostRepairFullBackupAsync(s, db, p, ct);
         return verifyFinal.Success ? RepairStatus.Success : RepairStatus.Failed;
     }
 
@@ -810,6 +813,7 @@ public sealed class RepairService
                 await TrySetMultiUserAsync(s, db, p, ct);
                 return RepairStatus.Failed;
             }
+            await TryOccupySingleUserSlotAsync(s, db, p, ct);
 
             try
             {
@@ -819,8 +823,7 @@ public sealed class RepairService
                     Report(p, db.Name, RepairLogLevel.Info,
                         "Corrupção restrita a índices não-clusterizados — reconstruindo (SEM perda de dados)...");
                     var rebuilt = await RebuildNonClusteredIndexesAsync(s, db, report, p, ct);
-                    var verifyIdx = await RunStepAsync(s, db, p, "Verificação pós-reconstrução de índices (DBCC CHECKDB)",
-                        Dbcc(db.Name, repairOption: null, noInfoMsgs: true), ct);
+                    var verifyIdx = await RunCheckDbStepAsync(s, db, p, "Verificação pós-reconstrução de índices (DBCC CHECKDB)", db.Name, ct);
                     if (rebuilt && verifyIdx.Success)
                     {
                         await s.ClearSuspectPagesAsync(db.Name, ct);
@@ -832,8 +835,7 @@ public sealed class RepairService
                 Report(p, db.Name, RepairLogLevel.Info, "Tentando reparo SEM perda de dados (REPAIR_REBUILD)...");
                 var rebuild = await RunStepAsync(s, db, p, "Reparo SEM perda (REPAIR_REBUILD)",
                     Dbcc(db.Name, "REPAIR_REBUILD", noInfoMsgs: false), ct);
-                var verify = await RunStepAsync(s, db, p, "Verificação pós-reparo (DBCC CHECKDB)",
-                    Dbcc(db.Name, repairOption: null, noInfoMsgs: true), ct);
+                var verify = await RunCheckDbStepAsync(s, db, p, "Verificação pós-reparo (DBCC CHECKDB)", db.Name, ct);
                 if (rebuild.Success && verify.Success)
                     return RepairStatus.Success;
 
@@ -849,13 +851,16 @@ public sealed class RepairService
                 await TrySafetyNetAsync(s, db, p, ct);
                 await RunStepAsync(s, db, p, "Reparo COM possível PERDA DE DADOS (REPAIR_ALLOW_DATA_LOSS)",
                     Dbcc(db.Name, "REPAIR_ALLOW_DATA_LOSS", noInfoMsgs: false), ct);
-                var verifyFinal = await RunStepAsync(s, db, p, "Verificação final (DBCC CHECKDB)",
-                    Dbcc(db.Name, repairOption: null, noInfoMsgs: true), ct);
+                var verifyFinal = await RunCheckDbStepAsync(s, db, p, "Verificação final (DBCC CHECKDB)", db.Name, ct);
                 await TryReconcileConstraintsAsync(s, db, p, allowDataLoss: true, ct);
+                await TryReseedIdentitiesAsync(s, db, p, ct);
+                if (verifyFinal.Success)
+                    await TryPostRepairFullBackupAsync(s, db, p, ct);
                 return verifyFinal.Success ? RepairStatus.Success : RepairStatus.Failed;
             }
             finally
             {
+                await TryReleaseSingleUserSlotAsync(s, ct);
                 await TrySetMultiUserAsync(s, db, p, ct);
             }
         }
@@ -883,6 +888,7 @@ public sealed class RepairService
             await TrySetMultiUserAsync(s, db, p, ct);
             return RepairStatus.Failed;
         }
+        await TryOccupySingleUserSlotAsync(s, db, p, ct);
         try
         {
             await TrySafetyNetAsync(s, db, p, ct);
@@ -892,6 +898,7 @@ public sealed class RepairService
         }
         finally
         {
+            await TryReleaseSingleUserSlotAsync(s, ct);
             await TrySetMultiUserAsync(s, db, p, ct);
         }
     }
@@ -1132,8 +1139,7 @@ public sealed class RepairService
         var finalState = await session.GetDatabaseStateAsync(db.Name, ct);
         db.StateDesc = finalState;
 
-        var check = await RunStepAsync(session, db, progress,
-            "Verificação de consistência (DBCC CHECKDB)", Dbcc(db.Name, repairOption: null, noInfoMsgs: true), ct);
+        var check = await RunCheckDbStepAsync(session, db, progress, "Verificação de consistência (DBCC CHECKDB)", db.Name, ct);
 
         if (finalState.Equals("ONLINE", StringComparison.OrdinalIgnoreCase))
         {
@@ -1143,6 +1149,8 @@ public sealed class RepairService
                 ? "Log de transações reconstruído com sucesso. Banco ONLINE e consistente."
                 : "Log reconstruído e banco ONLINE, mas o DBCC CHECKDB ainda acusa inconsistências. Considere o reparo COM perda de dados.";
             Report(progress, db.Name, check.Success ? RepairLogLevel.Success : RepairLogLevel.Warning, result.Message);
+            // A reconstrução do log quebra definitivamente a cadeia de backups de log.
+            await TryPostRepairFullBackupAsync(session, db, progress, ct);
         }
         else
         {
@@ -1369,6 +1377,7 @@ public sealed class RepairService
         {
             await RunStepAsync(session, db, progress, "Obtendo acesso exclusivo (SINGLE_USER WITH ROLLBACK IMMEDIATE)",
                 AlterDatabase(db.Name, "SET SINGLE_USER WITH ROLLBACK IMMEDIATE"), ct);
+            await TryOccupySingleUserSlotAsync(session, db, progress, ct);
 
             var report = await session.CheckDbWithResultsAsync(db.Name, repairOption: null, ct);
             if (!report.Executed)
@@ -1394,8 +1403,7 @@ public sealed class RepairService
             }
 
             var ok = await RebuildNonClusteredIndexesAsync(session, db, report, progress, ct);
-            var verify = await RunStepAsync(session, db, progress, "Verificação pós-reconstrução (DBCC CHECKDB)",
-                Dbcc(db.Name, repairOption: null, noInfoMsgs: true), ct);
+            var verify = await RunCheckDbStepAsync(session, db, progress, "Verificação pós-reconstrução (DBCC CHECKDB)", db.Name, ct);
 
             result.Status = ok && verify.Success ? RepairStatus.Success : RepairStatus.Failed;
             if (result.Status == RepairStatus.Success)
@@ -1413,7 +1421,8 @@ public sealed class RepairService
         }
         finally
         {
-            // 1) Religa na PRÓPRIA sessão (que é a dona do slot SINGLE_USER quando viva).
+            // 1) Devolve o contexto a master e religa na PRÓPRIA sessão (dona do slot SINGLE_USER).
+            await TryReleaseSingleUserSlotAsync(session, CancellationToken.None);
             await TrySetMultiUserAsync(session, db, progress, CancellationToken.None);
             // 2) Backstop em conexão NOVA, caso a sessão tenha sido derrubada por um erro severo (824).
             result.FinalStateDesc = await ForceMultiUserAsync(connectionString, db, progress);
@@ -1460,6 +1469,7 @@ public sealed class RepairService
         {
             await RunStepAsync(session, db, progress, "Obtendo acesso exclusivo (SINGLE_USER WITH ROLLBACK IMMEDIATE)",
                 AlterDatabase(db.Name, "SET SINGLE_USER WITH ROLLBACK IMMEDIATE"), ct);
+            await TryOccupySingleUserSlotAsync(session, db, progress, ct);
 
             var violations = await session.CheckConstraintsAsync(db.Name, ct);
             var fk = violations.Where(v => v.IsForeignKey).ToList();
@@ -1517,6 +1527,7 @@ public sealed class RepairService
         }
         finally
         {
+            await TryReleaseSingleUserSlotAsync(session, CancellationToken.None);
             await TrySetMultiUserAsync(session, db, progress, CancellationToken.None);
             result.FinalStateDesc = await ForceMultiUserAsync(connectionString, db, progress);
             db.StateDesc = result.FinalStateDesc;
@@ -1775,13 +1786,115 @@ public sealed class RepairService
     }
 
     /// <summary>
-    /// Tenta o backup COPY_ONLY e, em seguida, uma cópia física dos arquivos (quando locais) —
-    /// porque o BACKUP costuma falhar com o banco em EMERGENCY (Msg 3033). Tudo best-effort.
+    /// Rede de segurança antes de um reparo destrutivo, tudo best-effort:
+    /// 1) tail-log WITH NO_TRUNCATE (captura as transações ainda não copiadas mesmo com os
+    ///    arquivos de DADOS danificados — junto com a cadeia de backups permite restaurar sem perda);
+    /// 2) backup COPY_ONLY do banco;
+    /// 3) cópia física dos arquivos (quando locais) — porque o BACKUP costuma falhar com o banco
+    ///    em EMERGENCY (Msg 3033).
     /// </summary>
     private async Task TrySafetyNetAsync(SqlSession s, DatabaseInfo db, IProgress<RepairLogEntry> p, CancellationToken ct)
     {
+        await TryCaptureTailLogAsync(s, db, p, ct);
         await TryBackupAsync(s, db, p, ct);
         await TryCopyPhysicalFilesAsync(s, db, p, ct);
+    }
+
+    /// <summary>
+    /// Captura o tail-log com NO_TRUNCATE + CONTINUE_AFTER_ERROR: funciona mesmo com os arquivos
+    /// de dados corrompidos/inacessíveis, desde que o .ldf esteja legível. É o que garante perda
+    /// MÍNIMA: as transações posteriores ao último backup ficam preservadas num .trn que pode ser
+    /// aplicado numa restauração da cadeia. Não altera o estado do banco. Best-effort.
+    /// </summary>
+    private async Task TryCaptureTailLogAsync(SqlSession s, DatabaseInfo db, IProgress<RepairLogEntry> p, CancellationToken ct)
+    {
+        try
+        {
+            var model = await s.GetRecoveryModelAsync(db.Name, ct);
+            if (model.Length == 0 || model.Equals("SIMPLE", StringComparison.OrdinalIgnoreCase))
+                return; // em SIMPLE não há cadeia de log a preservar
+
+            var file = $"{AppConstants.SanitizeToken(db.Name, "banco")}_tail_{DateTime.Now:yyyyMMdd_HHmmss}.trn";
+            var sql =
+                "DECLARE @cmd nvarchar(max);\n" +
+                "SET @cmd = N'BACKUP LOG ' + QUOTENAME(@db) + N' TO DISK = @f WITH NO_TRUNCATE, CONTINUE_AFTER_ERROR, INIT, NAME = @n;';\n" +
+                "EXEC sys.sp_executesql @cmd, N'@f nvarchar(4000), @n nvarchar(256)', @f = @file, @n = @name;";
+            var r = await RunStepAsync(s, db, p, "Preservando o tail-log (BACKUP LOG ... WITH NO_TRUNCATE)", sql,
+                new Dictionary<string, object?> { ["@db"] = db.Name, ["@file"] = file, ["@name"] = $"RestoreDB tail-log de {db.Name}" }, ct);
+            Report(p, db.Name, r.Success ? RepairLogLevel.Success : RepairLogLevel.Warning,
+                r.Success
+                    ? $"Tail-log preservado na pasta padrão de backups: {file} — junto com a cadeia de backups, permite restauração SEM perda."
+                    : "Não foi possível preservar o tail-log (log inacessível). O reparo prosseguirá conforme autorizado.");
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* best-effort */ }
+    }
+
+    /// <summary>
+    /// Após um reparo DESTRUTIVO bem-sucedido (REPAIR_ALLOW_DATA_LOSS / reconstrução de log), a
+    /// cadeia de backups anterior deixa de ser confiável (diferenciais/logs antigos não casam mais
+    /// com o estado atual). Um backup FULL novo vira a base da nova cadeia. Best-effort.
+    /// </summary>
+    private async Task TryPostRepairFullBackupAsync(SqlSession s, DatabaseInfo db, IProgress<RepairLogEntry> p, CancellationToken ct)
+    {
+        try
+        {
+            Report(p, db.Name, RepairLogLevel.Warning,
+                "O reparo alterou a estrutura do banco: a cadeia de backups anterior NÃO é mais confiável. Criando um backup FULL novo (nova base)...");
+            var file = $"{AppConstants.SanitizeToken(db.Name, "banco")}_PosReparo_{DateTime.Now:yyyyMMdd_HHmmss}.bak";
+            var comp = await s.SupportsBackupCompressionAsync(ct) ? ", COMPRESSION" : string.Empty;
+            var sql =
+                "DECLARE @cmd nvarchar(max);\n" +
+                "SET @cmd = N'BACKUP DATABASE ' + QUOTENAME(@db) + N' TO DISK = @f WITH INIT" + comp + ", NAME = @n;';\n" +
+                "EXEC sys.sp_executesql @cmd, N'@f nvarchar(4000), @n nvarchar(256)', @f = @file, @n = @name;";
+            var r = await RunStepAsync(s, db, p, "Backup FULL pós-reparo (nova base da cadeia)", sql,
+                new Dictionary<string, object?> { ["@db"] = db.Name, ["@file"] = file, ["@name"] = $"RestoreDB pós-reparo de {db.Name}" }, ct);
+            Report(p, db.Name, r.Success ? RepairLogLevel.Success : RepairLogLevel.Warning,
+                r.Success
+                    ? $"Backup FULL pós-reparo criado na pasta padrão de backups: {file}"
+                    : "Não foi possível criar o backup pós-reparo — faça um BACKUP DATABASE ... FULL assim que possível.");
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* best-effort */ }
+    }
+
+    /// <summary>Reajusta as sementes de IDENTITY após remoção de linhas (best-effort).</summary>
+    private async Task TryReseedIdentitiesAsync(SqlSession s, DatabaseInfo db, IProgress<RepairLogEntry> p, CancellationToken ct)
+    {
+        try
+        {
+            var n = await s.ReseedIdentitiesAsync(db.Name, ct);
+            if (n > 0)
+                Report(p, db.Name, RepairLogLevel.Info, $"Sementes de IDENTITY reajustadas em {n} tabela(s) (evita saltos/colisões após remoção de linhas).");
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* best-effort */ }
+    }
+
+    /// <summary>
+    /// OCUPA a vaga SINGLE_USER: o ALTER ... SET SINGLE_USER não deixa esta conexão "dentro" do
+    /// banco (a sessão opera a partir de master), então entre um comando e outro um processo
+    /// qualquer pode tomar a única vaga e travar o reparo. Um USE muda o contexto da conexão de
+    /// forma durável, garantindo a exclusividade real durante a sequência. Os comandos seguintes
+    /// não dependem do contexto (todos qualificam o banco explicitamente). Best-effort: se o USE
+    /// falhar, o comportamento é o mesmo de antes. Usar APENAS quando o banco permanece ONLINE
+    /// durante todo o fluxo (transições ONLINE/EMERGENCY invalidariam o contexto da conexão).
+    /// </summary>
+    private async Task TryOccupySingleUserSlotAsync(SqlSession s, DatabaseInfo db, IProgress<RepairLogEntry> p, CancellationToken ct)
+    {
+        var use = "USE [" + db.Name.Replace("]", "]]") + "];";
+        var r = await s.ExecuteAsync("Ocupar a vaga SINGLE_USER (USE)", use, null, AppConstants.QueryCommandTimeoutSeconds, ct);
+        if (r.Success)
+            Report(p, db.Name, RepairLogLevel.Info, "Vaga SINGLE_USER ocupada por esta sessão (exclusividade garantida).");
+        else
+            Report(p, db.Name, RepairLogLevel.Warning, "Não foi possível ocupar a vaga SINGLE_USER — outro processo pode disputá-la durante o reparo.");
+    }
+
+    /// <summary>Devolve o contexto da conexão a master (par do <see cref="TryOccupySingleUserSlotAsync"/>).</summary>
+    private static async Task TryReleaseSingleUserSlotAsync(SqlSession s, CancellationToken ct)
+    {
+        try { await s.ExecuteAsync("Liberar contexto (USE master)", "USE [master];", null, AppConstants.QueryCommandTimeoutSeconds, ct); }
+        catch { /* best-effort */ }
     }
 
     private async Task TryCopyPhysicalFilesAsync(SqlSession s, DatabaseInfo db, IProgress<RepairLogEntry> p, CancellationToken ct)
@@ -1872,10 +1985,13 @@ public sealed class RepairService
                 {
                     sb.AppendLine();
                     sb.AppendLine("/* DESTRUTIVO — somente com confirmação explícita: */");
+                    sb.AppendLine($"BACKUP LOG {n} TO DISK = N'{AppConstants.SanitizeToken(db.Name, "banco")}_tail.trn' WITH NO_TRUNCATE, CONTINUE_AFTER_ERROR, INIT; -- preserva o tail-log (modelo FULL)");
                     sb.AppendLine($"ALTER DATABASE {n} SET EMERGENCY;");
                     sb.AppendLine($"ALTER DATABASE {n} SET SINGLE_USER WITH ROLLBACK IMMEDIATE;");
                     sb.AppendLine($"DBCC CHECKDB ({n}, REPAIR_ALLOW_DATA_LOSS) WITH ALL_ERRORMSGS;");
                     sb.AppendLine($"DBCC CHECKDB ({n}) WITH NO_INFOMSGS, ALL_ERRORMSGS;");
+                    sb.AppendLine($"/* Após o reparo destrutivo, a cadeia de backups anterior deixa de ser confiável: */");
+                    sb.AppendLine($"BACKUP DATABASE {n} TO DISK = N'{AppConstants.SanitizeToken(db.Name, "banco")}_PosReparo.bak' WITH INIT;");
                 }
                 sb.AppendLine($"ALTER DATABASE {n} SET MULTI_USER;");
                 break;
@@ -1973,15 +2089,36 @@ public sealed class RepairService
         return (sql, new Dictionary<string, object?> { ["@db"] = dbName });
     }
 
-    private static (string sql, Dictionary<string, object?> prm) Dbcc(string dbName, string? repairOption, bool noInfoMsgs)
+    private static (string sql, Dictionary<string, object?> prm) Dbcc(string dbName, string? repairOption, bool noInfoMsgs, bool tablock = false)
     {
         var repairPart = repairOption is null ? string.Empty : ", " + repairOption;
         var withPart = noInfoMsgs ? "WITH NO_INFOMSGS, ALL_ERRORMSGS" : "WITH ALL_ERRORMSGS";
+        if (tablock && repairOption is null) withPart += ", TABLOCK";
         var sql =
             "DECLARE @cmd nvarchar(max);\n" +
             "SET @cmd = N'DBCC CHECKDB (' + QUOTENAME(@db) + N'" + repairPart + ") " + withPart + ";';\n" +
             "EXEC sys.sp_executesql @cmd;";
         return (sql, new Dictionary<string, object?> { ["@db"] = dbName });
+    }
+
+    /// <summary>
+    /// CHECKDB somente-leitura (diagnóstico/verificação) com fallback: se o snapshot interno não
+    /// puder ser criado (Msg 1823/7928 — disco cheio ou sem permissão na pasta de dados), repete
+    /// WITH TABLOCK, que usa bloqueios em vez do snapshot. Comum em cenários de emergência, onde
+    /// o disco cheio costuma ser justamente a causa do problema.
+    /// </summary>
+    private async Task<CommandExecutionResult> RunCheckDbStepAsync(
+        SqlSession s, DatabaseInfo db, IProgress<RepairLogEntry> p, string description, string dbName, CancellationToken ct)
+    {
+        var r = await RunStepAsync(s, db, p, description, Dbcc(dbName, repairOption: null, noInfoMsgs: true), ct);
+        if (!r.Success && r.ErrorMessages.Any(m => m.Contains("Msg 1823") || m.Contains("Msg 7928")))
+        {
+            Report(p, db.Name, RepairLogLevel.Warning,
+                "O CHECKDB não conseguiu criar o snapshot interno (disco cheio/sem permissão). Repetindo WITH TABLOCK...");
+            r = await RunStepAsync(s, db, p, description + " (TABLOCK)",
+                Dbcc(dbName, repairOption: null, noInfoMsgs: true, tablock: true), ct);
+        }
+        return r;
     }
 
     /// <summary>
