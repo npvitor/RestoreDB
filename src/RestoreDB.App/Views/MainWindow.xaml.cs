@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.IO;
 using System.Threading;
 using System.Windows;
@@ -63,6 +64,28 @@ public partial class MainWindow : Window
         LogPathText.Text = "Log: " + _logService.LogFilePath;
 
         Loaded += async (_, _) => await LoadDatabasesAsync();
+    }
+
+    /// <summary>
+    /// Fechar a janela no meio de uma operação pode deixar o banco em acesso restrito
+    /// (SINGLE_USER/EMERGENCY) sem a limpeza automática — exige confirmação explícita.
+    /// </summary>
+    protected override void OnClosing(CancelEventArgs e)
+    {
+        if (_busy)
+        {
+            var r = MessageBox.Show(
+                "Há uma operação EM ANDAMENTO. Fechar agora pode deixar o banco em acesso restrito " +
+                "(SINGLE_USER) ou em estado intermediário.\n\n" +
+                "Prefira usar 'Cancelar' e aguardar a operação terminar.\n\nFechar mesmo assim?",
+                "Operação em andamento", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+            if (r != MessageBoxResult.Yes)
+            {
+                e.Cancel = true;
+                return;
+            }
+        }
+        base.OnClosing(e);
     }
 
     // ------------------------------------------------------------------ Tema (claro/escuro)
@@ -172,6 +195,10 @@ public partial class MainWindow : Window
             RestorePanel.Visibility = Visibility.Collapsed;
             SalvagePanel.Visibility = Visibility.Collapsed;
             _salvageCopyName = null;
+            SalvageTableCombo.ItemsSource = null;
+            // Sem limpar, o combo mantém as tabelas do banco selecionado ANTERIORMENTE.
+            CheckTableCombo.ItemsSource = null;
+            CheckTableCombo.Text = string.Empty;
             PagesBox.Text = string.Empty;
             SimulateResultText.Visibility = Visibility.Collapsed;
             ForensicList.Visibility = Visibility.Collapsed;
@@ -325,6 +352,13 @@ public partial class MainWindow : Window
                 await ShowRestoreOptionAsync(db);
                 SafeRepairPanel.Visibility = Visibility.Visible;
                 ViewScriptButton.Visibility = Visibility.Visible;
+                // O suporte não tem como descobrir fileId:pageId sozinho — o diagnóstico já sabe.
+                if (diag.RecommendedAction == RecommendedActionKind.PageRestore)
+                    PagesBox.Text = string.Join(",", diag.SuspectPages
+                        .Where(p => p.IsActiveCorruption)
+                        .Select(p => $"{p.FileId}:{p.PageId}")
+                        .Distinct()
+                        .Take(100));
                 break;
 
             // Problema de LOG → reparo seguro (reconstrói o log sem Administrador) e, como
@@ -332,7 +366,7 @@ public partial class MainWindow : Window
             case RecommendedActionKind.RebuildLog:
                 SafeRepairPanel.Visibility = Visibility.Visible;
                 ViewScriptButton.Visibility = Visibility.Visible;
-                ShowLogRebuildOption(db);
+                ShowLogRebuildOption(db, force: true);
                 break;
 
             // Log cheio / pouco espaço: liberar espaço e religar (modo seguro).
@@ -617,6 +651,18 @@ public partial class MainWindow : Window
             return;
         }
 
+        // Diferencial/log sozinho normalmente não restaura (exige o FULL antes) — orienta o usuário.
+        if (!string.Equals(set.BackupTypeCode, "D", StringComparison.OrdinalIgnoreCase))
+        {
+            var proceed = MessageBox.Show(
+                "O conjunto selecionado NÃO é um backup COMPLETO (é diferencial ou de log). Sozinho, ele " +
+                "normalmente não pode ser restaurado.\n\n" +
+                "Recomendado: use 'Restaurar cadeia completa', que monta FULL → diferencial → logs automaticamente.\n\n" +
+                "Continuar mesmo assim (uso avançado)?",
+                "Backup não é FULL", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+            if (proceed != MessageBoxResult.Yes) return;
+        }
+
         var confirm = MessageBox.Show(
             $"Restaurar o banco \"{db.Name}\" a partir do backup selecionado?\n\n" +
             $"{set.Display}\n\n" +
@@ -647,7 +693,9 @@ public partial class MainWindow : Window
                 {
                     new RestorePiece
                     {
-                        DiskPath = set.PhysicalDevice,
+                        DiskPath = set.AllDevices.Count > 0 ? set.AllDevices[0] : set.PhysicalDevice,
+                        // Backup striped (dividido em vários arquivos): todos os volumes são necessários.
+                        AdditionalDevices = set.AllDevices.Skip(1).ToList(),
                         Position = set.Position,
                         IsLog = string.Equals(set.BackupTypeCode, "L", StringComparison.OrdinalIgnoreCase)
                     }
@@ -680,6 +728,12 @@ public partial class MainWindow : Window
             ShowError("Selecione um backup na lista para testar.", new InvalidOperationException("Nenhum backup selecionado."));
             return;
         }
+        if (!string.Equals(set.BackupTypeCode, "D", StringComparison.OrdinalIgnoreCase))
+        {
+            ShowError("O teste de restauração precisa de um backup COMPLETO (full). Selecione um conjunto FULL na lista.",
+                new InvalidOperationException("Conjunto selecionado não é FULL."));
+            return;
+        }
         _ = RunTestRestoreAsync(db, set);
     }
 
@@ -693,7 +747,13 @@ public partial class MainWindow : Window
         {
             var pieces = new List<RestorePiece>
             {
-                new() { DiskPath = set.PhysicalDevice, Position = set.Position, IsLog = false }
+                new()
+                {
+                    DiskPath = set.AllDevices.Count > 0 ? set.AllDevices[0] : set.PhysicalDevice,
+                    AdditionalDevices = set.AllDevices.Skip(1).ToList(),
+                    Position = set.Position,
+                    IsLog = false
+                }
             };
             var result = await _restoreService.TestRestoreAsync(db.Name, pieces, _connectionString, _progress, _cts!.Token);
             // É um teste: não altera o estado do banco real; mostra só o resultado.
@@ -719,20 +779,31 @@ public partial class MainWindow : Window
     private void PointInTimeCheck_Changed(object sender, RoutedEventArgs e)
         => PointInTimeRow.Visibility = PointInTimeCheck.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
 
-    /// <summary>Alvo de ponto-no-tempo (STOPAT) quando o usuário marcou a opção; senão null (mais recente).</summary>
-    private DateTime? GetPointInTimeTarget()
+    /// <summary>
+    /// Alvo de ponto-no-tempo (STOPAT). Devolve false quando a opção está marcada mas incompleta —
+    /// prosseguir silenciosamente restauraria "até o mais recente", contrariando a intenção do usuário.
+    /// </summary>
+    private bool TryGetPointInTimeTarget(out DateTime? target)
     {
-        if (PointInTimeCheck.IsChecked != true) return null;
-        if (StopAtDate.SelectedDate is not DateTime d) return null;
+        target = null;
+        if (PointInTimeCheck.IsChecked != true) return true;
+        if (StopAtDate.SelectedDate is not DateTime d)
+        {
+            ShowError("A opção 'Restaurar até um ponto no tempo' está marcada, mas a DATA não foi informada. " +
+                      "Informe a data (e a hora) ou desmarque a opção.",
+                new InvalidOperationException("Data do STOPAT não informada."));
+            return false;
+        }
         if (!TimeSpan.TryParse(StopAtTime.Text?.Trim(), out var t)) t = new TimeSpan(23, 59, 59);
-        return d.Date + t;
+        target = d.Date + t;
+        return true;
     }
 
     private void RestoreChainButton_Click(object sender, RoutedEventArgs e)
     {
         if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
 
-        var target = GetPointInTimeTarget();
+        if (!TryGetPointInTimeTarget(out var target)) return;
         var alvo = target.HasValue ? $"até {target.Value:yyyy-MM-dd HH:mm:ss}" : "até o ponto mais recente";
         var confirm = MessageBox.Show(
             $"Restaurar o banco \"{db.Name}\" pela CADEIA COMPLETA {alvo}?\n\n" +
@@ -808,11 +879,13 @@ public partial class MainWindow : Window
             StatusText.Text = result.Message;
             if (ok)
             {
-                _salvageCopyName = db.Name + "_Recuperado";
-                await LoadDatabasesAsync(); // a cópia aparece na lista (reseleciona e reseta os painéis)
-                // Mostra o assistente de salvamento DEPOIS do reload (que reseta os painéis).
-                SalvageHintText.Text = $"Cópia [{_salvageCopyName}] criada. Selecione uma tabela e traga de volta ao banco vivo \"{db.Name}\" as linhas que faltam (por chave primária, sem duplicar).";
-                await PopulateSalvageTablesAsync(db.Name);
+                var copyName = db.Name + "_Recuperado";
+                await LoadDatabasesAsync(); // a cópia aparece na lista (reseleciona e RESETA os painéis)
+                // O reset acima anula _salvageCopyName — atribuir somente DEPOIS do reload.
+                _salvageCopyName = copyName;
+                SalvageHintText.Text = $"Cópia [{copyName}] criada. Selecione uma tabela e traga de volta ao banco vivo \"{db.Name}\" as linhas que faltam (por chave primária, sem duplicar).";
+                // Lista as tabelas a partir da CÓPIA (íntegra) — o banco vivo pode estar inacessível.
+                await PopulateSalvageTablesAsync(copyName);
                 RestorePanel.Visibility = Visibility.Visible;
                 SalvagePanel.Visibility = Visibility.Visible;
             }
@@ -952,6 +1025,7 @@ public partial class MainWindow : Window
     private void RestoreStandbyButton_Click(object sender, RoutedEventArgs e)
     {
         if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+        if (!TryGetPointInTimeTarget(out var standbyTarget)) return;
 
         var confirm = MessageBox.Show(
             $"Restaurar \"{db.Name}\" em modo STANDBY (somente leitura)?\n\n" +
@@ -961,10 +1035,10 @@ public partial class MainWindow : Window
             MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
 
         if (confirm == MessageBoxResult.Yes)
-            _ = RunStandbyAsync(db);
+            _ = RunStandbyAsync(db, standbyTarget);
     }
 
-    private async Task RunStandbyAsync(DatabaseInfo db)
+    private async Task RunStandbyAsync(DatabaseInfo db, DateTime? target)
     {
         if (_busy) return;
         SetBusy(true);
@@ -972,7 +1046,7 @@ public partial class MainWindow : Window
         StatusText.Text = $"Restaurando \"{db.Name}\" em STANDBY...";
         try
         {
-            var result = await _restoreService.RestoreToStandbyAsync(db.Name, GetPointInTimeTarget(), _connectionString, _progress, _cts!.Token);
+            var result = await _restoreService.RestoreToStandbyAsync(db.Name, target, _connectionString, _progress, _cts!.Token);
             HandleRepairResult(db, result);
             StatusText.Text = result.Message;
         }
@@ -1154,8 +1228,29 @@ public partial class MainWindow : Window
         var mdf = dlg.FileName;
         var name = Path.GetFileNameWithoutExtension(mdf);
         var dir = Path.GetDirectoryName(mdf) ?? string.Empty;
-        var ldfGuess = Path.Combine(dir, name + "_log.ldf");
-        string? ldf = File.Exists(ldfGuess) ? ldfGuess : null;
+
+        // Procura o .ldf pelos padrões comuns; se não achar, oferece localizar manualmente antes
+        // de recriar o log (recriar descarta transações não confirmadas).
+        string? ldf = new[] { name + "_log.ldf", name + "_1.ldf", name + ".ldf" }
+            .Select(n => Path.Combine(dir, n)).FirstOrDefault(File.Exists);
+        if (ldf is null)
+        {
+            var find = MessageBox.Show(
+                "O arquivo de log (.ldf) não foi encontrado ao lado do .mdf.\n\n" +
+                "Deseja LOCALIZÁ-LO manualmente? (Se não, um log NOVO será recriado — transações não " +
+                "confirmadas podem ser perdidas.)",
+                "Arquivo de log não encontrado", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.Yes);
+            if (find == MessageBoxResult.Yes)
+            {
+                var ldfDlg = new OpenFileDialog
+                {
+                    Title = "Escolher o arquivo de log (.ldf)",
+                    InitialDirectory = dir,
+                    Filter = "Arquivo de log SQL (*.ldf)|*.ldf|Todos os arquivos (*.*)|*.*"
+                };
+                if (ldfDlg.ShowDialog(this) == true) ldf = ldfDlg.FileName;
+            }
+        }
         var rebuild = ldf is null;
 
         var confirm = MessageBox.Show(
@@ -1288,7 +1383,9 @@ public partial class MainWindow : Window
 
         var confirm = MessageBox.Show(
             $"Você está prestes a executar o reparo COM POSSÍVEL PERDA DE DADOS no banco \"{db.Name}\".\n\n" +
-            "Esta operação pode descartar dados corrompidos de forma irreversível.\n\n" +
+            "Esta operação pode descartar dados corrompidos. Antes de executar, a ferramenta tentará " +
+            "preservar as transações mais recentes (tail-log) e criar um backup de segurança; ao final, " +
+            "um backup FULL novo é gerado. Os arquivos ficam na pasta padrão de backups do servidor.\n\n" +
             "Deseja continuar?",
             "Confirmar reparo com perda de dados",
             MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
@@ -1336,10 +1433,18 @@ public partial class MainWindow : Window
         }
     }
 
-    /// <summary>Exibe a opção de último recurso (reconstruir o log), exceto em bancos de sistema.</summary>
-    private void ShowLogRebuildOption(DatabaseInfo db)
+    /// <summary>
+    /// Exibe a opção de último recurso (reconstruir o log). Só faz sentido quando o problema
+    /// envolve o log/recuperação (SUSPECT/RECOVERY_PENDING/EMERGENCY) ou quando o diagnóstico a
+    /// recomendou (<paramref name="force"/>) — oferecê-la após qualquer falha induziria um usuário
+    /// de suporte a uma operação destrutiva inadequada (ex.: corrupção de dados num banco ONLINE,
+    /// cujo caminho correto é restaurar de backup). Nunca em bancos de sistema.
+    /// </summary>
+    private void ShowLogRebuildOption(DatabaseInfo db, bool force = false)
     {
-        if (db.IsSystemDatabase)
+        var state = db.StateDesc.Trim().ToUpperInvariant();
+        var applies = force || state is "SUSPECT" or "RECOVERY_PENDING" or "EMERGENCY";
+        if (db.IsSystemDatabase || !applies)
         {
             LogRebuildPanel.Visibility = Visibility.Collapsed;
             return;
@@ -1361,7 +1466,8 @@ public partial class MainWindow : Window
                 ResultPanel.SetResourceReference(Border.BackgroundProperty, "OkBackBrush");
                 ResultPanel.SetResourceReference(Border.BorderBrushProperty, "OkForeBrush");
                 ResultText.SetResourceReference(TextBlock.ForegroundProperty, "OkForeBrush");
-                DiagnosePanel.Visibility = Visibility.Collapsed;
+                // O diagnóstico permanece disponível: recomenda-se re-verificar após o reparo.
+                DiagnosePanel.Visibility = Visibility.Visible;
                 DiagnosisResultPanel.Visibility = Visibility.Collapsed;
                 RepairOptionsTitle.Visibility = Visibility.Collapsed;
                 SafeRepairPanel.Visibility = Visibility.Collapsed;
@@ -1383,8 +1489,10 @@ public partial class MainWindow : Window
                 DataLossPanel.Visibility = Visibility.Visible;
                 DataLossConfirmCheck.IsChecked = false;
                 DataLossRepairButton.IsEnabled = false;
-                // E também oferece o último recurso (reconstruir o log) como alternativa —
-                // útil quando o problema é o próprio log de transações (ex.: RECOVERY_PENDING).
+                // A alternativa que preserva 100% dos dados (restaurar de backup) fica visível
+                // LADO A LADO com a confirmação de perda — o usuário decide vendo as duas.
+                _ = ShowRestoreOptionAsync(db);
+                // E o último recurso (reconstruir o log) quando o estado indicar problema de log.
                 ShowLogRebuildOption(db);
                 break;
 

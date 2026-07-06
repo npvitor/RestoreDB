@@ -146,7 +146,7 @@
                                         Style="{StaticResource FlatButton}" Height="48" FontSize="15" Click="DiagnoseButton_Click" />
                                 <CheckBox x:Name="PhysicalOnlyCheck" Content="Verificação rápida (PHYSICAL_ONLY) — para bancos muito grandes"
                                           Margin="0,8,0,0" Foreground="{DynamicResource MutedTextBrush}" />
-                                <TextBlock Text="Verificação completa SEM alterar nada: DBCC CHECKDB (consistência física), CHECKCONSTRAINTS (chaves estrangeiras/CHECK), CHECKCATALOG (metadados), páginas suspeitas e log de erros. Detecta corrupção mesmo em bancos que parecem saudáveis (ONLINE)."
+                                <TextBlock Text="Verificação completa SEM alterar nada: DBCC CHECKDB com DATA_PURITY (consistência física e valores inválidos), CHECKCONSTRAINTS (chaves estrangeiras/CHECK), CHECKCATALOG (metadados), páginas suspeitas e log de erros. Detecta corrupção mesmo em bancos que parecem saudáveis (ONLINE). Se houver corrupção física, as checagens lógicas são adiadas até o reparo."
                                            Foreground="{DynamicResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,8,0,0" />
 
                                 <!-- Verificações avançadas (dirigidas) -->
@@ -390,7 +390,7 @@
                                     <TextBlock Text="⚠ ATENÇÃO: REPARO COM POSSÍVEL PERDA DE DADOS"
                                                FontWeight="Bold" Foreground="{DynamicResource DangerDarkBrush}" TextWrapping="Wrap" />
                                     <TextBlock Margin="0,8,0,0" Foreground="{DynamicResource DangerDarkBrush}" TextWrapping="Wrap"
-                                               Text="O reparo seguro não foi suficiente. A próxima etapa usa DBCC CHECKDB com REPAIR_ALLOW_DATA_LOSS, que pode DESCARTAR dados corrompidos para tornar o banco consistente. Tentaremos um backup de segurança antes, mas ele pode não ser possível." />
+                                               Text="O reparo seguro não foi suficiente. A próxima etapa usa DBCC CHECKDB com REPAIR_ALLOW_DATA_LOSS, que pode DESCARTAR dados corrompidos para tornar o banco consistente. Antes de executar, a ferramenta preserva automaticamente o que for possível: as transações mais recentes (tail-log) e um backup de segurança — se houver cadeia de backups, os dados descartados podem ser recuperados depois. Ao final, um backup FULL novo é criado (a cadeia antiga deixa de valer). Se existir backup íntegro, RESTAURAR (abaixo) preserva 100% dos dados." />
                                     <Button x:Name="SimulateRepairButton" Content="🔬  Simular antes (pré-visualizar a perda, sem tocar no banco)"
                                             Style="{StaticResource SecondaryButton}" Height="42" Margin="0,12,0,0"
                                             Click="SimulateRepairButton_Click" />

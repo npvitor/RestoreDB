@@ -72,8 +72,16 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         {
             result.Success = false;
             result.Exception = ex;
+            // A exceção de um DBCC traz TODAS as mensagens misturadas (ex.: milhares de
+            // "DBCC results for..."). Severidade <= 10 é informativa — vai para InfoMessages,
+            // para o registro da UI não pintar tudo de vermelho e esconder os erros reais.
             foreach (SqlError err in ex.Errors)
-                result.ErrorMessages.Add(FormatMessage(err));
+            {
+                if (err.Class <= 10) infos.Add(FormatMessage(err));
+                else result.ErrorMessages.Add(FormatMessage(err));
+            }
+            if (result.ErrorMessages.Count == 0)
+                result.ErrorMessages.Add(ex.Message);
         }
         catch (Exception ex)
         {
