@@ -17,6 +17,19 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
     internal SqlSession(SqlConnection connection) => _connection = connection;
 
     /// <summary>
+    /// Garante a conexão aberta antes de um comando. Erros SEVEROS (ex.: 824 ao ler uma página
+    /// corrompida) DERRUBAM a conexão — sem isso, todos os passos seguintes do reparo falhariam
+    /// com "connection closed". Reabrir volta o contexto a master (perde USE/vaga SINGLE_USER,
+    /// mas as opções do banco persistem e os comandos qualificam o banco explicitamente).
+    /// </summary>
+    private async Task EnsureOpenAsync(CancellationToken ct)
+    {
+        if (_connection.State == System.Data.ConnectionState.Open) return;
+        try { _connection.Close(); } catch { /* estado Broken */ }
+        await _connection.OpenAsync(ct);
+    }
+
+    /// <summary>
     /// Executa um comando T-SQL capturando mensagens informativas (PRINT / DBCC) e de erro.
     /// Não lança em erros do servidor: devolve Success=false e a lista de mensagens, para
     /// que a camada de serviço decida o escalonamento. Cancelamento é propagado.
@@ -40,6 +53,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         _connection.InfoMessage += OnInfoMessage;
         try
         {
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = timeoutSeconds };
             if (parameters is not null)
             {
@@ -103,6 +117,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
     public async Task<string> GetDatabaseStateAsync(string databaseName, CancellationToken ct = default)
     {
         const string sql = "SELECT state_desc FROM sys.databases WHERE name = @db;";
+        await EnsureOpenAsync(ct);
         await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
         cmd.Parameters.AddWithValue("@db", databaseName);
         var value = await cmd.ExecuteScalarAsync(ct);
@@ -118,6 +133,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
     {
         try
         {
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(
                 "DELETE FROM msdb.dbo.suspect_pages WHERE database_id = DB_ID(@db);", _connection)
             { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
@@ -132,6 +148,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
     {
         try
         {
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(
                 "SELECT recovery_model_desc FROM sys.databases WHERE name = @db;", _connection)
             { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
@@ -226,6 +243,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
             "FROM sys.master_files AS mf WHERE mf.database_id = DB_ID(@db) ORDER BY mf.type, mf.file_id;";
 
         var list = new List<DatabaseFile>();
+        await EnsureOpenAsync(ct);
         await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
         cmd.Parameters.AddWithValue("@db", databaseName);
         await using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -371,6 +389,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
             "SET @cmd = N'DBCC CHECKDB (' + QUOTENAME(@db) + N'" + repairPart + ") WITH " + withOpts + ";';\n" +
             "EXEC sys.sp_executesql @cmd;";
 
+        await EnsureOpenAsync(ct);
         await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
         cmd.Parameters.AddWithValue("@db", databaseName);
         await using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -843,6 +862,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
                 "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
                 "DECLARE @stmt nvarchar(max) = N'DBCC CHECKCONSTRAINTS WITH ALL_CONSTRAINTS, ALL_ERRORMSGS;';\n" +
                 "EXEC @proc @stmt;";
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@db", databaseName);
             await using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -989,6 +1009,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         if (objectId == 0) return string.Empty;
         try
         {
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand("SELECT OBJECT_NAME(@oid, DB_ID(@db));", _connection)
             { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@oid", objectId);
@@ -1008,6 +1029,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
                 "DECLARE @cmd nvarchar(max);\n" +
                 "SET @cmd = N'SELECT name FROM ' + QUOTENAME(@db) + N'.sys.indexes WHERE object_id=@o AND index_id=@i';\n" +
                 "EXEC sys.sp_executesql @cmd, N'@o int, @i int', @o = @oid, @i = @iid;";
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@db", databaseName);
             cmd.Parameters.AddWithValue("@oid", objectId);

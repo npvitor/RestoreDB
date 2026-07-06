@@ -351,6 +351,15 @@ public sealed class RepairService
                 "Verificação de integridade lógica adiada (banco inacessível neste estado).");
             return;
         }
+        if (diag.CheckDb.HasErrors)
+        {
+            // CHECKCONSTRAINTS lê os dados pelos índices — com páginas corrompidas, um 824
+            // (severidade 24) derrubaria a conexão. Repare o físico primeiro; a checagem
+            // lógica roda na próxima verificação (e a reconciliação pós-reparo já cobre FKs).
+            Report(progress, db.Name, RepairLogLevel.Info,
+                "Verificação de integridade lógica adiada (há corrupção FÍSICA — repare-a primeiro).");
+            return;
+        }
 
         Report(progress, db.Name, RepairLogLevel.Info, "Verificando integridade LÓGICA (DBCC CHECKCATALOG / CHECKCONSTRAINTS)...");
 
@@ -781,7 +790,10 @@ public sealed class RepairService
         var report = await s.CheckDbWithResultsAsync(db.Name, repairOption: null, ct);
         var hasPhysical = report is { Executed: true, HasErrors: true };
 
-        var violations = await s.CheckConstraintsAsync(db.Name, ct);
+        // Com corrupção FÍSICA presente, o CHECKCONSTRAINTS é adiado: ele LÊ os dados pelos
+        // índices corrompidos e um erro 824 (severidade 24) DERRUBA a conexão da sessão.
+        // O físico é reparado primeiro; a reconciliação lógica já roda após o reparo.
+        var violations = hasPhysical ? new List<ConstraintViolation>() : await s.CheckConstraintsAsync(db.Name, ct);
         var fkViolations = violations.Where(v => v.IsForeignKey).ToList();
 
         if (!hasPhysical && violations.Count == 0)
