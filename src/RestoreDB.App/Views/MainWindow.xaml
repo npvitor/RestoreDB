@@ -158,10 +158,10 @@
                                         <ComboBox x:Name="CheckTableCombo" Height="28" Margin="0,6,0,0" IsEditable="True"
                                                   DropDownOpened="CheckTableCombo_DropDownOpened" />
                                         <Button x:Name="CheckTableButton" Content="Verificar tabela (CHECKTABLE)"
-                                                Style="{StaticResource SecondaryButton}" Height="36" Margin="0,6,0,0"
+                                                Style="{StaticResource SecondaryButton}" Height="40" Margin="0,6,0,0"
                                                 Click="CheckTableButton_Click" />
                                         <Button x:Name="ReseedButton" Content="Reajustar identidades (CHECKIDENT RESEED)"
-                                                Style="{StaticResource SecondaryButton}" Height="36" Margin="0,6,0,0"
+                                                Style="{StaticResource SecondaryButton}" Height="40" Margin="0,6,0,0"
                                                 Click="ReseedButton_Click" />
                                         <TextBlock Text="O reajuste de identidade é útil após remoção de linhas (reparo com perda / salvamento)."
                                                    Foreground="{DynamicResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,6,0,0" />
@@ -175,16 +175,16 @@
                                         <TextBlock Text="Manutenção preventiva: desfragmenta índices (REORGANIZE/REBUILD) e atualiza estatísticas."
                                                    Foreground="{DynamicResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" />
                                         <Button x:Name="MaintainButton" Content="Otimizar índices e estatísticas"
-                                                Style="{StaticResource SecondaryButton}" Height="36" Margin="0,6,0,0"
+                                                Style="{StaticResource SecondaryButton}" Height="40" Margin="0,6,0,0"
                                                 Click="MaintainButton_Click" />
                                         <Button x:Name="ScheduleButton" Content="Configurar verificação agendada (gerar comando)"
-                                                Style="{StaticResource SecondaryButton}" Height="36" Margin="0,6,0,0"
+                                                Style="{StaticResource SecondaryButton}" Height="40" Margin="0,6,0,0"
                                                 Click="ScheduleButton_Click" />
 
                                         <TextBlock Text="Recuperar de exclusão acidental: lista DELETE/DROP/TRUNCATE recentes no log e restaura até logo antes."
                                                    Foreground="{DynamicResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,10,0,0" />
                                         <Button x:Name="ForensicButton" Content="Procurar exclusões recentes no log"
-                                                Style="{StaticResource SecondaryButton}" Height="36" Margin="0,6,0,0"
+                                                Style="{StaticResource SecondaryButton}" Height="40" Margin="0,6,0,0"
                                                 Click="ForensicButton_Click" />
                                         <ListBox x:Name="ForensicList" Height="92" Margin="0,6,0,0" Visibility="Collapsed"
                                                  Background="{DynamicResource CardBrush}" DisplayMemberPath="Display"
@@ -280,7 +280,7 @@
                                               Content="Entendo e autorizo a remoção dos registros órfãos."
                                               Checked="ConstraintFixConfirmCheck_Changed" Unchecked="ConstraintFixConfirmCheck_Changed" />
                                     <Button x:Name="ConstraintFixButton" Content="Corrigir integridade (remover registros órfãos)"
-                                            Style="{StaticResource DangerButton}" Height="42" Margin="0,12,0,0"
+                                            Style="{StaticResource DangerButton}" Height="40" Margin="0,12,0,0"
                                             IsEnabled="False" Click="ConstraintFixButton_Click" />
                                 </StackPanel>
                             </Border>
@@ -288,14 +288,14 @@
                             <!-- [PRIMÁRIO p/ OFFLINE/RESTORING/etc.] Reparo seguro -->
                             <StackPanel x:Name="SafeRepairPanel" Visibility="Collapsed" Margin="0,8,0,0">
                                 <Button x:Name="SafeRepairButton" Content="Reparar (modo seguro, sem perda de dados)"
-                                        Style="{StaticResource FlatButton}" Height="44" Click="SafeRepairButton_Click" />
+                                        Style="{StaticResource FlatButton}" Height="40" Click="SafeRepairButton_Click" />
                                 <TextBlock Text="Tentaremos primeiro a abordagem mais segura: religar / recuperar e, se necessário, DBCC CHECKDB com REPAIR_REBUILD."
                                            Foreground="{DynamicResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,8,0,0" />
                             </StackPanel>
 
                             <!-- Ver script planejado (dry-run) -->
                             <Button x:Name="ViewScriptButton" Visibility="Collapsed" Content="Ver script planejado (não executa nada)"
-                                    Style="{StaticResource SecondaryButton}" Height="44" Margin="0,10,0,0"
+                                    Style="{StaticResource SecondaryButton}" Height="40" Margin="0,10,0,0"
                                     Click="ViewScriptButton_Click" />
 
                             <!-- [PRIMÁRIO p/ corrupção de DADOS] Restaurar de backup -->
