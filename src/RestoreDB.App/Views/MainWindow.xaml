@@ -92,7 +92,7 @@
             <Border Grid.Column="2" Background="{DynamicResource CardBrush}" BorderBrush="{DynamicResource LineBrush}"
                     BorderThickness="1" CornerRadius="6" Padding="22,18">
                 <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="0,0,8,0">
-                    <StackPanel MaxWidth="840" HorizontalAlignment="Left">
+                    <StackPanel MaxWidth="1400" HorizontalAlignment="Left">
                         <TextBlock Text="Diagnóstico, reparo e restauração" Style="{StaticResource HeaderText}" FontSize="17" Margin="0,0,0,4" />
                         <TextBlock Text="Selecione um banco à esquerda, diagnostique e siga a ação recomendada. Operações destrutivas sempre pedem confirmação."
                                    Foreground="{DynamicResource MutedTextBrush}" FontSize="12" TextWrapping="Wrap" Margin="0,0,0,14" />
@@ -102,8 +102,15 @@
                                    Text="Selecione um banco na lista para ver os detalhes."
                                    Foreground="{DynamicResource MutedTextBrush}" TextWrapping="Wrap" />
 
-                        <!-- Detalhes -->
-                        <StackPanel x:Name="DetailsPanel" Visibility="Collapsed">
+                        <!-- Detalhes: 2 colunas — diagnóstico à esquerda, resolução à direita (aproveita widescreen) -->
+                        <Grid x:Name="DetailsPanel" Visibility="Collapsed">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+
+                            <!-- Coluna esquerda: estado + diagnóstico (Passo 1) + resultado -->
+                            <StackPanel Grid.Column="0" VerticalAlignment="Top">
                             <TextBlock x:Name="DbNameText" FontSize="18" FontWeight="Bold"
                                        Foreground="{DynamicResource PrimaryDarkBrush}" TextWrapping="Wrap" />
 
@@ -248,9 +255,13 @@
                                 </StackPanel>
                             </Border>
 
+                            </StackPanel>
+
+                            <!-- Coluna direita: como resolver (Passo 2) — reparo / restauração -->
+                            <StackPanel Grid.Column="1" VerticalAlignment="Top" Margin="24,0,0,0">
                             <!-- Cabeçalho das opções de reparo (aparece só após o diagnóstico) -->
                             <TextBlock x:Name="RepairOptionsTitle" Visibility="Collapsed" Text="PASSO 2 — COMO RESOLVER"
-                                       Style="{StaticResource FieldLabel}" Margin="0,20,0,0" />
+                                       Style="{StaticResource FieldLabel}" Margin="0,0,0,0" />
 
                             <!-- [PRIMÁRIO p/ corrupção só de índice] Reparo SEM perda: reconstrução de índices -->
                             <Border x:Name="IndexRepairPanel" Visibility="Collapsed" Margin="0,8,0,0"
@@ -454,7 +465,8 @@
                                             IsEnabled="False" Click="LogRebuildButton_Click" />
                                 </StackPanel>
                             </Border>
-                        </StackPanel>
+                            </StackPanel>
+                        </Grid>
 
                         <ProgressBar x:Name="RepairBusyBar" IsIndeterminate="True" Height="5" Margin="0,16,0,0"
                                      Visibility="Collapsed" Foreground="{DynamicResource PrimaryBrush}" />
