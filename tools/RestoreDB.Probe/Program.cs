@@ -9,7 +9,7 @@ using RestoreDB.Services;
 //   diagnose <db>
 //   repair-indexes <db>
 //   repair <db> [dataloss]
-//   fix-constraints <db>
+//   fix-constraints <db> [bakPath]   (bakPath opcional: .bak para recuperar registros-pai)
 //   restore <db> <bakPath> [replace]
 //   restore-pit <db> [yyyy-MM-ddTHH:mm:ss | now] [notail]
 //   test-restore <db> <bakPath>
@@ -62,7 +62,7 @@ switch (cmd)
 
     case "diagnose":
     {
-        var diag = await new RepairService(log).DiagnoseAsync(db, conn, progress);
+        var diag = await new RepairService(log, new RestoreService(log)).DiagnoseAsync(db, conn, progress);
         Console.WriteLine($"RESULT: action={diag.RecommendedAction} indexOnly={diag.IndexOnlyRepairPossible} " +
                           $"data={diag.DataCorruptionSuspected} log={diag.LogCorruptionSuspected} " +
                           $"logical={diag.LogicalCorruptionSuspected} fkViolacoes={diag.ForeignKeyViolations.Count} " +
@@ -97,7 +97,7 @@ switch (cmd)
 
     case "simulate-repair":
     {
-        var r = await new RepairService(log).SimulateRepairAsync(db, conn, progress);
+        var r = await new RepairService(log, new RestoreService(log)).SimulateRepairAsync(db, conn, progress);
         Console.WriteLine($"RESULT: executed={r.Executed} perdaTotal={r.TotalRowsLost} tabelasAfetadas={r.AffectedTables.Count} checkdbLimpoDepois={r.CheckDbCleanAfter}");
         Console.WriteLine($"SUMMARY: {r.Message}");
         return r.Executed ? 0 : 1;
@@ -105,14 +105,17 @@ switch (cmd)
 
     case "fix-constraints":
     {
-        var r = await new RepairService(log).FixConstraintViolationsAsync(db, conn, progress);
+        // arg opcional [bakPath]: força a recuperação de registros-pai a partir desse .bak (senão, automático).
+        var recoveryBak = args.Length > 2 ? args[2] : null;
+        var opts = recoveryBak is null ? null : new ParentRecoveryOptions { InitialBackupPath = recoveryBak };
+        var r = await new RepairService(log, new RestoreService(log)).FixConstraintViolationsAsync(db, conn, progress, default, opts);
         Console.WriteLine($"RESULT: {r.Status} | {r.Message}");
         return r.Status is RepairStatus.Success or RepairStatus.NoActionNeeded ? 0 : 1;
     }
 
     case "repair-indexes":
     {
-        var r = await new RepairService(log).RebuildIndexesAsync(db, conn, progress);
+        var r = await new RepairService(log, new RestoreService(log)).RebuildIndexesAsync(db, conn, progress);
         Console.WriteLine($"RESULT: {r.Status} | {r.Message}");
         return r.Status is RepairStatus.Success or RepairStatus.NoActionNeeded ? 0 : 1;
     }
@@ -120,7 +123,7 @@ switch (cmd)
     case "repair":
     {
         var dataloss = args.Length > 2 && args[2].Equals("dataloss", StringComparison.OrdinalIgnoreCase);
-        var r = await new RepairService(log).RepairAsync(db, conn, dataloss, progress);
+        var r = await new RepairService(log, new RestoreService(log)).RepairAsync(db, conn, dataloss, progress);
         Console.WriteLine($"RESULT: {r.Status} | {r.Message}");
         return r.Status is RepairStatus.Success or RepairStatus.NoActionNeeded ? 0 : 1;
     }
@@ -220,21 +223,21 @@ switch (cmd)
     case "check-table":
     {
         if (args.Length < 3) { Console.Error.WriteLine("check-table exige <schema.table>"); return 2; }
-        var rep = await new RepairService(log).CheckTableAsync(db, args[2], conn, progress);
+        var rep = await new RepairService(log, new RestoreService(log)).CheckTableAsync(db, args[2], conn, progress);
         Console.WriteLine($"RESULT: executed={rep.Executed} erros={rep.ErrorCount} minRepair={rep.MinRepairLevel}");
         return rep.Executed && !rep.HasErrors ? 0 : 1;
     }
 
     case "reseed":
     {
-        var n = await new RepairService(log).ReseedIdentitiesAsync(db, conn, progress);
+        var n = await new RepairService(log, new RestoreService(log)).ReseedIdentitiesAsync(db, conn, progress);
         Console.WriteLine($"RESULT: tabelas_reseed={n}");
         return 0;
     }
 
     case "rebuild-log":
     {
-        var r = await new RepairService(log).RebuildTransactionLogAsync(db, conn, progress);
+        var r = await new RepairService(log, new RestoreService(log)).RebuildTransactionLogAsync(db, conn, progress);
         Console.WriteLine($"RESULT: {r.Status} | {r.Message}");
         return r.Status == RepairStatus.Success ? 0 : 1;
     }

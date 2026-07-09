@@ -276,6 +276,18 @@
                                                FontWeight="Bold" Foreground="{DynamicResource WarnForeBrush}" TextWrapping="Wrap" />
                                     <TextBlock x:Name="ConstraintFixText" Margin="0,8,0,0" Foreground="{DynamicResource WarnForeBrush}" TextWrapping="Wrap"
                                                Text="Há linhas cuja chave estrangeira aponta para um registro inexistente (o DBCC CHECKDB não detecta isso). A correção REMOVE essas linhas órfãs para restaurar a integridade — operação destrutiva, com backup de segurança antes. Para preservar 100% dos registros, prefira restaurar de backup." />
+                                    <StackPanel Margin="0,12,0,0">
+                                        <TextBlock Text="RECUPERAÇÃO DE REGISTROS-PAI (OPCIONAL)" Style="{StaticResource FieldLabel}" Foreground="{DynamicResource WarnForeBrush}" />
+                                        <StackPanel Orientation="Horizontal">
+                                            <Button x:Name="ChooseRecoveryBakFixButton" Content="📁 Escolher .bak…"
+                                                    Style="{StaticResource SecondaryButton}" Height="34" Click="ChooseRecoveryBackupButton_Click" />
+                                            <Button x:Name="ClearRecoveryBakFixButton" Content="↺ Automático"
+                                                    Style="{StaticResource SecondaryButton}" Height="34" Margin="8,0,0,0" Click="ClearRecoveryBackupButton_Click" />
+                                        </StackPanel>
+                                        <TextBlock x:Name="RecoveryBakFixText" FontSize="11" TextWrapping="Wrap" Margin="0,6,0,0"
+                                                   Foreground="{DynamicResource WarnForeBrush}"
+                                                   Text="Automático: usa o backup FULL mais recente do histórico. Escolha um .bak se o backup estiver em outra mídia (o SQL Server precisa conseguir lê-lo)." />
+                                    </StackPanel>
                                     <CheckBox x:Name="ConstraintFixConfirmCheck" Margin="0,12,0,0" Foreground="{DynamicResource WarnForeBrush}"
                                               Content="Entendo e autorizo a remoção dos registros órfãos."
                                               Checked="ConstraintFixConfirmCheck_Changed" Unchecked="ConstraintFixConfirmCheck_Changed" />
@@ -396,6 +408,18 @@
                                             Click="SimulateRepairButton_Click" />
                                     <TextBlock x:Name="SimulateResultText" Visibility="Collapsed" Margin="0,8,0,0" FontWeight="SemiBold"
                                                Foreground="{DynamicResource DangerDarkBrush}" TextWrapping="Wrap" />
+                                    <StackPanel Margin="0,12,0,0">
+                                        <TextBlock Text="RECUPERAÇÃO DE REGISTROS-PAI (OPCIONAL)" Style="{StaticResource FieldLabel}" Foreground="{DynamicResource DangerDarkBrush}" />
+                                        <StackPanel Orientation="Horizontal">
+                                            <Button x:Name="ChooseRecoveryBakLossButton" Content="📁 Escolher .bak…"
+                                                    Style="{StaticResource SecondaryButton}" Height="34" Click="ChooseRecoveryBackupButton_Click" />
+                                            <Button x:Name="ClearRecoveryBakLossButton" Content="↺ Automático"
+                                                    Style="{StaticResource SecondaryButton}" Height="34" Margin="8,0,0,0" Click="ClearRecoveryBackupButton_Click" />
+                                        </StackPanel>
+                                        <TextBlock x:Name="RecoveryBakLossText" FontSize="11" TextWrapping="Wrap" Margin="0,6,0,0"
+                                                   Foreground="{DynamicResource DangerDarkBrush}"
+                                                   Text="Automático: usa o backup FULL mais recente do histórico. Escolha um .bak se o backup estiver em outra mídia (o SQL Server precisa conseguir lê-lo)." />
+                                    </StackPanel>
                                     <CheckBox x:Name="DataLossConfirmCheck" Margin="0,12,0,0" Foreground="{DynamicResource DangerDarkBrush}"
                                               Content="Estou ciente e autorizo o reparo com possível perda de dados."
                                               Checked="DataLossConfirmCheck_Changed" Unchecked="DataLossConfirmCheck_Changed" />

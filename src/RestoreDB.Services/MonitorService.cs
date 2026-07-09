@@ -18,7 +18,7 @@ public sealed class MonitorService
 
     public MonitorService(LogService log, string? alertDir = null)
     {
-        _repair = new RepairService(log);
+        _repair = new RepairService(log, new RestoreService(log));
         _alertDir = alertDir ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "RestoreDB", "Alerts");
     }

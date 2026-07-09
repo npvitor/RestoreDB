@@ -20,8 +20,13 @@ public sealed class RepairService
 {
     private readonly SqlDataAccess _data = new();
     private readonly LogService _log;
+    private readonly RestoreService _restore;
 
-    public RepairService(LogService log) => _log = log;
+    public RepairService(LogService log, RestoreService restore)
+    {
+        _log = log;
+        _restore = restore;
+    }
 
     /// <summary>
     /// Executa o reparo do banco. Quando <paramref name="allowDataLoss"/> é false (padrão),
@@ -33,7 +38,8 @@ public sealed class RepairService
         string connectionString,
         bool allowDataLoss,
         IProgress<RepairLogEntry> progress,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        ParentRecoveryOptions? recovery = null)
     {
         var result = new RepairResult();
         var mode = allowDataLoss ? "COM possível PERDA DE DADOS" : "seguro (sem perda de dados)";
@@ -49,13 +55,13 @@ public sealed class RepairService
         {
             status = state.Trim().ToUpperInvariant() switch
             {
-                "ONLINE" => await OnlineRepairFlowAsync(session, db, allowDataLoss, progress, ct),
+                "ONLINE" => await OnlineRepairFlowAsync(session, db, connectionString, allowDataLoss, recovery, progress, ct),
                 "OFFLINE" => await BringOnlineAsync(session, db, progress, ct),
                 "RESTORING" => await RestoreWithRecoveryAsync(session, db, progress, ct),
                 "RECOVERING" => await RestoreWithRecoveryAsync(session, db, progress, ct),
-                "RECOVERY_PENDING" => await RecoveryPendingAsync(session, db, allowDataLoss, progress, ct),
-                "SUSPECT" => await EmergencyRepairFlowAsync(session, db, allowDataLoss, progress, ct),
-                "EMERGENCY" => await EmergencyRepairFlowAsync(session, db, allowDataLoss, progress, ct),
+                "RECOVERY_PENDING" => await RecoveryPendingAsync(session, db, connectionString, allowDataLoss, recovery, progress, ct),
+                "SUSPECT" => await EmergencyRepairFlowAsync(session, db, connectionString, allowDataLoss, recovery, progress, ct),
+                "EMERGENCY" => await EmergencyRepairFlowAsync(session, db, connectionString, allowDataLoss, recovery, progress, ct),
                 _ => RepairStatus.Failed
             };
         }
@@ -628,7 +634,7 @@ public sealed class RepairService
     }
 
     /// <summary>RECOVERY_PENDING → tentar ONLINE; se não bastar, escalar para EMERGENCY + DBCC.</summary>
-    private async Task<RepairStatus> RecoveryPendingAsync(SqlSession s, DatabaseInfo db, bool allowDataLoss, IProgress<RepairLogEntry> p, CancellationToken ct)
+    private async Task<RepairStatus> RecoveryPendingAsync(SqlSession s, DatabaseInfo db, string connectionString, bool allowDataLoss, ParentRecoveryOptions? recovery, IProgress<RepairLogEntry> p, CancellationToken ct)
     {
         Report(p, db.Name, RepairLogLevel.Info, "RECOVERY_PENDING: tentando recolocar o banco ONLINE...");
         var r = await RunStepAsync(s, db, p, "Tentando SET ONLINE", AlterDatabase(db.Name, "SET ONLINE"), ct);
@@ -640,7 +646,7 @@ public sealed class RepairService
         }
 
         Report(p, db.Name, RepairLogLevel.Warning, "SET ONLINE não resolveu. Escalando para reparo via EMERGENCY + DBCC CHECKDB.");
-        return await EmergencyRepairFlowAsync(s, db, allowDataLoss, p, ct);
+        return await EmergencyRepairFlowAsync(s, db, connectionString, allowDataLoss, recovery, p, ct);
     }
 
     /// <summary>
@@ -651,7 +657,7 @@ public sealed class RepairService
     /// Importante: o SQL Server NÃO permite REPAIR_REBUILD com o banco em modo EMERGENCY
     /// (Msg 7901); por isso a recuperação normal é tentada primeiro.
     /// </summary>
-    private async Task<RepairStatus> EmergencyRepairFlowAsync(SqlSession s, DatabaseInfo db, bool allowDataLoss, IProgress<RepairLogEntry> p, CancellationToken ct)
+    private async Task<RepairStatus> EmergencyRepairFlowAsync(SqlSession s, DatabaseInfo db, string connectionString, bool allowDataLoss, ParentRecoveryOptions? recovery, IProgress<RepairLogEntry> p, CancellationToken ct)
     {
         if (AppConstants.IsSystemDatabase(db.Name))
         {
@@ -768,7 +774,7 @@ public sealed class RepairService
 
         // O REPAIR_ALLOW_DATA_LOSS desaloca páginas SEM respeitar constraints — pode deixar
         // chaves estrangeiras órfãs. Como a perda de dados já foi autorizada, reconciliamos.
-        await TryReconcileConstraintsAsync(s, db, p, allowDataLoss: true, ct);
+        await TryReconcileConstraintsAsync(s, db, p, allowDataLoss: true, connectionString, recovery, ct);
         await TryReseedIdentitiesAsync(s, db, p, ct);
 
         await TrySetMultiUserAsync(s, db, p, ct);
@@ -784,7 +790,7 @@ public sealed class RepairService
     /// índices não-clusterizados / REPAIR_REBUILD (sem perda) → e, só com confirmação,
     /// REPAIR_ALLOW_DATA_LOSS / remoção de órfãos (com perda).
     /// </summary>
-    private async Task<RepairStatus> OnlineRepairFlowAsync(SqlSession s, DatabaseInfo db, bool allowDataLoss, IProgress<RepairLogEntry> p, CancellationToken ct)
+    private async Task<RepairStatus> OnlineRepairFlowAsync(SqlSession s, DatabaseInfo db, string connectionString, bool allowDataLoss, ParentRecoveryOptions? recovery, IProgress<RepairLogEntry> p, CancellationToken ct)
     {
         Report(p, db.Name, RepairLogLevel.Info, "Banco ONLINE: verificando consistência física e lógica antes de decidir...");
         var report = await s.CheckDbWithResultsAsync(db.Name, repairOption: null, ct);
@@ -864,7 +870,7 @@ public sealed class RepairService
                 await RunStepAsync(s, db, p, "Reparo COM possível PERDA DE DADOS (REPAIR_ALLOW_DATA_LOSS)",
                     Dbcc(db.Name, "REPAIR_ALLOW_DATA_LOSS", noInfoMsgs: false), ct);
                 var verifyFinal = await RunCheckDbStepAsync(s, db, p, "Verificação final (DBCC CHECKDB)", db.Name, ct);
-                await TryReconcileConstraintsAsync(s, db, p, allowDataLoss: true, ct);
+                await TryReconcileConstraintsAsync(s, db, p, allowDataLoss: true, connectionString, recovery, ct);
                 await TryReseedIdentitiesAsync(s, db, p, ct);
                 if (verifyFinal.Success)
                     await TryPostRepairFullBackupAsync(s, db, p, ct);
@@ -904,7 +910,7 @@ public sealed class RepairService
         try
         {
             await TrySafetyNetAsync(s, db, p, ct);
-            await TryReconcileConstraintsAsync(s, db, p, allowDataLoss: true, ct);
+            await TryReconcileConstraintsAsync(s, db, p, allowDataLoss: true, connectionString, recovery, ct);
             var remaining = await s.CheckConstraintsAsync(db.Name, ct);
             return remaining.Count(v => v.IsForeignKey) == 0 ? RepairStatus.Success : RepairStatus.Failed;
         }
@@ -920,7 +926,7 @@ public sealed class RepairService
     /// linhas que violam chaves estrangeiras (registros órfãos) e, quando a perda já foi
     /// autorizada, remove-as. Best-effort — nunca derruba o fluxo de reparo.
     /// </summary>
-    private async Task TryReconcileConstraintsAsync(SqlSession s, DatabaseInfo db, IProgress<RepairLogEntry> p, bool allowDataLoss, CancellationToken ct)
+    private async Task TryReconcileConstraintsAsync(SqlSession s, DatabaseInfo db, IProgress<RepairLogEntry> p, bool allowDataLoss, string connectionString, ParentRecoveryOptions? recovery, CancellationToken ct)
     {
         try
         {
@@ -938,27 +944,397 @@ public sealed class RepairService
                 return;
             }
 
-            var total = 0;
-            foreach (var v in fk)
-            {
-                try
-                {
-                    var removed = await s.DeleteViolatingRowsAsync(db.Name, v, ct);
-                    total += removed;
-                    Report(p, db.Name, RepairLogLevel.Success, $"  ✔ {removed} registro(s) órfão(s) removido(s) — {v.Display}");
-                }
-                catch (Exception ex)
-                {
-                    Report(p, db.Name, RepairLogLevel.Warning, $"  ⚠ Não foi possível remover órfãos de {v.Constraint}: {ex.Message}");
-                }
-            }
-            Report(p, db.Name, total > 0 ? RepairLogLevel.Success : RepairLogLevel.Info,
-                $"Reconciliação de integridade concluída: {total} registro(s) órfão(s) removido(s).");
+            var (recovered, deleted, _) = await ReconcileForeignKeyOrphansAsync(s, db, fk, p, connectionString, recovery, ct);
+            Report(p, db.Name, (recovered > 0 || deleted > 0) ? RepairLogLevel.Success : RepairLogLevel.Info,
+                recovered > 0
+                    ? $"Reconciliação de integridade concluída: {recovered} registro(s)-pai recuperado(s) do backup e {deleted} registro(s) órfão(s) removido(s)."
+                    : $"Reconciliação de integridade concluída: {deleted} registro(s) órfão(s) removido(s).");
         }
+        catch (OperationCanceledException) { throw; } // o cancelamento durante a restauração deve propagar
         catch
         {
             // best-effort: a reconciliação nunca deve derrubar o reparo.
         }
+    }
+
+    /// <summary>
+    /// Reconciliação COMPARTILHADA de chaves estrangeiras órfãs (com a perda de dados já autorizada),
+    /// usada tanto pela reconciliação pós-reparo quanto pela correção de integridade dedicada:
+    /// (1) tenta RECUPERAR os registros-pai a partir do backup mais recente (best-effort);
+    /// (2) recheca as violações REAIS remanescentes (a recuperação pode ter resolvido algumas/todas);
+    /// (3) remove os órfãos que sobraram — exatamente como antes. Devolve
+    /// (recuperados, removidos, houveFalhaNaRemoção) para o chamador compor sua mensagem/status.
+    /// </summary>
+    private async Task<(int recovered, int deleted, bool anyDeleteFailed)> ReconcileForeignKeyOrphansAsync(
+        SqlSession session, DatabaseInfo db, IReadOnlyList<ConstraintViolation> fkViolations,
+        IProgress<RepairLogEntry> progress, string connectionString, ParentRecoveryOptions? recovery, CancellationToken ct)
+    {
+        var chooseAnother = recovery?.ChooseAnotherBackup;
+        var source = recovery?.InitialBackupPath;      // null = automático via histórico
+        var totalRecovered = 0;
+        IReadOnlyList<ConstraintViolation> current = fkViolations;
+        // Backups já tentados: impede um loop sem fim caso o callback devolva repetidamente o mesmo
+        // .bak (que não resolve). Cada arquivo distinto é tentado no máximo uma vez.
+        var triedBackups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(source)) triedBackups.Add(source!);
+
+        // Loop de recuperação: tenta a fonte atual; se sobrar órfão e houver callback, oferece OUTRO
+        // .bak antes de qualquer remoção. Só sai para a exclusão quando não sobra órfão, quando não há
+        // callback, ou quando o usuário opta por prosseguir.
+        while (true)
+        {
+            var attempt = await TryRecoverParentRowsAsync(session, db, current, progress, connectionString, source, ct);
+            totalRecovered += attempt.Recovered;
+
+            // Recheca os órfãos REAIS restantes só quando algo mudou (recuperar um pai resolve a FK).
+            // Sem recuperação, a lista atual ainda vale — evita um DBCC CHECKCONSTRAINTS extra (caro).
+            IReadOnlyList<ConstraintViolation> remaining = attempt.Recovered > 0
+                ? (await session.CheckConstraintsAsync(db.Name, ct)).Where(v => v.IsForeignKey).ToList()
+                : current;
+
+            if (remaining.Count == 0 || chooseAnother is null) { current = remaining; break; }
+
+            var reason = attempt.RestoreSucceeded
+                ? $"o backup não continha {remaining.Count} registro(s)-pai (recuperação parcial)"
+                : attempt.Reason;
+            Report(progress, db.Name, RepairLogLevel.Warning,
+                $"Recuperação de registros-pai incompleta ({reason}). Aguardando o usuário escolher outro .bak ou prosseguir com a remoção...");
+
+            string? another;
+            try
+            {
+                another = await chooseAnother(new ParentRecoveryPrompt
+                {
+                    DatabaseName = db.Name, Recovered = totalRecovered, RemainingOrphans = remaining.Count,
+                    Reason = reason, LastTriedPath = source
+                }, ct);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch { another = null; } // falha na interação não derruba o reparo — prossegue com a remoção
+
+            if (string.IsNullOrWhiteSpace(another))
+            {
+                Report(progress, db.Name, RepairLogLevel.Info,
+                    "Prosseguindo sem novos backups — os órfãos remanescentes serão removidos.");
+                current = remaining;
+                break;
+            }
+
+            if (!triedBackups.Add(another))
+            {
+                Report(progress, db.Name, RepairLogLevel.Info,
+                    "Este backup já foi tentado e não resolveu — prosseguindo com a remoção dos órfãos remanescentes.");
+                current = remaining;
+                break;
+            }
+
+            Report(progress, db.Name, RepairLogLevel.Info, $"Nova tentativa de recuperação com o backup escolhido: {another}");
+            source = another;
+            current = remaining;   // a próxima tentativa mira apenas o que ainda está órfão
+        }
+
+        // Remoção dos órfãos que sobraram (exatamente como antes).
+        var deleted = 0;
+        var anyDeleteFailed = false;
+        foreach (var v in current)
+        {
+            try
+            {
+                var removed = await session.DeleteViolatingRowsAsync(db.Name, v, ct);
+                deleted += removed;
+                Report(progress, db.Name, RepairLogLevel.Success, $"  ✔ {removed} registro(s) órfão(s) removido(s) — {v.Display}");
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                anyDeleteFailed = true;
+                Report(progress, db.Name, RepairLogLevel.Warning, $"  ⚠ Não foi possível remover órfãos de {v.Constraint}: {ex.Message}");
+            }
+        }
+        return (totalRecovered, deleted, anyDeleteFailed);
+    }
+
+    /// <summary>
+    /// Antes de excluir os registros filhos órfãos, tenta RECUPERAR automaticamente os registros-pai a
+    /// partir do backup mais recente: restaura a cadeia em um banco paralelo/descartável, localiza cada
+    /// linha-pai pelo valor EXATO da chave (o predicado gerado pelo próprio SQL Server em
+    /// CHECKCONSTRAINTS) e a reinsere no banco vivo. Best-effort — pode não encontrar tudo, ou não haver
+    /// backup. Devolve quantos registros-pai foram recuperados (inseridos ou já presentes). Nunca lança
+    /// (exceto cancelamento): qualquer falha apenas recai na remoção de órfãos, como antes.
+    /// </summary>
+    private async Task<(int Recovered, bool RestoreSucceeded, string Reason)> TryRecoverParentRowsAsync(
+        SqlSession session, DatabaseInfo db, IReadOnlyList<ConstraintViolation> fkViolations,
+        IProgress<RepairLogEntry> progress, string connectionString, string? recoveryBackupPath, CancellationToken ct)
+    {
+        if (fkViolations.Count == 0) return (0, true, string.Empty);
+
+        var useChosenFile = !string.IsNullOrWhiteSpace(recoveryBackupPath);
+        if (!useChosenFile)
+        {
+            // Checagem barata: só vale a pena tentar se houver uma cadeia de backup COMPLETA (custo ~zero
+            // no caso comum de não haver backup). Quando o usuário ESCOLHE um .bak, pulamos esta checagem
+            // (o msdb pode nem conhecer o arquivo) e validamos o arquivo direto na restauração.
+            List<BackupSetInfo> history;
+            try { history = await session.GetBackupHistoryAsync(db.Name, ct); }
+            catch (OperationCanceledException) { throw; }
+            catch { history = new List<BackupSetInfo>(); }
+
+            // Usa o mesmo critério do restore de recuperação: FULL agendado mais recente (não COPY_ONLY),
+            // sem logs — para não reproduzir a própria perda do pai na cópia.
+            var plan = BackupChainPlanner.PlanBaseFullOnly(db.Name, history);
+            if (!plan.IsComplete || plan.BaseFull is null)
+            {
+                Report(progress, db.Name, RepairLogLevel.Info,
+                    "Recuperação automática de registros-pai: sem backup completo disponível no histórico.");
+                return (0, false, "não há backup completo no histórico do servidor");
+            }
+        }
+
+        Report(progress, db.Name, RepairLogLevel.Warning,
+            (useChosenFile
+                ? $"Tentando RECUPERAR os registros-pai a partir do backup ESCOLHIDO ({recoveryBackupPath}) antes de remover os órfãos "
+                : "Tentando RECUPERAR os registros-pai a partir do backup mais recente antes de remover os órfãos ")
+            + "(melhor esforço — pode não encontrar tudo; a restauração pode demorar conforme o tamanho do backup).");
+
+        // Sufixo único: o loop de recuperação pode criar vários bancos paralelos em sequência; a
+        // precisão de segundos do timestamp sozinha poderia colidir entre tentativas rápidas.
+        var scratch = $"{AppConstants.SanitizeToken(db.Name, "banco")}_OrphanRecovery_{DateTime.Now:yyyyMMddHHmmss}_{Guid.NewGuid().ToString("N")[..6]}";
+        var recovered = 0;
+        var restoreSucceeded = false;
+        var failReason = string.Empty;
+        try
+        {
+            var restore = await _restore.RestoreAsCopyAsync(db.Name, scratch, connectionString, progress, ct,
+                baseFullOnly: true, explicitFullBackupPath: recoveryBackupPath);
+            if (restore.Status != RepairStatus.Success)
+            {
+                Report(progress, db.Name, RepairLogLevel.Warning, "Não foi possível restaurar a cópia do backup para recuperação.");
+                failReason = useChosenFile
+                    ? "o arquivo escolhido não pôde ser restaurado (ilegível ou sem backup FULL)"
+                    : "a restauração do backup do histórico falhou";
+                return (0, false, failReason);
+            }
+
+            // Mapeamento pai cacheado por nome de constraint (não repetir a consulta ao catálogo).
+            var mappingCache = new Dictionary<string, ForeignKeyParentMapping?>(StringComparer.OrdinalIgnoreCase);
+            foreach (var v in fkViolations)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                var fkName = Unbracket(v.Constraint);
+                if (!mappingCache.TryGetValue(fkName, out var map))
+                {
+                    map = await session.GetForeignKeyParentMappingAsync(db.Name, fkName, ct);
+                    mappingCache[fkName] = map;
+                }
+                if (map is null || map.ColumnPairs.Count == 0 || string.IsNullOrEmpty(map.ParentTable))
+                {
+                    Report(progress, db.Name, RepairLogLevel.Info,
+                        $"  • Não foi possível resolver a tabela-pai de {v.Constraint} — será tratada na remoção de órfãos.");
+                    continue;
+                }
+
+                var parentPredicate = RewritePredicateToParent(ParseEqualityPredicate(v.Where), map);
+                if (parentPredicate is null)
+                {
+                    Report(progress, db.Name, RepairLogLevel.Info,
+                        $"  • Não foi possível interpretar a chave de {v.Display} — será tratada na remoção de órfãos.");
+                    continue;
+                }
+
+                var target = $"{map.ParentSchema}.{map.ParentTable}";
+                var outcome = await session.TryInsertRecoveredParentRowAsync(db.Name, scratch, map.ParentSchema, map.ParentTable, parentPredicate, ct);
+                switch (outcome)
+                {
+                    case ParentRecoveryOutcome.Inserted:
+                        recovered++;
+                        Report(progress, db.Name, RepairLogLevel.Success,
+                            $"  ✔ Registro-pai recuperado do backup em {target} (WHERE {parentPredicate}) — {v.Constraint}.");
+                        break;
+                    case ParentRecoveryOutcome.AlreadyPresent:
+                        recovered++;
+                        Report(progress, db.Name, RepairLogLevel.Info, $"  • Registro-pai já presente em {target} — {v.Constraint}.");
+                        break;
+                    case ParentRecoveryOutcome.NotFoundInBackup:
+                        Report(progress, db.Name, RepairLogLevel.Info,
+                            $"  • Registro-pai não encontrado no backup para {target} (WHERE {parentPredicate}) — a linha filha será removida.");
+                        break;
+                    default:
+                        Report(progress, db.Name, RepairLogLevel.Warning,
+                            $"  ⚠ Não foi possível recuperar o registro-pai de {v.Constraint} — a linha filha será removida.");
+                        break;
+                }
+            }
+
+            restoreSucceeded = true;
+            Report(progress, db.Name, recovered > 0 ? RepairLogLevel.Success : RepairLogLevel.Info,
+                $"Recuperação de registros-pai concluída: {recovered} registro(s)-pai recuperado(s) do backup.");
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            Report(progress, db.Name, RepairLogLevel.Warning, "Falha na recuperação de registros-pai: " + ex.Message);
+            failReason = "erro inesperado ao recuperar: " + ex.Message;
+        }
+        finally
+        {
+            // Descarta o banco paralelo (mesmo padrão de limpeza de TestRestoreAsync/SimulateRepairAsync).
+            var dropped = await session.DropDatabaseBestEffortAsync(scratch, CancellationToken.None);
+            if (!dropped)
+                Report(progress, db.Name, RepairLogLevel.Warning,
+                    $"Não foi possível descartar o banco paralelo de recuperação [{scratch}] — remova-o manualmente.");
+        }
+        return (recovered, restoreSucceeded, failReason);
+    }
+
+    /// <summary>
+    /// Faz o parse do predicado de igualdade gerado pelo SQL Server em DBCC CHECKCONSTRAINTS
+    /// (ex.: "[ClienteId] = 42" ou "[A] = 1 AND [B] = N'x'"), devolvendo os pares (coluna, literal).
+    /// Divide em AND de nível superior com um scanner que respeita literais entre aspas simples
+    /// (inclusive aspas escapadas '') e identificadores entre colchetes — para não quebrar em um valor
+    /// de string que contenha " AND ", nem num nome de coluna com caracteres especiais. O literal é
+    /// preservado tal como veio (já é sintaxe T-SQL válida). Público para permitir testes unitários.
+    /// </summary>
+    public static List<(string Column, string Literal)> ParseEqualityPredicate(string where)
+    {
+        var result = new List<(string Column, string Literal)>();
+        if (string.IsNullOrWhiteSpace(where)) return result;
+
+        foreach (var conjunct in SplitTopLevelAnd(where))
+        {
+            var eq = FindTopLevelEquals(conjunct);
+            if (eq < 0) continue;
+            var column = conjunct[..eq].Trim();
+            var literal = conjunct[(eq + 1)..].Trim();
+            if (column.Length == 0 || literal.Length == 0) continue;
+            result.Add((column, literal));
+        }
+        return result;
+    }
+
+    /// <summary>Reescreve o predicado trocando as colunas-FILHA (do CHECKCONSTRAINTS) pelas colunas-PAI
+    /// correspondentes, reaproveitando o literal. Devolve null se alguma coluna do predicado não fizer
+    /// parte do mapeamento da FK (por segurança, não recupera com um predicado incompleto).</summary>
+    private static string? RewritePredicateToParent(List<(string Column, string Literal)> pairs, ForeignKeyParentMapping map)
+    {
+        // Exige correspondência 1-para-1 com as colunas da FK: um predicado parcial (menos colunas que
+        // a chave) casaria com VÁRIAS linhas-pai no backup e inseriria registros a mais. Aborta por segurança.
+        if (pairs.Count == 0 || pairs.Count != map.ColumnPairs.Count) return null;
+        var clauses = new List<string>();
+        foreach (var (column, literal) in pairs)
+        {
+            var child = Unbracket(column);
+            var match = map.ColumnPairs.FirstOrDefault(cp => string.Equals(cp.ChildColumn, child, StringComparison.OrdinalIgnoreCase));
+            if (match is null || string.IsNullOrEmpty(match.ParentColumn)) return null;
+            clauses.Add($"[{match.ParentColumn.Replace("]", "]]")}] = {literal}");
+        }
+        return string.Join(" AND ", clauses);
+    }
+
+    /// <summary>Divide um predicado em conjuntos separados por AND de nível superior, respeitando
+    /// literais entre aspas ('...', com '' escapado) e identificadores entre colchetes ([...]).</summary>
+    private static List<string> SplitTopLevelAnd(string s)
+    {
+        var parts = new List<string>();
+        var sb = new StringBuilder();
+        bool inQuote = false, inBracket = false;
+        int depth = 0, i = 0;
+        while (i < s.Length)
+        {
+            char c = s[i];
+            if (inQuote)
+            {
+                sb.Append(c);
+                if (c == '\'')
+                {
+                    if (i + 1 < s.Length && s[i + 1] == '\'') { sb.Append('\''); i += 2; continue; }
+                    inQuote = false;
+                }
+                i++;
+                continue;
+            }
+            if (inBracket)
+            {
+                sb.Append(c);
+                if (c == ']')
+                {
+                    if (i + 1 < s.Length && s[i + 1] == ']') { sb.Append(']'); i += 2; continue; }
+                    inBracket = false;
+                }
+                i++;
+                continue;
+            }
+            if (c == '\'') { inQuote = true; sb.Append(c); i++; continue; }
+            if (c == '[') { inBracket = true; sb.Append(c); i++; continue; }
+            if (c == '(') { depth++; sb.Append(c); i++; continue; }
+            if (c == ')') { if (depth > 0) depth--; sb.Append(c); i++; continue; }
+            if (depth == 0 && IsAndKeywordAt(s, i))
+            {
+                parts.Add(sb.ToString());
+                sb.Clear();
+                i += 3;
+                continue;
+            }
+            sb.Append(c);
+            i++;
+        }
+        parts.Add(sb.ToString());
+        return parts;
+    }
+
+    private static bool IsAndKeywordAt(string s, int i)
+    {
+        if (i + 3 > s.Length) return false;
+        if (string.Compare(s, i, "AND", 0, 3, StringComparison.OrdinalIgnoreCase) != 0) return false;
+        char before = i == 0 ? ' ' : s[i - 1];
+        char after = i + 3 < s.Length ? s[i + 3] : ' ';
+        return !IsIdentifierChar(before) && !IsIdentifierChar(after);
+    }
+
+    private static bool IsIdentifierChar(char c) => char.IsLetterOrDigit(c) || c == '_';
+
+    /// <summary>Índice do primeiro '=' de nível superior (fora de aspas/colchetes/parênteses), ou -1.</summary>
+    private static int FindTopLevelEquals(string s)
+    {
+        bool inQuote = false, inBracket = false;
+        int depth = 0;
+        for (int i = 0; i < s.Length; i++)
+        {
+            char c = s[i];
+            if (inQuote)
+            {
+                if (c == '\'')
+                {
+                    if (i + 1 < s.Length && s[i + 1] == '\'') { i++; continue; }
+                    inQuote = false;
+                }
+                continue;
+            }
+            if (inBracket)
+            {
+                if (c == ']')
+                {
+                    if (i + 1 < s.Length && s[i + 1] == ']') { i++; continue; }
+                    inBracket = false;
+                }
+                continue;
+            }
+            if (c == '\'') { inQuote = true; continue; }
+            if (c == '[') { inBracket = true; continue; }
+            if (c == '(') { depth++; continue; }
+            if (c == ')') { if (depth > 0) depth--; continue; }
+            if (c == '=' && depth == 0) return i;
+        }
+        return -1;
+    }
+
+    /// <summary>Remove um nível de QUOTENAME: "[Nome]]X]" → "Nome]X" (nomes do CHECKCONSTRAINTS vêm entre colchetes).</summary>
+    private static string Unbracket(string name)
+    {
+        var s = name.Trim();
+        if (s.Length >= 2 && s[0] == '[' && s[^1] == ']')
+            return s[1..^1].Replace("]]", "]");
+        return s;
     }
 
     // ----------------------------------------------------------------------------------
@@ -1454,7 +1830,8 @@ public sealed class RepairService
     /// Violações de CHECK constraint são apenas reportadas (não removidas automaticamente).
     /// </summary>
     public async Task<RepairResult> FixConstraintViolationsAsync(
-        DatabaseInfo db, string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default)
+        DatabaseInfo db, string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default,
+        ParentRecoveryOptions? recovery = null)
     {
         var result = new RepairResult();
         Report(progress, db.Name, RepairLogLevel.Warning,
@@ -1510,30 +1887,18 @@ public sealed class RepairService
             // Rede de segurança antes de descartar linhas.
             await TrySafetyNetAsync(session, db, progress, ct);
 
-            var total = 0;
-            var ok = true;
-            foreach (var v in fk)
-            {
-                try
-                {
-                    var removed = await session.DeleteViolatingRowsAsync(db.Name, v, ct);
-                    total += removed;
-                    Report(progress, db.Name, RepairLogLevel.Success, $"Removidos {removed} registro(s) órfão(s) — {v.Display}");
-                }
-                catch (Exception ex)
-                {
-                    ok = false;
-                    Report(progress, db.Name, RepairLogLevel.Error, $"Falha ao remover órfãos de {v.Constraint}: {ex.Message}");
-                }
-            }
+            // Antes de excluir: tenta recuperar os registros-pai do backup; só remove o que sobrar.
+            var (recovered, total, anyDeleteFailed) = await ReconcileForeignKeyOrphansAsync(session, db, fk, progress, connectionString, recovery, ct);
 
             var remaining = await session.CheckConstraintsAsync(db.Name, ct);
             var remainingFk = remaining.Count(v => v.IsForeignKey);
 
-            result.Status = ok && remainingFk == 0 ? RepairStatus.Success : RepairStatus.Failed;
+            result.Status = !anyDeleteFailed && remainingFk == 0 ? RepairStatus.Success : RepairStatus.Failed;
             result.Message = result.Status == RepairStatus.Success
-                ? $"Integridade referencial restaurada: {total} registro(s) órfão(s) removido(s)."
-                : $"Removidos {total} registro(s), mas ainda restam {remainingFk} violação(ões) de FK. Verifique o log.";
+                ? (recovered > 0
+                    ? $"Integridade referencial restaurada: {recovered} registro(s)-pai recuperado(s) do backup e {total} registro(s) órfão(s) removido(s)."
+                    : $"Integridade referencial restaurada: {total} registro(s) órfão(s) removido(s).")
+                : $"Recuperados {recovered}, removidos {total} registro(s), mas ainda restam {remainingFk} violação(ões) de FK. Verifique o log.";
             Report(progress, db.Name, result.Status == RepairStatus.Success ? RepairLogLevel.Success : RepairLogLevel.Warning, result.Message);
             return result;
         }

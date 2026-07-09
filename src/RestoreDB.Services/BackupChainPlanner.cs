@@ -109,6 +109,37 @@ public static class BackupChainPlanner
         return plan;
     }
 
+    /// <summary>
+    /// Plano ESPECIAL para a recuperação de registros-pai órfãos: usa SOMENTE o FULL agendado mais
+    /// recente (NÃO COPY_ONLY) e NÃO aplica diferenciais nem logs. Racional:
+    ///  • os backups COPY_ONLY aqui costumam ser os que a PRÓPRIA ferramenta acabou de criar como rede
+    ///    de segurança — do estado JÁ danificado (sem o pai) — e não devem ofuscar o backup agendado;
+    ///  • aplicar logs até o presente REPRODUZIRIA a remoção do pai na cópia (tail-log capturou o DELETE),
+    ///    esvaziando a recuperação. Restaurar só o FULL entrega um estado passado ÍNTEGRO que ainda contém
+    ///    o pai, sem reproduzir a perda. Best-effort: se não houver FULL agendado, a cadeia fica incompleta.
+    /// </summary>
+    public static BackupChainPlan PlanBaseFullOnly(string databaseName, IReadOnlyList<BackupSetInfo> history)
+    {
+        var plan = new BackupChainPlan { DatabaseName = databaseName };
+        var baseFull = history.Where(b => b.IsFull && !b.IsCopyOnly)
+                              .OrderByDescending(b => b.BackupFinishDate ?? DateTime.MinValue)
+                              .FirstOrDefault();
+        if (baseFull is null)
+        {
+            plan.Warnings.Add("Nenhum backup FULL agendado (não COPY_ONLY) para recuperar registros-pai.");
+            plan.IsComplete = false;
+            plan.Summary = "Recuperação de registros-pai indisponível: sem FULL agendado.";
+            return plan;
+        }
+
+        plan.BaseFull = baseFull;
+        plan.Pieces.Add(ToPiece(baseFull, isLog: false));
+        plan.IsComplete = true;
+        plan.ReachesTarget = true;
+        plan.Summary = "Recuperação de registros-pai: FULL agendado mais recente (somente FULL, sem logs).";
+        return plan;
+    }
+
     /// <summary>Um diferencial/log pertence ao full quando seu database_backup_lsn casa com o
     /// checkpoint_lsn do full. Sem LSNs (0), aceita pela cronologia (validação relaxada).</summary>
     private static bool BelongsTo(BackupSetInfo dependent, BackupSetInfo baseFull)

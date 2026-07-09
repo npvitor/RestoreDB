@@ -148,7 +148,8 @@ public sealed class RestoreService
     /// sobrescreve um banco já existente de mesmo nome.
     /// </summary>
     public async Task<RepairResult> RestoreAsCopyAsync(
-        string originalDb, string? copyName, string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default)
+        string originalDb, string? copyName, string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default,
+        bool baseFullOnly = false, string? explicitFullBackupPath = null)
     {
         var result = new RepairResult();
         var copy = string.IsNullOrWhiteSpace(copyName) ? originalDb + "_Recuperado" : copyName!;
@@ -164,8 +165,23 @@ public sealed class RestoreService
             return result;
         }
 
-        var history = await session.GetBackupHistoryAsync(originalDb, ct);
-        var plan = BackupChainPlanner.Plan(originalDb, history, target: null);
+        BackupChainPlan plan;
+        if (!string.IsNullOrWhiteSpace(explicitFullBackupPath))
+        {
+            // O usuário escolheu um .bak específico (ex.: guardado em outra mídia) — usa o FULL DESSE
+            // arquivo, ignorando o histórico do msdb. O SQL Server precisa conseguir LER esse caminho.
+            Report(progress, originalDb, RepairLogLevel.Info, $"Usando o backup escolhido pelo usuário: {explicitFullBackupPath}");
+            plan = await BuildFullOnlyPlanFromFileAsync(session, originalDb, explicitFullBackupPath!, ct);
+        }
+        else
+        {
+            var history = await session.GetBackupHistoryAsync(originalDb, ct);
+            // Recuperação de registros-pai (baseFullOnly): só o FULL agendado mais recente, sem logs — para
+            // não reproduzir a própria perda do pai na cópia (ver BackupChainPlanner.PlanBaseFullOnly).
+            plan = baseFullOnly
+                ? BackupChainPlanner.PlanBaseFullOnly(originalDb, history)
+                : BackupChainPlanner.Plan(originalDb, history, target: null);
+        }
         foreach (var w in plan.Warnings) Report(progress, originalDb, RepairLogLevel.Warning, "  ⚠ " + w);
         if (!plan.IsComplete || plan.BaseFull is null)
         {
@@ -191,6 +207,46 @@ public sealed class RestoreService
             Report(progress, originalDb, RepairLogLevel.Success, restore.Message);
         }
         return restore;
+    }
+
+    /// <summary>
+    /// Monta um plano "somente FULL" a partir de UM arquivo de backup escolhido pelo usuário: lê o
+    /// cabeçalho (RESTORE HEADERONLY) e usa o backup COMPLETO mais recente contido no arquivo. Não
+    /// aplica logs (evita reproduzir a perda do pai). Falha de forma clara se o arquivo for ilegível
+    /// pelo servidor ou não contiver um FULL.
+    /// </summary>
+    private async Task<BackupChainPlan> BuildFullOnlyPlanFromFileAsync(SqlSession session, string db, string path, CancellationToken ct)
+    {
+        var plan = new BackupChainPlan { DatabaseName = db };
+        List<BackupSetInfo> sets;
+        try
+        {
+            sets = await session.RestoreHeaderOnlyAsync(path, ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            plan.Warnings.Add($"Não foi possível ler o arquivo de backup escolhido '{path}' (o SQL Server precisa ter acesso a ele): {ex.Message}");
+            plan.IsComplete = false;
+            plan.Summary = "Arquivo de backup escolhido ilegível.";
+            return plan;
+        }
+
+        var full = sets.Where(s => s.IsFull).OrderByDescending(s => s.BackupFinishDate ?? DateTime.MinValue).FirstOrDefault();
+        if (full is null)
+        {
+            plan.Warnings.Add($"O arquivo escolhido '{path}' não contém um backup COMPLETO (FULL).");
+            plan.IsComplete = false;
+            plan.Summary = "Sem FULL no arquivo escolhido.";
+            return plan;
+        }
+
+        plan.BaseFull = full;
+        plan.Pieces.Add(new RestorePiece { DiskPath = path, Position = full.Position <= 0 ? 1 : full.Position, IsLog = false });
+        plan.IsComplete = true;
+        plan.ReachesTarget = true;
+        plan.Summary = $"Recuperação de registros-pai: FULL do arquivo escolhido ({Path.GetFileName(path)}).";
+        return plan;
     }
 
     /// <summary>

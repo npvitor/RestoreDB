@@ -694,21 +694,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         var objRef = $"{schema}.{table}";
 
         // Colunas não-computadas (na ordem) + se há IDENTITY.
-        var cols = new List<string>();
-        var hasIdentity = false;
-        {
-            var sql =
-                $"SELECT c.name, c.is_identity FROM {Quote(toDb)}.sys.columns c " +
-                $"WHERE c.object_id = OBJECT_ID(@o) AND c.is_computed = 0 ORDER BY c.column_id;";
-            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
-            cmd.Parameters.AddWithValue("@o", $"{toDb}.{objRef}");
-            await using var r = await cmd.ExecuteReaderAsync(ct);
-            while (await r.ReadAsync(ct))
-            {
-                cols.Add(r.GetString(0));
-                if (!r.IsDBNull(1) && r.GetBoolean(1)) hasIdentity = true;
-            }
-        }
+        var (cols, hasIdentity) = await GetInsertableColumnsAsync(toDb, schema, table, ct);
         if (cols.Count == 0)
             throw new InvalidOperationException($"Tabela '{schemaTable}' não encontrada em [{toDb}].");
 
@@ -748,6 +734,36 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         run.Parameters.AddWithValue("@stmt", inner);
         var n = await run.ExecuteScalarAsync(ct);
         return n is null || n == DBNull.Value ? 0 : Convert.ToInt32(n);
+    }
+
+    /// <summary>
+    /// Descobre as colunas INSERÍVEIS de uma tabela (não-computadas, na ordem de column_id) e se a
+    /// tabela tem coluna IDENTITY. Consulta o catálogo do banco alvo por nome de 3 partes (OBJECT_ID
+    /// resolve cross-database). Reutilizado por <see cref="SalvageTableAsync"/> e pela recuperação
+    /// de registros-pai a partir de backup.
+    /// </summary>
+    private async Task<(List<string> Columns, bool HasIdentity)> GetInsertableColumnsAsync(
+        string db, string schema, string table, CancellationToken ct)
+    {
+        var cols = new List<string>();
+        var hasIdentity = false;
+        var objRef = $"{db}.{schema}.{table}";
+        // Exclui colunas COMPUTADAS e rowversion/timestamp (system_type_id 189) — nenhuma delas aceita
+        // valor explícito num INSERT; incluí-las derrubaria o INSERT ... SELECT (erro 273).
+        var sql =
+            $"SELECT c.name, c.is_identity FROM {Quote(db)}.sys.columns c " +
+            $"WHERE c.object_id = OBJECT_ID(@o) AND c.is_computed = 0 AND c.system_type_id <> 189 " +
+            $"ORDER BY c.column_id;";
+        await EnsureOpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+        cmd.Parameters.AddWithValue("@o", objRef);
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        while (await r.ReadAsync(ct))
+        {
+            cols.Add(r.GetString(0));
+            if (!r.IsDBNull(1) && r.GetBoolean(1)) hasIdentity = true;
+        }
+        return (cols, hasIdentity);
     }
 
     private static (string schema, string table) SplitSchemaTable(string schemaTable)
@@ -1009,6 +1025,130 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         cmd.Parameters.AddWithValue("@db", databaseName);
         cmd.Parameters.AddWithValue("@inner", inner);
         return await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>
+    /// Resolve, para uma chave estrangeira, o schema/tabela do lado PAI (referenciado) e os pares
+    /// ordenados (coluna-filha → coluna-pai) — cobre chaves compostas. Consulta o catálogo do banco
+    /// alvo por nomes de 3 partes (estilo 2008 R2-safe, sem INFORMATION_SCHEMA). Devolve null se a FK
+    /// não existir ou em caso de erro. Best-effort.
+    ///
+    /// Atenção à terminologia do SQL Server em sys.foreign_key_columns: "parent" = tabela
+    /// referenciadora (a FILHA, que contém a FK); "referenced" = tabela referenciada (o PAI, que
+    /// contém a PK). Aqui recuperamos a linha do lado "referenced".
+    /// </summary>
+    public async Task<ForeignKeyParentMapping?> GetForeignKeyParentMappingAsync(
+        string databaseName, string constraintName, CancellationToken ct = default)
+    {
+        try
+        {
+            var q = Quote(databaseName);
+            var sql =
+                $"SELECT sch.name, rt.name, pc.name, rc.name\n" +
+                $"FROM {q}.sys.foreign_keys fk\n" +
+                $"JOIN {q}.sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id\n" +
+                $"JOIN {q}.sys.tables rt ON rt.object_id = fk.referenced_object_id\n" +
+                $"JOIN {q}.sys.schemas sch ON sch.schema_id = rt.schema_id\n" +
+                $"JOIN {q}.sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id\n" +
+                $"JOIN {q}.sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id\n" +
+                $"WHERE fk.name = @fk\n" +
+                $"ORDER BY fkc.constraint_column_id;";
+            await EnsureOpenAsync(ct);
+            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@fk", constraintName);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+
+            ForeignKeyParentMapping? map = null;
+            while (await r.ReadAsync(ct))
+            {
+                map ??= new ForeignKeyParentMapping
+                {
+                    ParentSchema = r.IsDBNull(0) ? "dbo" : r.GetString(0),
+                    ParentTable = r.IsDBNull(1) ? string.Empty : r.GetString(1)
+                };
+                map.ColumnPairs.Add(new ForeignKeyColumnPair
+                {
+                    ChildColumn = r.IsDBNull(2) ? string.Empty : r.GetString(2),
+                    ParentColumn = r.IsDBNull(3) ? string.Empty : r.GetString(3)
+                });
+            }
+            return map;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// Tenta reinserir no banco VIVO (<paramref name="liveDb"/>) a linha-pai localizada na CÓPIA do
+    /// backup (<paramref name="scratchDb"/>) pelo <paramref name="predicate"/> — que carrega o valor
+    /// exato da chave que falta. Preserva a chave (SET IDENTITY_INSERT quando há identidade). Distingue:
+    /// inserida / já existia (violação de PK 2627/2601, sucesso silencioso) / não encontrada na cópia /
+    /// erro inesperado. Best-effort — nunca lança (exceto cancelamento). Roda no contexto de liveDb
+    /// (a mesma sessão que detém o SINGLE_USER), lendo a origem por nome de 3 partes — o mesmo idioma
+    /// cross-database de <see cref="SalvageTableAsync"/>, sem linked server.
+    /// </summary>
+    public async Task<ParentRecoveryOutcome> TryInsertRecoveredParentRowAsync(
+        string liveDb, string scratchDb, string schema, string parentTable, string predicate, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(parentTable) || string.IsNullOrWhiteSpace(predicate))
+            return ParentRecoveryOutcome.Failed;
+
+        List<string> cols;
+        bool hasIdentity;
+        try { (cols, hasIdentity) = await GetInsertableColumnsAsync(liveDb, schema, parentTable, ct); }
+        catch (OperationCanceledException) { throw; }
+        catch { return ParentRecoveryOutcome.Failed; }
+        if (cols.Count == 0) return ParentRecoveryOutcome.Failed;
+
+        var qTarget = $"{Quote(schema)}.{Quote(parentTable)}";                     // no contexto de liveDb
+        var qSource = $"{Quote(scratchDb)}.{Quote(schema)}.{Quote(parentTable)}";  // 3 partes
+        var colList = string.Join(", ", cols.Select(Quote));
+        var idOn = hasIdentity ? $"SET IDENTITY_INSERT {qTarget} ON; " : string.Empty;
+
+        // O predicado usa as colunas do PAI (= valor exato da PK ausente), reescrito na camada de serviço.
+        var inner =
+            idOn +
+            $"INSERT INTO {qTarget} ({colList}) SELECT {colList} FROM {qSource} src WHERE {predicate}; " +
+            "SELECT @@ROWCOUNT;";
+        const string runner =
+            "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
+            "EXEC @proc @stmt;";
+        try
+        {
+            await EnsureOpenAsync(ct);
+            await using var run = new SqlCommand(runner, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
+            run.Parameters.AddWithValue("@db", liveDb);
+            run.Parameters.AddWithValue("@stmt", inner);
+            var n = await run.ExecuteScalarAsync(ct);
+            var rows = n is null || n == DBNull.Value ? 0 : Convert.ToInt32(n);
+            return rows > 0 ? ParentRecoveryOutcome.Inserted : ParentRecoveryOutcome.NotFoundInBackup;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (SqlException ex) when (ex.Errors.Cast<SqlError>().Any(e => e.Number is 2627 or 2601))
+        {
+            // A linha-pai já existe no banco vivo — a FK já não está órfã por essa chave. Sucesso silencioso.
+            return ParentRecoveryOutcome.AlreadyPresent;
+        }
+        catch
+        {
+            return ParentRecoveryOutcome.Failed;
+        }
+        finally
+        {
+            // Um erro (ex.: violação de PK) aborta o lote com o IDENTITY_INSERT ainda LIGADO na sessão,
+            // o que impediria inserir noutra tabela adiante. Garante o desligamento (best-effort).
+            if (hasIdentity)
+            {
+                try
+                {
+                    await using var offCmd = new SqlCommand(runner, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+                    offCmd.Parameters.AddWithValue("@db", liveDb);
+                    offCmd.Parameters.AddWithValue("@stmt", $"SET IDENTITY_INSERT {qTarget} OFF;");
+                    await offCmd.ExecuteNonQueryAsync(CancellationToken.None);
+                }
+                catch { /* best-effort */ }
+            }
+        }
     }
 
     /// <summary>Resolve o nome de um objeto (tabela/índice) a partir do object_id, dentro do banco alvo.</summary>

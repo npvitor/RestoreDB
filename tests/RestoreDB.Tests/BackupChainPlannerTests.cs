@@ -125,6 +125,65 @@ public class BackupChainPlannerTests
         Assert.Equal(2, piece.AdditionalDevices.Count);
     }
 
+    private static BackupSetInfo CopyOnlyFull(int day, string device = "copyonly.bak") => new()
+    {
+        BackupTypeCode = "D", PhysicalDevice = device, Position = 1, IsCopyOnly = true,
+        BackupFinishDate = new DateTime(2026, 1, day, 0, 0, 0),
+        FirstLsn = 500, LastLsn = 600, CheckpointLsn = 550, DatabaseBackupLsn = 0
+    };
+
+    [Fact]
+    public void PlanBaseFullOnly_PicksLatestScheduledFull_IgnoresCopyOnlyAndLogs()
+    {
+        var history = new List<BackupSetInfo>
+        {
+            Full(1, first: 100, last: 200, checkpoint: 150, device: "scheduled.bak"),
+            Log(3, first: 200, last: 300),           // deve ser ignorado (nada de logs na recuperação)
+            CopyOnlyFull(5, device: "safety.bak"),   // COPY_ONLY mais recente — NÃO deve ser escolhido
+        };
+
+        var plan = BackupChainPlanner.PlanBaseFullOnly("DB", history);
+
+        Assert.True(plan.IsComplete);
+        Assert.NotNull(plan.BaseFull);
+        Assert.Equal("scheduled.bak", plan.BaseFull!.PhysicalDevice); // o FULL agendado, não o COPY_ONLY
+        Assert.Single(plan.Pieces);                                   // somente o FULL, sem logs
+        Assert.False(plan.Pieces[0].IsLog);
+    }
+
+    [Fact]
+    public void PlanBaseFullOnly_PicksMostRecentAmongScheduledFulls()
+    {
+        var history = new List<BackupSetInfo>
+        {
+            Full(1, first: 100, last: 200, checkpoint: 150, device: "old.bak"),
+            Full(4, first: 300, last: 400, checkpoint: 350, device: "new.bak"),
+        };
+
+        var plan = BackupChainPlanner.PlanBaseFullOnly("DB", history);
+
+        Assert.Equal("new.bak", plan.BaseFull!.PhysicalDevice);
+    }
+
+    [Fact]
+    public void PlanBaseFullOnly_OnlyCopyOnlyFull_IsIncomplete()
+    {
+        var plan = BackupChainPlanner.PlanBaseFullOnly("DB", new List<BackupSetInfo> { CopyOnlyFull(5) });
+
+        Assert.False(plan.IsComplete);
+        Assert.Null(plan.BaseFull);
+        Assert.Empty(plan.Pieces);
+    }
+
+    [Fact]
+    public void PlanBaseFullOnly_NoFull_IsIncomplete()
+    {
+        var plan = BackupChainPlanner.PlanBaseFullOnly("DB", new List<BackupSetInfo> { Log(2, 200, 300) });
+
+        Assert.False(plan.IsComplete);
+        Assert.Empty(plan.Pieces);
+    }
+
     [Fact]
     public void Plan_PointInTime_StopsAtTargetLog()
     {

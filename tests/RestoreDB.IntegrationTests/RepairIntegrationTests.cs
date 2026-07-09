@@ -12,7 +12,11 @@ namespace RestoreDB.IntegrationTests;
 /// </summary>
 public sealed class RepairIntegrationTests
 {
-    private static RepairService Repair() => new(new LogService());
+    private static RepairService Repair()
+    {
+        var log = new LogService();
+        return new(log, new RestoreService(log));
+    }
     private static RestoreService Restore() => new(new LogService());
 
     [IntegrationFact]
@@ -131,6 +135,163 @@ public sealed class RepairIntegrationTests
         var total = Convert.ToInt32(await It.ScalarAsync(
             $"SELECT COUNT(*) FROM {It.Q(db.Name)}.dbo.Pedido;"));
         Assert.Equal(2, total);
+    }
+
+    [IntegrationFact]
+    public async Task CorrigirIntegridade_RecuperaPaiDoBackup_PreservaFilho()
+    {
+        await using var db = await TestDatabase.CreateAsync("fkrecover", withData: false);
+
+        // Esquema pai/filho com dados VÁLIDOS (Cliente 1 e 2; Pedidos apontando 1 e 2).
+        var setup =
+            $"USE {It.Q(db.Name)}; " +
+            "CREATE TABLE dbo.Cliente(Id int PRIMARY KEY, Nome nvarchar(100) NOT NULL); " +
+            "CREATE TABLE dbo.Pedido(Id int IDENTITY PRIMARY KEY, ClienteId int NOT NULL " +
+            "  CONSTRAINT FK_Pedido_Cliente FOREIGN KEY REFERENCES dbo.Cliente(Id)); " +
+            "INSERT INTO dbo.Cliente(Id,Nome) VALUES (1,N''Cliente 1''),(2,N''Cliente 2''); " +
+            "INSERT INTO dbo.Pedido(ClienteId) VALUES (1),(2);";
+        await It.ExecAsync($"EXEC(N'{setup}');");
+
+        // Backup FULL (agendado, NÃO copy-only): contém Cliente 1 e 2.
+        await db.BackupAsync();
+
+        // Simula o efeito do REPAIR: o PAI (Cliente 2) some, deixando o FILHO (Pedido→2) órfão.
+        var orphan =
+            $"USE {It.Q(db.Name)}; " +
+            "ALTER TABLE dbo.Pedido NOCHECK CONSTRAINT FK_Pedido_Cliente; " +
+            "DELETE FROM dbo.Cliente WHERE Id = 2; " +
+            "ALTER TABLE dbo.Pedido WITH NOCHECK CHECK CONSTRAINT FK_Pedido_Cliente;";
+        await It.ExecAsync($"EXEC(N'{orphan}');");
+
+        // Estado órfão inicial: 1 Cliente, 2 Pedidos (um deles órfão).
+        Assert.Equal(1, Convert.ToInt32(await It.ScalarAsync($"SELECT COUNT(*) FROM {It.Q(db.Name)}.dbo.Cliente;")));
+        Assert.Equal(2, Convert.ToInt32(await It.ScalarAsync($"SELECT COUNT(*) FROM {It.Q(db.Name)}.dbo.Pedido;")));
+
+        try
+        {
+            var result = await Repair().FixConstraintViolationsAsync(db.AsInfo("ONLINE"), It.Conn, It.NoProgress);
+
+            Assert.Equal(RepairStatus.Success, result.Status);
+            Assert.Equal("ONLINE", await It.GetStateAsync(db.Name));
+
+            // O PAI foi RECUPERADO do backup (Cliente 2 voltou)...
+            Assert.Equal(1, Convert.ToInt32(await It.ScalarAsync(
+                $"SELECT COUNT(*) FROM {It.Q(db.Name)}.dbo.Cliente WHERE Id = 2;")));
+            // ...e o FILHO saudável foi PRESERVADO (nenhum Pedido removido).
+            Assert.Equal(2, Convert.ToInt32(await It.ScalarAsync($"SELECT COUNT(*) FROM {It.Q(db.Name)}.dbo.Pedido;")));
+            Assert.Contains("recuperado", result.Message, StringComparison.OrdinalIgnoreCase);
+
+            // O banco paralelo de recuperação foi descartado (sem lixo no servidor).
+            Assert.Equal(0, Convert.ToInt32(await It.ScalarAsync(
+                "SELECT COUNT(*) FROM sys.databases WHERE name LIKE @p;", ("@p", db.Name + "_OrphanRecovery_%"))));
+        }
+        finally
+        {
+            // Segurança: descarta qualquer banco paralelo remanescente.
+            var leftover = (await It.ScalarAsync(
+                "SELECT TOP 1 name FROM sys.databases WHERE name LIKE @p;", ("@p", db.Name + "_OrphanRecovery_%"))) as string;
+            if (leftover is not null) await It.ForceDropAsync(leftover);
+        }
+    }
+
+    [IntegrationFact]
+    public async Task CorrigirIntegridade_RecuperaPaiDeBackupESCOLHIDO_MesmoSemHistoricoMsdb()
+    {
+        await using var db = await TestDatabase.CreateAsync("fkrecfile", withData: false);
+
+        var setup =
+            $"USE {It.Q(db.Name)}; " +
+            "CREATE TABLE dbo.Cliente(Id int PRIMARY KEY, Nome nvarchar(100) NOT NULL); " +
+            "CREATE TABLE dbo.Pedido(Id int IDENTITY PRIMARY KEY, ClienteId int NOT NULL " +
+            "  CONSTRAINT FK_Pedido_Cliente FOREIGN KEY REFERENCES dbo.Cliente(Id)); " +
+            "INSERT INTO dbo.Cliente(Id,Nome) VALUES (1,N''Cliente 1''),(2,N''Cliente 2''); " +
+            "INSERT INTO dbo.Pedido(ClienteId) VALUES (1),(2);";
+        await It.ExecAsync($"EXEC(N'{setup}');");
+
+        // Backup FULL para um ARQUIVO conhecido (contém Cliente 2).
+        var bakPath = await db.BackupAsync();
+
+        // Órfão: remove o pai Cliente 2.
+        var orphan =
+            $"USE {It.Q(db.Name)}; " +
+            "ALTER TABLE dbo.Pedido NOCHECK CONSTRAINT FK_Pedido_Cliente; " +
+            "DELETE FROM dbo.Cliente WHERE Id = 2; " +
+            "ALTER TABLE dbo.Pedido WITH NOCHECK CHECK CONSTRAINT FK_Pedido_Cliente;";
+        await It.ExecAsync($"EXEC(N'{orphan}');");
+
+        // Prova forte: apaga TODO o histórico do msdb — a recuperação AUTOMÁTICA não acharia backup.
+        // Só o .bak ESCOLHIDO (lido direto via HEADERONLY) pode recuperar o pai.
+        await It.TryPurgeBackupHistoryAsync(db.Name);
+
+        try
+        {
+            var result = await Repair().FixConstraintViolationsAsync(db.AsInfo("ONLINE"), It.Conn, It.NoProgress, default,
+                new ParentRecoveryOptions { InitialBackupPath = bakPath });
+
+            Assert.Equal(RepairStatus.Success, result.Status);
+            Assert.Equal(1, Convert.ToInt32(await It.ScalarAsync(
+                $"SELECT COUNT(*) FROM {It.Q(db.Name)}.dbo.Cliente WHERE Id = 2;")));         // pai recuperado do .bak escolhido
+            Assert.Equal(2, Convert.ToInt32(await It.ScalarAsync($"SELECT COUNT(*) FROM {It.Q(db.Name)}.dbo.Pedido;"))); // filho preservado
+            Assert.Contains("recuperado", result.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            var leftover = (await It.ScalarAsync(
+                "SELECT TOP 1 name FROM sys.databases WHERE name LIKE @p;", ("@p", db.Name + "_OrphanRecovery_%"))) as string;
+            if (leftover is not null) await It.ForceDropAsync(leftover);
+        }
+    }
+
+    [IntegrationFact]
+    public async Task CorrigirIntegridade_RecuperacaoFalha_CallbackEscolheOutroBak_RecuperaAntesDeRemover()
+    {
+        await using var db = await TestDatabase.CreateAsync("fkcallback", withData: false);
+
+        var setup =
+            $"USE {It.Q(db.Name)}; " +
+            "CREATE TABLE dbo.Cliente(Id int PRIMARY KEY, Nome nvarchar(100) NOT NULL); " +
+            "CREATE TABLE dbo.Pedido(Id int IDENTITY PRIMARY KEY, ClienteId int NOT NULL " +
+            "  CONSTRAINT FK_Pedido_Cliente FOREIGN KEY REFERENCES dbo.Cliente(Id)); " +
+            "INSERT INTO dbo.Cliente(Id,Nome) VALUES (1,N''C1''),(2,N''C2''); " +
+            "INSERT INTO dbo.Pedido(ClienteId) VALUES (1),(2);";
+        await It.ExecAsync($"EXEC(N'{setup}');");
+
+        var bakPath = await db.BackupAsync();   // contém Cliente 2
+
+        await It.ExecAsync($"EXEC(N'USE {It.Q(db.Name)}; ALTER TABLE dbo.Pedido NOCHECK CONSTRAINT FK_Pedido_Cliente; " +
+            "DELETE FROM dbo.Cliente WHERE Id=2; ALTER TABLE dbo.Pedido WITH NOCHECK CHECK CONSTRAINT FK_Pedido_Cliente;');");
+
+        // Purga o histórico → a 1ª tentativa (automática) NÃO acha backup e o callback é acionado.
+        await It.TryPurgeBackupHistoryAsync(db.Name);
+
+        var prompts = 0;
+        var options = new ParentRecoveryOptions
+        {
+            InitialBackupPath = null,                                    // 1ª tentativa automática → falha
+            ChooseAnotherBackup = (prompt, ct) =>
+            {
+                prompts++;
+                return Task.FromResult<string?>(prompts == 1 ? bakPath : null); // oferece o .bak bom só uma vez
+            }
+        };
+
+        try
+        {
+            var result = await Repair().FixConstraintViolationsAsync(db.AsInfo("ONLINE"), It.Conn, It.NoProgress, default, options);
+
+            Assert.True(prompts >= 1);                                   // callback acionado (recuperação incompleta)
+            Assert.Equal(RepairStatus.Success, result.Status);
+            Assert.Equal(1, Convert.ToInt32(await It.ScalarAsync(       // pai recuperado via callback
+                $"SELECT COUNT(*) FROM {It.Q(db.Name)}.dbo.Cliente WHERE Id=2;")));
+            Assert.Equal(2, Convert.ToInt32(await It.ScalarAsync(       // filho preservado (nada removido)
+                $"SELECT COUNT(*) FROM {It.Q(db.Name)}.dbo.Pedido;")));
+        }
+        finally
+        {
+            var leftover = (await It.ScalarAsync(
+                "SELECT TOP 1 name FROM sys.databases WHERE name LIKE @p;", ("@p", db.Name + "_OrphanRecovery_%"))) as string;
+            if (leftover is not null) await It.ForceDropAsync(leftover);
+        }
     }
 
     /// <summary>Cria um esquema pai/filho com FK e injeta uma linha filha órfã (FK desabilitada e

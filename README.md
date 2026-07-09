@@ -25,9 +25,13 @@ Todo o T-SQL é **compatível com SQL Server 2008 R2** (e versões superiores).
   (`is_not_trusted`), `msdb.dbo.suspect_pages`, log de erros, topologia, espaço em disco e
   `PAGE_VERIFY`.
 - **Diagnóstico de qualquer banco** — inclusive `ONLINE` — sem precisar forçar `EMERGENCY` na mão.
-- **Correção de integridade lógica**: remove os **registros órfãos** (violação de FK) detectados,
-  restaurando a integridade referencial — com backup de segurança antes (operação destrutiva,
-  exige confirmação).
+- **Correção de integridade lógica com recuperação do registro-pai a partir de backup**: antes de
+  **remover** um registro órfão (violação de FK), a ferramenta tenta **reinserir o registro-pai que
+  faltava** a partir do backup FULL agendado mais recente — ou de um **`.bak` escolhido** pelo
+  usuário (útil quando o backup está em **outra mídia**) — preservando os registros filhos saudáveis.
+  Só cai na **remoção** (destrutiva, com backup de segurança e confirmação) o que não existir em
+  backup nenhum; se a recuperação for **parcial/ilegível**, a UI **oferece escolher outro `.bak`**
+  antes de qualquer exclusão.
 - **Escalonamento de reparo** do menos ao mais agressivo, **sempre primeiro SEM perda de dados**.
 - **Rede de segurança automática antes do reparo destrutivo**: captura o **tail-log WITH
   NO_TRUNCATE** (funciona mesmo com os arquivos de DADOS danificados — junto com a cadeia de
@@ -365,17 +369,50 @@ O `DBCC CHECKDB` valida a estrutura **física**, mas **não** verifica chaves es
 corrupção (ou um `REPAIR_ALLOW_DATA_LOSS` anterior, que desaloca páginas **sem** respeitar
 constraints) pode deixar uma linha cuja FK aponta para uma PK **inexistente** (registro órfão). O
 **`DBCC CHECKCONSTRAINTS`** detecta essas violações e devolve o predicado exato das linhas
-violadoras. A opção **"Corrigir integridade (remover registros órfãos)"**:
+violadoras — que carrega o **valor da chave** que falta no pai. A opção **"Corrigir integridade
+(remover registros órfãos)"**:
 
 - obtém acesso exclusivo (`SINGLE_USER`) e faz **backup/cópia de segurança** antes;
-- **remove** as linhas órfãs (apenas violações de **FK**; violações de **CHECK** são reportadas
-  para revisão manual), usando o predicado gerado pelo próprio SQL Server;
+- **tenta primeiro recuperar o registro-pai** que faltava, a partir de um backup (ver abaixo),
+  preservando os registros filhos saudáveis;
+- só então **remove** as linhas órfãs remanescentes (apenas violações de **FK**; violações de
+  **CHECK** são reportadas para revisão manual), usando o predicado gerado pelo próprio SQL Server;
 - **reverifica** com `CHECKCONSTRAINTS` ao final.
 
 Além disso, após qualquer `REPAIR_ALLOW_DATA_LOSS`, a ferramenta **reconcilia automaticamente** as
-chaves estrangeiras órfãs que a desalocação possa ter criado — deixando o banco **logicamente**
-consistente, não só fisicamente. Para preservar 100% dos registros, **restaurar de backup**
-continua sendo o caminho preferido.
+chaves estrangeiras órfãs que a desalocação possa ter criado (mesma recuperação de pai + remoção do
+que sobrar) — deixando o banco **logicamente** consistente, não só fisicamente.
+
+#### Recuperação automática do registro-pai a partir de backup
+
+Quando uma linha filha ficou órfã porque o **pai** foi descartado (por corrupção ou por um
+`REPAIR_ALLOW_DATA_LOSS`), o dado filho geralmente está **saudável** — só perdeu a referência.
+Como o `CHECKCONSTRAINTS` entrega o valor **exato** da chave ausente, a ferramenta consegue trazer
+o pai de volta em vez de descartar o filho:
+
+1. restaura o **último backup FULL agendado** (não-`COPY_ONLY`, **somente o FULL, sem logs** — para
+   não reproduzir a própria remoção do pai) em um **banco paralelo descartável**
+   (`..._OrphanRecovery_*`), via `RestoreService.RestoreAsCopyAsync`;
+2. resolve, pelo catálogo (`sys.foreign_keys`/`sys.foreign_key_columns`), a **tabela-pai** e o
+   mapeamento coluna-filha → coluna-pai (cobre **chaves compostas**), reescreve o predicado para o
+   pai e **reinsere** a linha-pai no banco vivo (`INSERT … SELECT` cross-database, com
+   `IDENTITY_INSERT` quando há identidade) — só o que faltava, sem duplicar (violação de PK é tratada
+   como sucesso);
+3. reverifica e **só remove** os órfãos cujo pai não existir em backup nenhum; o banco paralelo é
+   sempre descartado ao final.
+
+**Escolha do backup e outra mídia.** Por padrão a recuperação usa o histórico do `msdb`. Nos painéis
+de correção e de reparo com perda há a opção **"Recuperação de registros-pai" → "📁 Escolher .bak…"**,
+para apontar um arquivo específico — indispensável quando o backup está em **outra mídia** que o
+`msdb` nem conhece. Se a recuperação **falhar ou for parcial** (arquivo ilegível, sem FULL, ou sem o
+pai procurado), a ferramenta **pergunta antes de remover** se você quer **escolher outro `.bak`** e
+tentar de novo, mirando só os órfãos restantes — e só remove quando você optar por prosseguir.
+
+> ⚠️ O arquivo escolhido precisa ser **legível pela conta de serviço do SQL Server** (o `RESTORE`
+> roda no servidor), não pelo aplicativo. Para servidor remoto, use um caminho de rede (UNC)
+> acessível à conta de serviço.
+
+Para preservar 100% dos registros, **restaurar de backup** continua sendo o caminho preferido.
 
 ### Restaurar de backup (corrupção de dados)
 
@@ -455,7 +492,9 @@ dotnet test RestoreDB.slnx
 **Testes de integração** ([`tests/RestoreDB.IntegrationTests`](tests/RestoreDB.IntegrationTests)) —
 exercitam os serviços reais contra uma instância SQL: conexão/`ServerInfo`, reparo `OFFLINE`,
 `EMERGENCY` e `RESTORING`, diagnóstico estruturado (CHECKDB/`suspect_pages`/topologia/disco),
-restauração de backup (revertendo perda de dados) e `HEADERONLY`/`FILELISTONLY`. Cada teste cria
+restauração de backup (revertendo perda de dados), **recuperação de registros-pai órfãos a partir
+de backup** (automática, com `.bak` escolhido e com o novo backup interativo via callback) e
+`HEADERONLY`/`FILELISTONLY`. Cada teste cria
 e **derruba** seu próprio banco `RestoreDB_IT_*` (isolado) e limpa os backups gerados. Sem as
 variáveis de ambiente abaixo, esses testes são **ignorados** (o `dotnet test` padrão segue verde).
 
@@ -470,12 +509,15 @@ $env:RESTOREDB_IT_USE_WINDOWS  = "1"
 dotnet test tests/RestoreDB.IntegrationTests
 ```
 
-> Validado contra **SQL Server 2022 (Developer Edition)** e, em produção, contra
-> **SQL Server 2008 R2 SP3 (Express Edition, 10.50.6000.34)** com **autenticação do Windows**:
-> **78 testes de lógica + 31 de integração** aprovados, e os fluxos de reparo exercitados com
-> **corrupção física real** (`DBCC WRITEPAGE`) sobre uma cópia de um banco de produção (≈900 MB)
-> — ver abaixo. O `Microsoft.Data.SqlClient` conecta-se ao 2008 R2 negociando TLS 1.0 (emite
-> apenas um **aviso** benigno; `Encrypt=Optional` torna a conexão possível).
+> Validado contra **SQL Server 2008 (major 10)** e **SQL Server 2025 (major 17)** — ambos com
+> **autenticação do Windows** — e, em produção, contra **SQL Server 2008 R2 SP3 (Express Edition,
+> 10.50.6000.34)**: **92 testes de lógica + 34 de integração** aprovados **nas duas versões**, e os
+> fluxos de reparo exercitados com **corrupção física real** (`DBCC WRITEPAGE`) sobre cópias de
+> bancos de produção de teste (≈900 MB). A **recuperação de registro-pai a partir de backup** foi
+> atestada **ponta a ponta nas duas versões**: remover um registro-pai real, recuperá-lo do backup
+> (histórico e `.bak` escolhido) e **preservar o registro filho** — com efeito líquido zero. O
+> `Microsoft.Data.SqlClient` conecta-se ao 2008 negociando TLS 1.0 (emite apenas um **aviso**
+> benigno; `Encrypt=Optional` torna a conexão possível).
 
 ### Validação com corrupção real
 

@@ -30,6 +30,26 @@ BEGIN
            (1003, N'Cliente C', 1200.00);
 END
 GO
+-- Tabela FILHA com FK para NotaFiscal — exercita a recuperação automática de registros-pai
+-- órfãos a partir de backup (antes de excluir os itens saudáveis cujo pai sumiu no reparo).
+IF OBJECT_ID(N'dbo.ItemNotaFiscal', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.ItemNotaFiscal
+    (
+        ItemNotaFiscalId int IDENTITY(1,1) PRIMARY KEY,
+        NotaFiscalId     int           NOT NULL,
+        Descricao        nvarchar(200) NOT NULL,
+        Quantidade       int           NOT NULL DEFAULT (1),
+        CONSTRAINT FK_ItemNotaFiscal_NotaFiscal
+            FOREIGN KEY (NotaFiscalId) REFERENCES dbo.NotaFiscal (NotaFiscalId)
+    );
+
+    INSERT INTO dbo.ItemNotaFiscal (NotaFiscalId, Descricao, Quantidade)
+    VALUES (1, N'Item da NF 1001', 2),
+           (2, N'Item da NF 1002', 1),
+           (3, N'Item da NF 1003', 5);
+END
+GO
 USE [master];
 GO
 

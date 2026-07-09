@@ -35,6 +35,9 @@ public partial class MainWindow : Window
     /// <summary>Nome do banco de cópia recuperada, para o assistente de salvamento (cópia → vivo).</summary>
     private string? _salvageCopyName;
 
+    /// <summary>.bak escolhido pelo usuário para a recuperação de registros-pai órfãos (opcional; vazio = automático via histórico).</summary>
+    private string? _recoveryBackupPath;
+
     /// <summary>Transações destrutivas listadas pela forense, para a restauração ponto-no-tempo.</summary>
     private List<ForensicTransaction> _forensicTx = new();
 
@@ -45,8 +48,8 @@ public partial class MainWindow : Window
         _connectionString = connectionString;
         _serverName = serverName;
         _serverInfo = serverInfo ?? new ServerInfo();
-        _repairService = new RepairService(_logService);
         _restoreService = new RestoreService(_logService);
+        _repairService = new RepairService(_logService, _restoreService);
         _maintenanceService = new MaintenanceService(_logService);
         _progress = new Progress<RepairLogEntry>(OnLogEntry);
 
@@ -192,6 +195,8 @@ public partial class MainWindow : Window
             ConstraintFixPanel.Visibility = Visibility.Collapsed;
             ConstraintFixConfirmCheck.IsChecked = false;
             ConstraintFixButton.IsEnabled = false;
+            _recoveryBackupPath = null; // a escolha de backup não vaza entre bancos
+            UpdateRecoveryBackupLabels();
             RestorePanel.Visibility = Visibility.Collapsed;
             SalvagePanel.Visibility = Visibility.Collapsed;
             _salvageCopyName = null;
@@ -546,6 +551,69 @@ public partial class MainWindow : Window
     private void ConstraintFixConfirmCheck_Changed(object sender, RoutedEventArgs e)
         => ConstraintFixButton.IsEnabled = ConstraintFixConfirmCheck.IsChecked == true && !_busy;
 
+    // ---- Backup opcional para a recuperação de registros-pai (usado pelos painéis de correção e de reparo com perda) ----
+
+    private void ChooseRecoveryBackupButton_Click(object sender, RoutedEventArgs e)
+    {
+        var dialog = new OpenFileDialog
+        {
+            Title = "Escolher backup (.bak) para recuperar registros-pai",
+            Filter = "Backup do SQL Server (*.bak)|*.bak|Todos os arquivos (*.*)|*.*"
+        };
+        if (dialog.ShowDialog(this) != true) return;
+        _recoveryBackupPath = dialog.FileName;
+        UpdateRecoveryBackupLabels();
+    }
+
+    private void ClearRecoveryBackupButton_Click(object sender, RoutedEventArgs e)
+    {
+        _recoveryBackupPath = null;
+        UpdateRecoveryBackupLabels();
+    }
+
+    private void UpdateRecoveryBackupLabels()
+    {
+        var text = string.IsNullOrEmpty(_recoveryBackupPath)
+            ? "Automático: usa o backup FULL mais recente do histórico. Escolha um .bak se o backup estiver em outra mídia (o SQL Server precisa conseguir lê-lo)."
+            : $"Usando o backup escolhido: {_recoveryBackupPath}";
+        RecoveryBakFixText.Text = text;
+        RecoveryBakLossText.Text = text;
+    }
+
+    private ParentRecoveryOptions BuildRecoveryOptions() => new()
+    {
+        InitialBackupPath = _recoveryBackupPath,
+        ChooseAnotherBackup = PromptForAnotherBackupAsync
+    };
+
+    /// <summary>
+    /// Chamado pelo serviço quando a recuperação de registros-pai falhou/foi parcial: pergunta ao
+    /// usuário se quer escolher OUTRO .bak (ex.: em outra mídia) antes de remover os órfãos. Sempre
+    /// na thread de UI. Devolve o novo caminho, ou null para prosseguir com a remoção.
+    /// </summary>
+    private Task<string?> PromptForAnotherBackupAsync(ParentRecoveryPrompt prompt, CancellationToken ct)
+        => Dispatcher.InvokeAsync(() =>
+        {
+            var msg =
+                $"A recuperação de registros-pai de \"{prompt.DatabaseName}\" não resolveu tudo:\n\n" +
+                $"• Motivo: {prompt.Reason}\n" +
+                $"• Registros-pai recuperados até agora: {prompt.Recovered}\n" +
+                $"• Órfãos ainda SEM pai: {prompt.RemainingOrphans}\n\n" +
+                "Deseja escolher OUTRO arquivo .bak (ex.: em outra mídia) para tentar recuperar os pais restantes?\n\n" +
+                "Sim = escolher outro backup e tentar de novo.\n" +
+                "Não = prosseguir REMOVENDO os órfãos remanescentes (irreversível).";
+            var choice = MessageBox.Show(msg, "Recuperação de registros-pai incompleta",
+                MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.Yes);
+            if (choice != MessageBoxResult.Yes) return (string?)null;
+
+            var dlg = new OpenFileDialog
+            {
+                Title = "Escolher outro .bak para recuperar registros-pai",
+                Filter = "Backup do SQL Server (*.bak)|*.bak|Todos os arquivos (*.*)|*.*"
+            };
+            return dlg.ShowDialog(this) == true ? dlg.FileName : (string?)null;
+        }).Task;
+
     private void ConstraintFixButton_Click(object sender, RoutedEventArgs e)
     {
         if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
@@ -554,6 +622,9 @@ public partial class MainWindow : Window
             $"Corrigir a integridade do banco \"{db.Name}\" REMOVENDO os registros órfãos?\n\n" +
             "As linhas cuja chave estrangeira aponta para um registro inexistente serão EXCLUÍDAS " +
             "de forma irreversível. Será feito um backup de segurança antes.\n\n" +
+            "Se houver um backup completo disponível, a ferramenta tentará primeiro recuperar " +
+            "automaticamente os registros-pai a partir dele para evitar excluir os registros filhos " +
+            "(melhor esforço — pode não encontrar tudo, ou não haver backup disponível).\n\n" +
             "Para preservar 100% dos registros, prefira restaurar de backup. Deseja continuar?",
             "Confirmar correção de integridade",
             MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
@@ -571,7 +642,7 @@ public partial class MainWindow : Window
         StatusText.Text = $"Corrigindo integridade de \"{db.Name}\"...";
         try
         {
-            var result = await _repairService.FixConstraintViolationsAsync(db, _connectionString, _progress, _cts!.Token);
+            var result = await _repairService.FixConstraintViolationsAsync(db, _connectionString, _progress, _cts!.Token, BuildRecoveryOptions());
             HandleRepairResult(db, result);
             if (result.Status == RepairStatus.Success)
                 ConstraintFixPanel.Visibility = Visibility.Collapsed;
@@ -1386,6 +1457,10 @@ public partial class MainWindow : Window
             "Esta operação pode descartar dados corrompidos. Antes de executar, a ferramenta tentará " +
             "preservar as transações mais recentes (tail-log) e criar um backup de segurança; ao final, " +
             "um backup FULL novo é gerado. Os arquivos ficam na pasta padrão de backups do servidor.\n\n" +
+            "Se o reparo deixar chaves estrangeiras órfãs e houver um backup completo disponível, a " +
+            "ferramenta tentará primeiro recuperar automaticamente os registros-pai a partir dele para " +
+            "evitar excluir os registros filhos (melhor esforço — pode não encontrar tudo, ou não haver " +
+            "backup disponível).\n\n" +
             "Deseja continuar?",
             "Confirmar reparo com perda de dados",
             MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
@@ -1407,7 +1482,7 @@ public partial class MainWindow : Window
 
         try
         {
-            var result = await _repairService.RepairAsync(db, _connectionString, allowDataLoss, _progress, _cts!.Token);
+            var result = await _repairService.RepairAsync(db, _connectionString, allowDataLoss, _progress, _cts!.Token, BuildRecoveryOptions());
             HandleRepairResult(db, result);
             StatusText.Text = result.Message;
         }
@@ -1614,6 +1689,10 @@ public partial class MainWindow : Window
         ForensicRestoreButton.IsEnabled = !busy;
         AttachButton.IsEnabled = !busy;
         ViewScriptButton.IsEnabled = !busy;
+        ChooseRecoveryBakFixButton.IsEnabled = !busy;
+        ClearRecoveryBakFixButton.IsEnabled = !busy;
+        ChooseRecoveryBakLossButton.IsEnabled = !busy;
+        ClearRecoveryBakLossButton.IsEnabled = !busy;
 
         RepairBusyBar.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
     }

@@ -212,10 +212,28 @@ confirmação** ([8.4](#84-reparo-com-possível-perda-de-dados-exige-confirmaç�
 ### 8.3. Corrigir integridade (remover registros órfãos)
 **Quando:** o diagnóstico encontrou **violações de chave estrangeira** (registros órfãos), com os
 arquivos físicos íntegros.
-**O que faz:** obtém acesso exclusivo, faz **backup de segurança** e **remove** as linhas órfãs (só
-violações de chave estrangeira; violações de CHECK são apenas reportadas), reverificando ao final.
-**Atenção:** é destrutivo (descarta linhas) — exige confirmação. Para preservar 100% dos registros,
-prefira **restaurar de backup**.
+**O que faz:** obtém acesso exclusivo, faz **backup de segurança** e, **antes de remover qualquer
+linha, tenta recuperar o "registro-pai" que faltava a partir de um backup** — assim o registro
+**filho** (que normalmente está saudável, apenas sem referência) é **preservado**. Só as linhas cujo
+pai **não existir em backup nenhum** são **removidas** (só violações de chave estrangeira; violações
+de CHECK são apenas reportadas). Reverifica ao final.
+
+**Recuperação do registro-pai a partir de backup (opcional).** No painel há o bloco
+**"RECUPERAÇÃO DE REGISTROS-PAI"**:
+- **Automático** (padrão): usa o **backup FULL mais recente** do histórico do servidor.
+- **📁 Escolher .bak…**: aponte um arquivo específico — útil quando o backup está em **outra mídia**
+  (HD externo, pasta de rede) que o histórico do servidor nem conhece. O botão **↺ Automático** volta
+  ao padrão.
+- Se a recuperação **falhar ou recuperar só parte** (arquivo ilegível, sem um backup FULL, ou sem o
+  pai procurado), a ferramenta **pergunta se você quer escolher OUTRO `.bak`** e tentar de novo,
+  mirando só os órfãos restantes — e **só remove os órfãos** quando você optar por **prosseguir**.
+  Nada é excluído sem essa decisão.
+
+**Atenção:** a remoção é destrutiva (descarta linhas) — exige confirmação. Para preservar 100% dos
+registros, prefira **restaurar de backup**.
+> 📁 O arquivo `.bak` escolhido precisa ser **legível pelo SQL Server** (a restauração roda no
+> servidor, não no aplicativo). Para servidor remoto, informe um caminho de **rede (UNC)** acessível
+> à conta de serviço do SQL Server.
 
 ### 8.4. Reparo COM possível perda de dados (exige confirmação)
 **Quando:** o reparo seguro não resolveu e não há (ou não se quer) restaurar de backup. O painel
@@ -226,10 +244,12 @@ por tabela** e se o banco ficaria limpo. **O banco real não é tocado.**
 **O que faz (ao confirmar):** primeiro a **rede de segurança automática** — captura as transações
 mais recentes (**tail-log**, que funciona mesmo com os arquivos de dados danificados) e um backup
 de segurança (`COPY_ONLY`); depois executa `DBCC CHECKDB … REPAIR_ALLOW_DATA_LOSS`, que
-**descarta** páginas corrompidas. Em seguida, **reconcilia** chaves estrangeiras que a operação
-possa ter deixado órfãs, **reajusta as identidades** e cria um **backup FULL novo** (os backups
-antigos deixam de ser confiáveis após o reparo). Os arquivos ficam na **pasta padrão de backups do
-servidor**.
+**descarta** páginas corrompidas. Em seguida, **reconcilia** as chaves estrangeiras que a operação
+possa ter deixado órfãs — **recuperando o registro-pai a partir de um backup quando possível**
+(mesmo mecanismo da [seção 8.3](#83-corrigir-integridade-remover-registros-órfãos), inclusive a
+opção de escolher um `.bak` em outra mídia) e removendo só os órfãos irrecuperáveis —, **reajusta as
+identidades** e cria um **backup FULL novo** (os backups antigos deixam de ser confiáveis após o
+reparo). Os arquivos ficam na **pasta padrão de backups do servidor**.
 **Como usar:** marque **“Estou ciente e autorizo…”**, clique em **“Executar reparo COM perda de
 dados”** e confirme.
 > ⚠️ **Pode haver perda de dados** — prefira sempre **restaurar de backup**. Mas, se o banco tem
@@ -384,6 +404,11 @@ sessão a outra pessoa, use **Exportar relatório** (HTML).
   recentes (**tail-log**, mesmo com os dados danificados) + backup de segurança + cópia dos
   arquivos (quando possível). Com cadeia de backups, o que o reparo descartar **pode ser
   recuperado depois**.
+- **Recuperação do registro-pai antes de remover órfãos:** ao corrigir integridade (ou reconciliar
+  chaves estrangeiras após um reparo com perda), a ferramenta tenta **trazer o registro-pai de volta
+  a partir de um backup** — preservando os filhos saudáveis — e só remove o que não existir em backup
+  nenhum. Pode-se **apontar um `.bak` de outra mídia** e, se a recuperação ficar incompleta, ela
+  **pergunta antes de excluir**.
 - **Backup FULL novo após reparo destrutivo/reconstrução de log** — nova base da cadeia de backups.
 - **Cadeias de restauração validadas** antes de executar; conjuntos que não podem ser restaurados
   sozinhos (diferencial/log) geram **aviso com orientação**.
@@ -463,6 +488,14 @@ Não confie neles: o reparo altera a estrutura do banco. A ferramenta cria autom
 **backup FULL novo** (arquivo `*_PosReparo_*.bak`) — ele é a nova base. Configure a rotina de
 backups a partir dele.
 
+**Ao corrigir integridade, dá para preservar os registros filhos em vez de apagá-los?**
+Sim. Antes de remover um órfão, a ferramenta tenta **recuperar o registro-pai** que faltava a partir
+de um backup (o FULL mais recente do histórico) — com isso o filho é **preservado**. Se o seu backup
+estiver em **outra mídia** (HD externo, pasta de rede), use **"RECUPERAÇÃO DE REGISTROS-PAI → 📁
+Escolher .bak…"** no painel. Se a recuperação não resolver tudo, a ferramenta **pergunta antes de
+remover** se você quer apontar outro `.bak`. O arquivo precisa ser **legível pelo SQL Server** (a
+restauração roda no servidor; para servidor remoto, use um caminho de rede UNC).
+
 ---
 
 ## 18. Glossário rápido
@@ -472,6 +505,9 @@ backups a partir dele.
 - **`REPAIR_REBUILD`** — reparo **sem** perda (estruturas reconstruíveis).
 - **`REPAIR_ALLOW_DATA_LOSS`** — reparo que pode **descartar** dados corrompidos.
 - **Registro órfão** — linha cuja **chave estrangeira** aponta para um registro que não existe.
+- **Registro-pai / registro-filho** — numa chave estrangeira, o **pai** é o registro referenciado
+  (a chave primária) e o **filho** é o que aponta para ele. Um filho fica **órfão** quando o pai
+  some — a ferramenta tenta **recuperar o pai do backup** antes de remover o filho.
 - **Ponto-no-tempo (STOPAT)** — restaurar até um instante específico (logo antes de um erro).
 - **STANDBY** — banco restaurado em **somente leitura**, consultável entre os logs.
 - **Tail-log** — backup das transações mais recentes, capturado antes de sobrescrever.
