@@ -22,6 +22,7 @@ public partial class MainWindow : Window
     private readonly RepairService _repairService;
     private readonly RestoreService _restoreService;
     private readonly MaintenanceService _maintenanceService;
+    private readonly AvailabilityService _availabilityService;
     private readonly ReportService _reportService = new();
 
     private readonly ObservableCollection<DatabaseInfo> _databases = new();
@@ -41,6 +42,12 @@ public partial class MainWindow : Window
     /// <summary>Transações destrutivas listadas pela forense, para a restauração ponto-no-tempo.</summary>
     private List<ForensicTransaction> _forensicTx = new();
 
+    /// <summary>Último diagnóstico do banco selecionado (arquivos inacessíveis, etc.).</summary>
+    private DiagnosisResult? _lastDiagnosis;
+
+    /// <summary>Novos caminhos escolhidos pelo usuário para arquivos ausentes (nome lógico → caminho).</summary>
+    private readonly Dictionary<string, string> _fileRelocations = new(StringComparer.OrdinalIgnoreCase);
+
     public MainWindow(string connectionString, string serverName, ServerInfo? serverInfo = null)
     {
         InitializeComponent();
@@ -51,6 +58,7 @@ public partial class MainWindow : Window
         _restoreService = new RestoreService(_logService);
         _repairService = new RepairService(_logService, _restoreService);
         _maintenanceService = new MaintenanceService(_logService);
+        _availabilityService = new AvailabilityService(_logService);
         _progress = new Progress<RepairLogEntry>(OnLogEntry);
 
         DatabasesGrid.ItemsSource = _databases;
@@ -209,6 +217,12 @@ public partial class MainWindow : Window
             ForensicList.Visibility = Visibility.Collapsed;
             ForensicRestoreButton.Visibility = Visibility.Collapsed;
             ForensicList.ItemsSource = null;
+            ForensicRecoverRowsButton.Visibility = Visibility.Collapsed;
+            LogFullPanel.Visibility = Visibility.Collapsed;
+            FileAccessPanel.Visibility = Visibility.Collapsed;
+            _fileRelocations.Clear();
+            _lastDiagnosis = null;
+            RecoverLostRowsCheck.IsChecked = true;
             ViewScriptButton.Visibility = Visibility.Collapsed;
             _backupSets.Clear();
             BackupSourceText.Text = string.Empty;
@@ -255,6 +269,7 @@ public partial class MainWindow : Window
         {
             var physicalOnly = PhysicalOnlyCheck.IsChecked == true;
             var diag = await _repairService.DiagnoseAsync(db, _connectionString, _progress, _cts!.Token, physicalOnly);
+            _lastDiagnosis = diag;
 
             DiagnosisSummaryText.Text = diag.Summary;
             RecoActionNameText.Text = RecommendedActionLabel(diag.RecommendedAction);
@@ -301,6 +316,8 @@ public partial class MainWindow : Window
     private async Task ApplyDiagnosisGatingAsync(DatabaseInfo db, DiagnosisResult diag)
     {
         // Estado inicial: tudo oculto; cada caso revela o que faz sentido.
+        LogFullPanel.Visibility = Visibility.Collapsed;
+        FileAccessPanel.Visibility = Visibility.Collapsed;
         IndexRepairPanel.Visibility = Visibility.Collapsed;
         ConstraintFixPanel.Visibility = Visibility.Collapsed;
         SafeRepairPanel.Visibility = Visibility.Collapsed;
@@ -374,7 +391,24 @@ public partial class MainWindow : Window
                 ShowLogRebuildOption(db, force: true);
                 break;
 
-            // Log cheio / pouco espaço: liberar espaço e religar (modo seguro).
+            // Log de transações cheio (9002): resolução dedicada, sem perda de dados.
+            case RecommendedActionKind.ResolveLogFull:
+                LogFullPanel.Visibility = Visibility.Visible;
+                if (diag.LogSpace is { } ls)
+                    LogFullText.Text = "Não é corrupção. " + ls.Summary + " A ferramenta libera o espaço (backup de log, crescimento do " +
+                                       "arquivo ou um arquivo de log extra em outro disco) e religa o banco.";
+                break;
+
+            // Arquivo ausente / sem permissão / preso por outro processo: apontar, conceder acesso, religar.
+            case RecommendedActionKind.FixFileAccess:
+                FileAccessPanel.Visibility = Visibility.Visible;
+                _fileRelocations.Clear();
+                UpdateFileAccessText(diag);
+                LocateFileButton.Visibility = diag.FileProblems.Any(f => f.Kind == FileProblemKind.Missing)
+                    ? Visibility.Visible : Visibility.Collapsed;
+                break;
+
+            // Pouco espaço em disco: liberar espaço e religar (modo seguro).
             case RecommendedActionKind.FreeDiskSpace:
                 SafeRepairPanel.Visibility = Visibility.Visible;
                 ViewScriptButton.Visibility = Visibility.Visible;
@@ -414,6 +448,8 @@ public partial class MainWindow : Window
         RecommendedActionKind.RebuildLog => "→ Ação recomendada: reconstruir o log de transações.",
         RecommendedActionKind.FixConstraints => "→ Ação recomendada: corrigir integridade lógica (remover registros órfãos).",
         RecommendedActionKind.FreeDiskSpace => "→ Ação recomendada: liberar espaço em disco e religar o banco.",
+        RecommendedActionKind.ResolveLogFull => "→ Ação recomendada: resolver o log de transações cheio (sem perda de dados).",
+        RecommendedActionKind.FixFileAccess => "→ Ação recomendada: corrigir o acesso aos arquivos do banco e religar (sem perda de dados).",
         _ => "→ Ação recomendada: reparo no modo seguro."
     };
 
@@ -426,6 +462,8 @@ public partial class MainWindow : Window
         RecommendedActionKind.RestoreFromBackup => ("ProblemBackBrush", "ProblemForeBrush"),
         RecommendedActionKind.PageRestore => ("ProblemBackBrush", "ProblemForeBrush"),
         RecommendedActionKind.FixConstraints => ("WarnBackBrush", "WarnForeBrush"),
+        RecommendedActionKind.ResolveLogFull => ("OkBackBrush", "OkForeBrush"),
+        RecommendedActionKind.FixFileAccess => ("OkBackBrush", "OkForeBrush"),
         _ => ("WarnBackBrush", "WarnForeBrush")
     };
 
@@ -441,6 +479,70 @@ public partial class MainWindow : Window
         findings.AddRange(diag.HealthFindings);
         FindingsList.ItemsSource = findings;
         PolicyHeader.Visibility = findings.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    // ------------------------------------------------------------------ Log cheio (9002) — sem perda
+
+    private void ResolveLogFullButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+        _ = RunSimpleActionAsync(db, $"Liberando o log de transações de \"{db.Name}\"...",
+            ct => _availabilityService.ResolveLogFullAsync(db, _connectionString, _progress, ct),
+            "Não foi possível resolver o log cheio.");
+    }
+
+    // ------------------------------------------------------------------ Arquivos inacessíveis — sem perda
+
+    private void UpdateFileAccessText(DiagnosisResult diag)
+    {
+        var lines = diag.FileProblems.Select(f =>
+            "• " + f.Display + (_fileRelocations.TryGetValue(f.LogicalName, out var np) ? $"  →  novo caminho: {np}" : string.Empty));
+        FileAccessText.Text = "Não é corrupção — o SQL Server não consegue abrir:\n" + string.Join("\n", lines) +
+                              "\n\nAponte onde está cada arquivo ausente (se foi movido) e clique em 'Corrigir acesso aos arquivos e religar'.";
+    }
+
+    private void LocateFileButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_lastDiagnosis is null) return;
+        foreach (var f in _lastDiagnosis.FileProblems.Where(x => x.Kind == FileProblemKind.Missing))
+        {
+            var dlg = new OpenFileDialog
+            {
+                Title = $"Onde está agora o arquivo {Path.GetFileName(f.PhysicalName)} ({f.LogicalName})?",
+                FileName = Path.GetFileName(f.PhysicalName),
+                Filter = f.IsLog ? "Arquivo de log SQL (*.ldf)|*.ldf|Todos os arquivos (*.*)|*.*"
+                                 : "Arquivo de dados SQL (*.mdf;*.ndf)|*.mdf;*.ndf|Todos os arquivos (*.*)|*.*"
+            };
+            if (dlg.ShowDialog(this) == true) _fileRelocations[f.LogicalName] = dlg.FileName;
+        }
+        UpdateFileAccessText(_lastDiagnosis);
+    }
+
+    private void FixFileAccessButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+        var relocations = new Dictionary<string, string>(_fileRelocations, StringComparer.OrdinalIgnoreCase);
+        _ = RunSimpleActionAsync(db, $"Corrigindo o acesso aos arquivos de \"{db.Name}\"...",
+            ct => _availabilityService.FixFileAccessAsync(db, _connectionString, _progress, ct, relocations),
+            "Não foi possível corrigir o acesso aos arquivos.");
+    }
+
+    /// <summary>Executa uma ação de serviço NÃO destrutiva com o mesmo ciclo das demais (busy, resultado, estado).</summary>
+    private async Task RunSimpleActionAsync(DatabaseInfo db, string status, Func<CancellationToken, Task<RepairResult>> action, string errorTitle)
+    {
+        if (_busy) return;
+        SetBusy(true);
+        ResultPanel.Visibility = Visibility.Collapsed;
+        StatusText.Text = status;
+        try
+        {
+            var result = await action(_cts!.Token);
+            HandleRepairResult(db, result);
+            StatusText.Text = result.Message;
+        }
+        catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
+        catch (Exception ex) { StatusText.Text = errorTitle; ShowError(errorTitle, ex); }
+        finally { SetBusy(false); RefreshStateLabels(db); }
     }
 
     // ------------------------------------------------------------------ Verificações avançadas (CHECKTABLE / reseed)
@@ -583,6 +685,7 @@ public partial class MainWindow : Window
     private ParentRecoveryOptions BuildRecoveryOptions() => new()
     {
         InitialBackupPath = _recoveryBackupPath,
+        RecoverLostRows = RecoverLostRowsCheck.IsChecked == true,
         ChooseAnotherBackup = PromptForAnotherBackupAsync
     };
 
@@ -1260,6 +1363,7 @@ public partial class MainWindow : Window
             ForensicList.ItemsSource = _forensicTx;
             ForensicList.Visibility = Visibility.Visible;
             ForensicRestoreButton.Visibility = _forensicTx.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+            ForensicRecoverRowsButton.Visibility = _forensicTx.Any(t => t.CanRecoverRowsInPlace) ? Visibility.Visible : Visibility.Collapsed;
             StatusText.Text = _forensicTx.Count > 0
                 ? $"{_forensicTx.Count} transação(ões) destrutiva(s) recente(s) no log ativo."
                 : "Nenhuma exclusão recente encontrada no log ativo (pode já ter sido truncado).";
@@ -1282,6 +1386,56 @@ public partial class MainWindow : Window
             "Confirmar recuperação ponto-no-tempo", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
         if (confirm == MessageBoxResult.Yes)
             _ = RunRestoreChainAsync(db, target);
+    }
+
+    private void ForensicRecoverRowsButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+        if (ForensicList.SelectedItem is not ForensicTransaction tx) { ShowError("Selecione uma transação na lista.", new InvalidOperationException("Nenhuma transação selecionada.")); return; }
+        if (!tx.CanRecoverRowsInPlace)
+        {
+            ShowError("Esta transação não é uma exclusão de linhas numa tabela identificada (DROP/TRUNCATE ou tabela desconhecida). " +
+                      "Use 'Restaurar o banco inteiro até ANTES' ou 'Recuperar para cópia'.", new InvalidOperationException("Transação não suportada."));
+            return;
+        }
+        if (tx.BeginTime is not DateTime begin) { ShowError("Não foi possível determinar o instante da transação.", new InvalidOperationException("Sem horário.")); return; }
+
+        var target = begin.AddSeconds(-1);
+        var confirm = MessageBox.Show(
+            $"Devolver à tabela {tx.Table} de \"{db.Name}\" as linhas que existiam em {target:yyyy-MM-dd HH:mm:ss} (logo ANTES do DELETE de {begin:HH:mm:ss})?\n\n" +
+            "O banco NÃO é sobrescrito: uma cópia temporária é restaurada até esse instante e só as linhas que faltam voltam " +
+            "(por chave primária, sem duplicar). Tudo o que foi feito depois continua no banco.\n\n" +
+            "Atenção: linhas dessa tabela excluídas DE PROPÓSITO depois desse instante também voltariam.\n\nContinuar?",
+            "Confirmar recuperação das linhas excluídas", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.Yes);
+        if (confirm != MessageBoxResult.Yes) return;
+
+        _ = RunRecoverDeletedRowsAsync(db, target, tx.Table);
+    }
+
+    private async Task RunRecoverDeletedRowsAsync(DatabaseInfo db, DateTime target, string table)
+    {
+        if (_busy) return;
+        SetBusy(true);
+        ResultPanel.Visibility = Visibility.Collapsed;
+        StatusText.Text = $"Recuperando as linhas excluídas de {table}...";
+        try
+        {
+            var result = await _restoreService.RecoverDeletedRowsAsync(db.Name, target, new[] { table }, _connectionString, _progress, _cts!.Token);
+            HandleRepairResult(db, result);
+            StatusText.Text = result.Message;
+            if (!string.IsNullOrEmpty(result.BackupFile))
+            {
+                // Cópia mantida (alguma tabela não pôde ser tratada automaticamente): oferece o assistente.
+                await LoadDatabasesAsync();
+                _salvageCopyName = result.BackupFile;
+                SalvageHintText.Text = $"Cópia [{result.BackupFile}] (estado de antes da exclusão) mantida. Selecione uma tabela e traga de volta ao banco \"{db.Name}\" as linhas que faltam.";
+                await PopulateSalvageTablesAsync(result.BackupFile);
+                SalvagePanel.Visibility = Visibility.Visible;
+            }
+        }
+        catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
+        catch (Exception ex) { StatusText.Text = "Falha ao recuperar as linhas."; ShowError("Não foi possível recuperar as linhas excluídas.", ex); }
+        finally { SetBusy(false); }
     }
 
     // ------------------------------------------------------------------ Anexar banco a partir de .mdf
@@ -1457,6 +1611,10 @@ public partial class MainWindow : Window
             "Esta operação pode descartar dados corrompidos. Antes de executar, a ferramenta tentará " +
             "preservar as transações mais recentes (tail-log) e criar um backup de segurança; ao final, " +
             "um backup FULL novo é gerado. Os arquivos ficam na pasta padrão de backups do servidor.\n\n" +
+            (RecoverLostRowsCheck.IsChecked == true
+                ? "Se a cadeia de backups chegar até o instante do reparo, as linhas que ele descartar serão " +
+                  "DEVOLVIDAS automaticamente a partir dos backups.\n\n"
+                : string.Empty) +
             "Se o reparo deixar chaves estrangeiras órfãs e houver um backup completo disponível, a " +
             "ferramenta tentará primeiro recuperar automaticamente os registros-pai a partir dele para " +
             "evitar excluir os registros filhos (melhor esforço — pode não encontrar tudo, ou não haver " +
@@ -1549,6 +1707,8 @@ public partial class MainWindow : Window
                 DataLossPanel.Visibility = Visibility.Collapsed;
                 LogRebuildPanel.Visibility = Visibility.Collapsed;
                 IndexRepairPanel.Visibility = Visibility.Collapsed;
+                LogFullPanel.Visibility = Visibility.Collapsed;
+                FileAccessPanel.Visibility = Visibility.Collapsed;
                 ConstraintFixPanel.Visibility = Visibility.Collapsed;
                 RestorePanel.Visibility = Visibility.Collapsed;
                 TopologyWarnPanel.Visibility = Visibility.Collapsed;
@@ -1687,6 +1847,10 @@ public partial class MainWindow : Window
         ScheduleButton.IsEnabled = !busy;
         ForensicButton.IsEnabled = !busy;
         ForensicRestoreButton.IsEnabled = !busy;
+        ForensicRecoverRowsButton.IsEnabled = !busy;
+        ResolveLogFullButton.IsEnabled = !busy;
+        LocateFileButton.IsEnabled = !busy;
+        FixFileAccessButton.IsEnabled = !busy;
         AttachButton.IsEnabled = !busy;
         ViewScriptButton.IsEnabled = !busy;
         ChooseRecoveryBakFixButton.IsEnabled = !busy;

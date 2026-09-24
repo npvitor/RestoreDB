@@ -3,7 +3,7 @@ using RestoreDB.Domain.Models;
 using RestoreDB.Services;
 
 // Runner mínimo que invoca os SERVIÇOS REAIS da ferramenta contra um banco, para validar
-// o comportamento sob corrupção real. Usa autenticação do Windows (sem senha).
+// o comportamento sob corrupção real. Autenticação do Windows, ou SQL com PROBE_USER/PROBE_PASS.
 //
 // uso:
 //   diagnose <db>
@@ -22,16 +22,23 @@ using RestoreDB.Services;
 //   reseed <db>
 //   history <db>
 //   rebuild-log <db>
+//   resolve-log <db>                          (log cheio / 9002, sem perda de dados)
+//   fix-files <db> [logico=caminho ...]       (arquivo ausente/sem permissão; religa sem perda)
+//   recover-deleted <db> <yyyy-MM-ddTHH:mm:ss> <schema.tabela>[,...]  (desfaz DELETE sem sobrescrever)
 //   state <db>
 
 if (args.Length < 2)
 {
-    Console.Error.WriteLine("uso: <diagnose|repair|repair-indexes|fix-constraints|simulate-repair|monitor|maintain|fragmentation|forensic|attach|restore|restore-pit|restore-pages|restore-standby|finalize-recovery|test-restore|restore-copy|salvage-table|verify-backups|check-table|reseed|history|rebuild-log|state> <db> [extra]");
+    Console.Error.WriteLine("uso: <diagnose|repair|repair-indexes|fix-constraints|simulate-repair|monitor|maintain|fragmentation|forensic|attach|restore|restore-pit|restore-pages|restore-standby|finalize-recovery|test-restore|restore-copy|salvage-table|verify-backups|check-table|reseed|history|rebuild-log|resolve-log|fix-files|recover-deleted|state> <db> [extra]");
     return 2;
 }
 
 var server = Environment.GetEnvironmentVariable("PROBE_SERVER") ?? "localhost";
-var info = new ConnectionInfo { Server = server, UseWindowsAuth = true };
+// Autenticação SQL opcional (PROBE_USER/PROBE_PASS); sem elas, autenticação do Windows.
+var probeUser = Environment.GetEnvironmentVariable("PROBE_USER");
+var info = string.IsNullOrWhiteSpace(probeUser)
+    ? new ConnectionInfo { Server = server, UseWindowsAuth = true }
+    : new ConnectionInfo { Server = server, User = probeUser, Password = Environment.GetEnvironmentVariable("PROBE_PASS") ?? string.Empty };
 var conn = new SqlDataAccess().BuildConnectionString(info);
 var log = new LogService();
 var progress = new Progress<RepairLogEntry>(e => Console.WriteLine($"  [{e.Level,-7}] {e.Message}"));
@@ -233,6 +240,33 @@ switch (cmd)
         var n = await new RepairService(log, new RestoreService(log)).ReseedIdentitiesAsync(db, conn, progress);
         Console.WriteLine($"RESULT: tabelas_reseed={n}");
         return 0;
+    }
+
+    case "resolve-log":
+    {
+        var r = await new AvailabilityService(log).ResolveLogFullAsync(db, conn, progress);
+        Console.WriteLine($"RESULT: {r.Status} | {r.Message}");
+        return r.Status == RepairStatus.Success ? 0 : 1;
+    }
+
+    case "fix-files":
+    {
+        // args opcionais: nomeLogico=novoCaminho (como o SERVIDOR enxerga o caminho)
+        var moves = args.Skip(2).Select(a => a.Split('=', 2)).Where(p => p.Length == 2)
+                        .ToDictionary(p => p[0], p => p[1], StringComparer.OrdinalIgnoreCase);
+        var r = await new AvailabilityService(log).FixFileAccessAsync(db, conn, progress, default, moves);
+        Console.WriteLine($"RESULT: {r.Status} | {r.Message}");
+        return r.Status == RepairStatus.Success ? 0 : 1;
+    }
+
+    case "recover-deleted":
+    {
+        if (args.Length < 4) { Console.Error.WriteLine("recover-deleted exige <yyyy-MM-ddTHH:mm:ss> <schema.tabela>[,...]"); return 2; }
+        var target = DateTime.Parse(args[2], System.Globalization.CultureInfo.InvariantCulture);
+        var tables = args[3].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var r = await new RestoreService(log).RecoverDeletedRowsAsync(dbName, target, tables, conn, progress);
+        Console.WriteLine($"RESULT: {r.Status} | {r.Message}");
+        return r.Status == RepairStatus.Success ? 0 : 1;
     }
 
     case "rebuild-log":

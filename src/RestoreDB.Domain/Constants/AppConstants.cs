@@ -40,6 +40,12 @@ public static class AppConstants
         "master", "model", "msdb", "tempdb"
     };
 
+    /// <summary>Prefixo do NAME dos backups gerados pela própria ferramenta (rede de segurança, simulação...).</summary>
+    public const string ToolBackupNamePrefix = "RestoreDB ";
+
+    /// <summary>Banco (na mesma instância) onde as linhas órfãs removidas ficam guardadas — a remoção vira reversível.</summary>
+    public const string QuarantineDatabaseName = "RestoreDB_Quarentena";
+
     public static bool IsSystemDatabase(string? name) =>
         !string.IsNullOrWhiteSpace(name) &&
         SystemDatabases.Contains(name, StringComparer.OrdinalIgnoreCase);

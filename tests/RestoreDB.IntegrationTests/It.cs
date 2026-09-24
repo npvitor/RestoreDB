@@ -142,7 +142,22 @@ internal sealed class TestDatabase : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         await It.ForceDropAsync(Name);
-        foreach (var b in _backups)
+        // Além dos backups do próprio teste, os que a FERRAMENTA gerou (tail-log, cópia de segurança,
+        // log COPY_ONLY...) — todos registrados no msdb para este banco.
+        try
+        {
+            await using var c = new SqlConnection(It.Conn);
+            await c.OpenAsync();
+            await using var cmd = new SqlCommand(
+                "SELECT DISTINCT bmf.physical_device_name FROM msdb.dbo.backupset bs " +
+                "JOIN msdb.dbo.backupmediafamily bmf ON bmf.media_set_id = bs.media_set_id WHERE bs.database_name = @n;", c);
+            cmd.Parameters.AddWithValue("@n", Name);
+            await using var r = await cmd.ExecuteReaderAsync();
+            while (await r.ReadAsync())
+                if (!r.IsDBNull(0)) _backups.Add(r.GetString(0));
+        }
+        catch { /* best-effort */ }
+        foreach (var b in _backups.Distinct(StringComparer.OrdinalIgnoreCase))
             await It.TryDeleteBackupFileAsync(b);
         await It.TryPurgeBackupHistoryAsync(Name);
     }

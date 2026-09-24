@@ -22,6 +22,17 @@ public sealed class BackupSetInfo
     public string ServerName { get; init; } = string.Empty;
     public string PhysicalDevice { get; init; } = string.Empty;
 
+    /// <summary>Nome do conjunto de backup (msdb.backupset.name / HEADERONLY BackupName).</summary>
+    public string Name { get; init; } = string.Empty;
+
+    /// <summary>
+    /// FULL COPY_ONLY criado pela PRÓPRIA ferramenta (rede de segurança antes de um reparo destrutivo ou
+    /// cópia de simulação). Retrata o banco JÁ danificado — e o de simulação é apagado ao final —, então
+    /// nunca deve ser escolhido como base de uma restauração quando existir outro FULL.
+    /// </summary>
+    public bool IsToolSafetyCopy =>
+        IsFull && IsCopyOnly && Name.StartsWith(Constants.AppConstants.ToolBackupNamePrefix, StringComparison.Ordinal);
+
     /// <summary>Todos os arquivos do conjunto quando dividido (striped). Vazio = usar PhysicalDevice.</summary>
     public List<string> Devices { get; init; } = new();
 
@@ -64,7 +75,8 @@ public sealed class BackupSetInfo
     public string Display =>
         $"{BackupTypeFriendly}  •  {(BackupFinishDate.HasValue ? BackupFinishDate.Value.ToString("yyyy-MM-dd HH:mm") : "?")}" +
         $"  •  {BackupSizeMb:0.#} MB  •  pos {Position}" +
-        (IsCopyOnly ? "  •  COPY_ONLY" : string.Empty) +
+        (IsToolSafetyCopy ? "  •  COPY_ONLY (cópia de segurança do RestoreDB — estado já danificado)"
+            : IsCopyOnly ? "  •  COPY_ONLY" : string.Empty) +
         (IsCompressed ? "  •  comprimido" : string.Empty) +
         (Devices.Count > 1 ? $"  •  {Devices.Count} arquivos (striped)" : string.Empty);
 }

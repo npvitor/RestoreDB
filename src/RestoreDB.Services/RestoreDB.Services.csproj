@@ -13,4 +13,9 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="RestoreDB.Tests" />
+    <InternalsVisibleTo Include="RestoreDB.IntegrationTests" />
+  </ItemGroup>
+
 </Project>

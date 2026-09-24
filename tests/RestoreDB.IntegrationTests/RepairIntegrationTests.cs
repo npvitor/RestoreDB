@@ -135,6 +135,10 @@ public sealed class RepairIntegrationTests
         var total = Convert.ToInt32(await It.ScalarAsync(
             $"SELECT COUNT(*) FROM {It.Q(db.Name)}.dbo.Pedido;"));
         Assert.Equal(2, total);
+
+        // O órfão foi para a quarentena (ver NewRecoveryIntegrationTests); limpa o que o teste gerou.
+        var q = $"{RestoreDB.Domain.Constants.AppConstants.QuarantineDatabaseName}.dbo.{db.Name}__dbo__Pedido";
+        await It.ExecAsync($"IF OBJECT_ID(N'{q}') IS NOT NULL DROP TABLE {q};");
     }
 
     [IntegrationFact]

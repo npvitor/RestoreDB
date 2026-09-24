@@ -50,6 +50,18 @@ public sealed class RestoreService
     public async Task<RepairResult> RestoreDatabaseAsync(
         RestoreRequest request, string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default)
     {
+        await using var session = await _data.OpenSessionAsync(connectionString, ct);
+        return await RestoreDatabaseAsync(session, request, progress, ct);
+    }
+
+    /// <summary>
+    /// Núcleo da restauração, na sessão do CHAMADOR. Importante: quem tomou o acesso exclusivo
+    /// (SINGLE_USER + tail-log NORECOVERY) precisa executar o RESTORE na MESMA conexão — de outra
+    /// conexão o SQL Server recusa com a Msg 3101 (a vaga de usuário único pertence à primeira).
+    /// </summary>
+    private async Task<RepairResult> RestoreDatabaseAsync(
+        SqlSession session, RestoreRequest request, IProgress<RepairLogEntry> progress, CancellationToken ct)
+    {
         var result = new RepairResult();
         var db = request.DatabaseName;
         Report(progress, db, RepairLogLevel.Info, $"════════ Restaurando [{db}] a partir de backup ════════");
@@ -62,12 +74,20 @@ public sealed class RestoreService
             return result;
         }
 
-        await using var session = await _data.OpenSessionAsync(connectionString, ct);
-
         // Realocação automática de arquivos (WITH MOVE) quando solicitado e sem mapa explícito:
         // arquivos cuja pasta original não existe no servidor são movidos para a pasta padrão.
         if (request.AutoRelocate && request.MoveMap.Count == 0)
             await ApplyAutoRelocateAsync(session, request, progress, ct);
+
+        // Sobrescrever um banco ONLINE com conexões abertas (a aplicação de faturamento, por exemplo)
+        // falha com a Msg 3101 ("Exclusive access could not be obtained"). O acesso exclusivo é tomado
+        // no MESMO lote do primeiro RESTORE (ver BuildRestore) — sem janela para outro processo ocupar
+        // a vaga SINGLE_USER entre um comando e outro.
+        var takeExclusive = request.Replace
+            && (await session.GetDatabaseStateAsync(db, ct)).Equals("ONLINE", StringComparison.OrdinalIgnoreCase);
+        if (takeExclusive)
+            Report(progress, db, RepairLogLevel.Info,
+                "O banco está ONLINE: as conexões abertas serão encerradas (SINGLE_USER WITH ROLLBACK IMMEDIATE) no início da restauração.");
 
         for (var i = 0; i < request.Pieces.Count; i++)
         {
@@ -84,6 +104,8 @@ public sealed class RestoreService
                 Report(progress, db, RepairLogLevel.Warning, "VERIFYONLY acusou problema na mídia — a restauração será tentada mesmo assim.");
 
             var (sql, prm) = BuildRestore(request, piece, isFirst: i == 0, isLast: isLast);
+            if (i == 0 && takeExclusive)
+                sql = ExclusiveAccessPrefix + sql;
             var r = await RunStepAsync(session, db, progress,
                 isLast ? "Restaurando e recuperando (WITH RECOVERY)" : "Restaurando (WITH NORECOVERY)", sql, prm, ct);
 
@@ -92,6 +114,8 @@ public sealed class RestoreService
                 result.Status = RepairStatus.Failed;
                 result.Message = $"Falha ao restaurar a peça {i + 1}. Verifique o log de operações.";
                 Report(progress, db, RepairLogLevel.Error, result.Message);
+                // Se a primeira peça falhou, o banco original continua ONLINE — mas em SINGLE_USER.
+                if (i == 0 && takeExclusive) await EnsureMultiUserAsync(session, db, progress);
                 return result;
             }
         }
@@ -101,6 +125,9 @@ public sealed class RestoreService
 
         if (finalState.Equals("ONLINE", StringComparison.OrdinalIgnoreCase))
         {
+            // O tail-log capturado depois do SINGLE_USER carrega essa opção: sem isto o banco
+            // restaurado poderia voltar em acesso restrito.
+            await EnsureMultiUserAsync(session, db, progress);
             await FixOrphanedUsersAsync(session, db, progress, ct);
             await session.ClearSuspectPagesAsync(db, ct);
             result.Status = RepairStatus.Success;
@@ -149,7 +176,8 @@ public sealed class RestoreService
     /// </summary>
     public async Task<RepairResult> RestoreAsCopyAsync(
         string originalDb, string? copyName, string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default,
-        bool baseFullOnly = false, string? explicitFullBackupPath = null)
+        bool baseFullOnly = false, string? explicitFullBackupPath = null,
+        DateTime? stopAt = null, Action<BackupChainPlan>? onPlanned = null)
     {
         var result = new RepairResult();
         var copy = string.IsNullOrWhiteSpace(copyName) ? originalDb + "_Recuperado" : copyName!;
@@ -175,12 +203,11 @@ public sealed class RestoreService
         }
         else
         {
-            var history = await session.GetBackupHistoryAsync(originalDb, ct);
             // Recuperação de registros-pai (baseFullOnly): só o FULL agendado mais recente, sem logs — para
             // não reproduzir a própria perda do pai na cópia (ver BackupChainPlanner.PlanBaseFullOnly).
-            plan = baseFullOnly
-                ? BackupChainPlanner.PlanBaseFullOnly(originalDb, history)
-                : BackupChainPlanner.Plan(originalDb, history, target: null);
+            plan = await PlanAvailableAsync(session, originalDb, h => baseFullOnly
+                ? BackupChainPlanner.PlanBaseFullOnly(originalDb, h)
+                : BackupChainPlanner.Plan(originalDb, h, target: stopAt), ct);
         }
         foreach (var w in plan.Warnings) Report(progress, originalDb, RepairLogLevel.Warning, "  ⚠ " + w);
         if (!plan.IsComplete || plan.BaseFull is null)
@@ -191,16 +218,19 @@ public sealed class RestoreService
             return result;
         }
 
+        onPlanned?.Invoke(plan);
+
         var request = new RestoreRequest
         {
             DatabaseName = copy,
             Replace = true,
+            StopAt = stopAt,
             Pieces = new List<RestorePiece>(plan.Pieces)
         };
         // Força realocar TODOS os arquivos (com nomes novos) para nunca colidir com os do original.
         await ApplyAutoRelocateAsync(session, request, progress, ct, forceRelocate: true);
 
-        var restore = await RestoreDatabaseAsync(request, connectionString, progress, ct);
+        var restore = await RestoreDatabaseAsync(session, request, progress, ct);
         if (restore.Status == RepairStatus.Success)
         {
             restore.Message = $"Cópia [{copy}] criada e ONLINE. Use-a para extrair/salvar dados sem afetar [{originalDb}].";
@@ -331,6 +361,96 @@ public sealed class RestoreService
     }
 
     /// <summary>
+    /// Desfaz uma EXCLUSÃO ACIDENTAL sem sobrescrever o banco: restaura uma CÓPIA da cadeia de backups até
+    /// <paramref name="target"/> (logo antes do DELETE — inclui um backup de log COPY_ONLY tirado agora,
+    /// para alcançar transações recentes sem mexer na cadeia) e devolve ao banco VIVO só as linhas que
+    /// faltam nas tabelas indicadas (por chave primária, gatilhos desligados). Tudo o que foi feito DEPOIS
+    /// da exclusão continua lá — ao contrário de restaurar o banco inteiro até aquele instante.
+    /// A cópia é descartada se todas as tabelas forem recuperadas; senão fica disponível para o assistente
+    /// de salvamento (nome em <see cref="RepairResult.BackupFile"/>).
+    /// </summary>
+    public async Task<RepairResult> RecoverDeletedRowsAsync(
+        string databaseName, DateTime target, IReadOnlyList<string> tables, string connectionString,
+        IProgress<RepairLogEntry> progress, CancellationToken ct = default)
+    {
+        var result = new RepairResult();
+        Report(progress, databaseName, RepairLogLevel.Info,
+            $"════════ Recuperar linhas excluídas de [{databaseName}] (estado de {target:yyyy-MM-dd HH:mm:ss}) — sem sobrescrever o banco ════════");
+
+        if (tables.Count == 0)
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = "Nenhuma tabela informada para recuperar.";
+            Report(progress, databaseName, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+
+        await using var session = await _data.OpenSessionAsync(connectionString, ct);
+        var model = await session.GetRecoveryModelAsync(databaseName, ct);
+        if (model.Equals("SIMPLE", StringComparison.OrdinalIgnoreCase))
+        {
+            result.Status = RepairStatus.Failed;
+            result.Message = "O banco está no modelo SIMPLE: não há backups de log para voltar a um instante exato. " +
+                             "Use 'Recuperar para cópia' (último backup) + 'Assistente de salvamento'.";
+            Report(progress, databaseName, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+
+        // Log COPY_ONLY: leva a cópia até transações que ainda não estão em nenhum backup, SEM truncar o
+        // log nem alterar a cadeia de backups agendada.
+        var logFile = $"{AppConstants.SanitizeToken(databaseName, "banco")}_undo_delete_{DateTime.Now:yyyyMMdd_HHmmss}.trn";
+        await RunStepAsync(session, databaseName, progress, "Backup de log COPY_ONLY (alcança as transações mais recentes)",
+            "DECLARE @cmd nvarchar(max) = N'BACKUP LOG ' + QUOTENAME(@db) + N' TO DISK = @f WITH COPY_ONLY, INIT, NAME = @n;';\n" +
+            "EXEC sys.sp_executesql @cmd, N'@f nvarchar(4000), @n nvarchar(256)', @f = @file, @n = @name;",
+            new Dictionary<string, object?> { ["@db"] = databaseName, ["@file"] = logFile, ["@name"] = $"RestoreDB log (recuperar exclusão) de {databaseName}" }, ct);
+
+        var copy = $"{AppConstants.SanitizeToken(databaseName, "banco")}_AntesExclusao_{DateTime.Now:yyyyMMddHHmmss}";
+        var restore = await RestoreAsCopyAsync(databaseName, copy, connectionString, progress, ct, stopAt: target);
+        if (restore.Status != RepairStatus.Success)
+        {
+            await session.DropDatabaseBestEffortAsync(copy, CancellationToken.None);
+            result.Status = RepairStatus.Failed;
+            result.Message = "Não foi possível montar a cópia de antes da exclusão: " + restore.Message;
+            Report(progress, databaseName, RepairLogLevel.Error, result.Message);
+            return result;
+        }
+
+        var total = 0;
+        var failed = new List<string>();
+        foreach (var t in tables.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            try
+            {
+                var n = await session.SalvageTableAsync(copy, databaseName, t, ct);
+                total += n;
+                Report(progress, databaseName, RepairLogLevel.Success, $"  ✔ {t}: {n} linha(s) devolvida(s).");
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                failed.Add(t);
+                Report(progress, databaseName, RepairLogLevel.Warning, $"  ⚠ {t}: {ex.Message}");
+            }
+        }
+
+        if (failed.Count == 0)
+        {
+            await session.DropDatabaseBestEffortAsync(copy, CancellationToken.None);
+            result.Status = RepairStatus.Success;
+            result.Message = $"{total} linha(s) excluída(s) devolvida(s) ao banco, sem sobrescrever o restante (nada duplicado).";
+        }
+        else
+        {
+            result.Status = total > 0 ? RepairStatus.Success : RepairStatus.Failed;
+            result.BackupFile = copy;
+            result.Message = $"{total} linha(s) devolvida(s). {failed.Count} tabela(s) não puderam ser tratadas automaticamente " +
+                             $"({string.Join(", ", failed)}); a cópia [{copy}] foi mantida para o assistente de salvamento.";
+        }
+        Report(progress, databaseName, result.Status == RepairStatus.Success ? RepairLogLevel.Success : RepairLogLevel.Warning, result.Message);
+        return result;
+    }
+
+    /// <summary>
     /// Copia de um banco de CÓPIA (recuperado) para o banco VIVO apenas as linhas que faltam (por
     /// chave primária) de uma tabela — o "assistente de salvamento". Não duplica registros.
     /// </summary>
@@ -438,7 +558,7 @@ public sealed class RestoreService
             return result;
         }
 
-        var plan = BackupChainPlanner.Plan(databaseName, history, target);
+        var plan = await PlanAvailableAsync(session, databaseName, h => BackupChainPlanner.Plan(databaseName, h, target), ct);
         foreach (var w in plan.Warnings)
             Report(progress, databaseName, RepairLogLevel.Warning, "  ⚠ " + w);
 
@@ -451,12 +571,19 @@ public sealed class RestoreService
         }
         Report(progress, databaseName, RepairLogLevel.Info, plan.Summary);
 
-        // Tail-log (best-effort): captura as transações ainda não copiadas, minimizando a perda.
+        // Tail-log (best-effort): captura as transações ainda não copiadas, minimizando a perda. É
+        // SEMPRE capturado (o REPLACE destruiria o log atual), mas só entra na cadeia quando o alvo está
+        // além dos backups existentes: aplicar um log depois de o STOPAT já ter sido atingido faz o
+        // RESTORE falhar e deixaria o banco em RESTORING.
         var pieces = new List<RestorePiece>(plan.Pieces);
         if (tailLogBackup)
         {
             var tail = await TryBackupTailLogAsync(session, databaseName, progress, ct);
-            if (tail is not null) pieces.Add(tail);
+            if (tail is not null && (target is null || !plan.ReachesTarget))
+                pieces.Add(tail);
+            else if (tail is not null)
+                Report(progress, databaseName, RepairLogLevel.Info,
+                    $"O instante alvo já é coberto pelos backups existentes — o tail-log ({tail.DiskPath}) fica guardado, mas não é aplicado.");
         }
 
         var request = new RestoreRequest
@@ -466,7 +593,7 @@ public sealed class RestoreService
             StopAt = target,
             Pieces = pieces
         };
-        return await RestoreDatabaseAsync(request, connectionString, progress, ct);
+        return await RestoreDatabaseAsync(session, request, progress, ct);
     }
 
     /// <summary>
@@ -482,8 +609,7 @@ public sealed class RestoreService
 
         await using var session = await _data.OpenSessionAsync(connectionString, ct);
 
-        var history = await session.GetBackupHistoryAsync(databaseName, ct);
-        var plan = BackupChainPlanner.Plan(databaseName, history, target);
+        var plan = await PlanAvailableAsync(session, databaseName, h => BackupChainPlanner.Plan(databaseName, h, target), ct);
         foreach (var w in plan.Warnings) Report(progress, databaseName, RepairLogLevel.Warning, "  ⚠ " + w);
         if (!plan.IsComplete || plan.BaseFull is null)
         {
@@ -507,7 +633,7 @@ public sealed class RestoreService
             Pieces = new List<RestorePiece>(plan.Pieces)
         };
 
-        var restore = await RestoreDatabaseAsync(request, connectionString, progress, ct);
+        var restore = await RestoreDatabaseAsync(session, request, progress, ct);
         // Em STANDBY o estado fica STANDBY/RESTORING (não ONLINE) — isso é o esperado aqui.
         var state = await session.GetDatabaseStateAsync(databaseName, ct);
         result.FinalStateDesc = state;
@@ -561,7 +687,10 @@ public sealed class RestoreService
 
         var file = $"{AppConstants.SanitizeToken(db, "banco")}_tail_{DateTime.Now:yyyyMMdd_HHmmss}.trn";
         var comp = await session.SupportsBackupCompressionAsync(ct) ? ", COMPRESSION" : string.Empty;
+        // WITH NORECOVERY exige acesso exclusivo (Msg 3101 com a aplicação conectada): encerra as
+        // conexões no mesmo lote do BACKUP LOG.
         var sql =
+            ExclusiveAccessPrefix +
             "DECLARE @cmd nvarchar(max);\n" +
             "SET @cmd = N'BACKUP LOG ' + QUOTENAME(@db) + N' TO DISK = @f WITH NORECOVERY, NO_TRUNCATE, CONTINUE_AFTER_ERROR, INIT" + comp + ", NAME = @n;';\n" +
             "EXEC sys.sp_executesql @cmd, N'@f nvarchar(4000), @n nvarchar(256)', @f = @file, @n = @name;";
@@ -638,7 +767,7 @@ public sealed class RestoreService
 
         try
         {
-            var restore = await RestoreDatabaseAsync(request, connectionString, progress, ct);
+            var restore = await RestoreDatabaseAsync(session, request, progress, ct);
             if (restore.Status != RepairStatus.Success)
             {
                 result.Status = RepairStatus.Failed;
@@ -703,11 +832,9 @@ public sealed class RestoreService
             return result;
         }
 
-        var history = await session.GetBackupHistoryAsync(databaseName, ct);
-
         // Cadeia validada por LSN (FULL → DIFERENCIAL → LOGs). O diferencial encurta a fila de
         // logs a aplicar — em cadeias longas, é a diferença entre minutos e horas.
-        var plan = BackupChainPlanner.Plan(databaseName, history, target: null);
+        var plan = await PlanAvailableAsync(session, databaseName, h => BackupChainPlanner.Plan(databaseName, h, target: null), ct);
         foreach (var w in plan.Warnings)
             Report(progress, databaseName, RepairLogLevel.Warning, "  ⚠ " + w);
         if (!plan.IsComplete || plan.BaseFull is null)
@@ -842,6 +969,81 @@ public sealed class RestoreService
             new Dictionary<string, object?> { ["@db"] = databaseName }, ct);
         Report(progress, databaseName, r.Success ? RepairLogLevel.Success : RepairLogLevel.Warning,
             r.Success ? "Usuários órfãos verificados/corrigidos." : "Não foi possível corrigir usuários órfãos automaticamente (verifique manualmente).");
+    }
+
+    /// <summary>
+    /// Prefixo T-SQL que encerra as conexões de um banco ONLINE (SINGLE_USER WITH ROLLBACK IMMEDIATE),
+    /// para ser concatenado ao MESMO lote do comando que exige exclusividade (RESTORE / tail-log
+    /// NORECOVERY). Usa o parâmetro @db do comando seguinte. Em outros estados não faz nada.
+    /// </summary>
+    internal const string ExclusiveAccessPrefix =
+        "IF EXISTS (SELECT 1 FROM sys.databases WHERE name = @db AND state_desc = N'ONLINE')\n" +
+        "BEGIN\n" +
+        "  DECLARE @excl nvarchar(max) = N'ALTER DATABASE ' + QUOTENAME(@db) + N' SET SINGLE_USER WITH ROLLBACK IMMEDIATE;';\n" +
+        "  EXEC sys.sp_executesql @excl;\n" +
+        "END;\n";
+
+    /// <summary>Devolve o banco a MULTI_USER se ele estiver ONLINE em acesso restrito. Best-effort.</summary>
+    private async Task EnsureMultiUserAsync(SqlSession session, string db, IProgress<RepairLogEntry> progress)
+    {
+        const string sql =
+            "IF EXISTS (SELECT 1 FROM sys.databases WHERE name = @db AND state_desc = N'ONLINE' AND user_access_desc <> N'MULTI_USER')\n" +
+            "BEGIN\n" +
+            "  DECLARE @cmd nvarchar(max) = N'ALTER DATABASE ' + QUOTENAME(@db) + N' SET MULTI_USER WITH ROLLBACK IMMEDIATE;';\n" +
+            "  EXEC sys.sp_executesql @cmd;\n" +
+            "END";
+        var r = await session.ExecuteAsync("Garantir acesso normal (MULTI_USER)", sql,
+            new Dictionary<string, object?> { ["@db"] = db }, AppConstants.RepairCommandTimeoutSeconds, CancellationToken.None);
+        if (!r.Success)
+            Report(progress, db, RepairLogLevel.Warning, "Não foi possível devolver o banco a MULTI_USER automaticamente — verifique.");
+    }
+
+    /// <summary>
+    /// Monta o plano de restauração a partir do histórico do msdb DESCARTANDO os conjuntos cujos
+    /// arquivos não existem mais no servidor (limpeza de retenção, cópia de simulação apagada, mídia
+    /// removida...). Sem isto, o plano escolheria um backup inexistente e a restauração só falharia no
+    /// meio — possivelmente depois de o tail-log já ter deixado o banco em RESTORING. Um arquivo que não
+    /// pôde ser verificado (sem permissão, compartilhamento inacessível à sonda) é mantido.
+    /// </summary>
+    public async Task<BackupChainPlan> PlanAvailableAsync(
+        SqlSession session, string databaseName, Func<IReadOnlyList<BackupSetInfo>, BackupChainPlan> planner, CancellationToken ct = default)
+    {
+        var pool = await session.GetBackupHistoryAsync(databaseName, ct);
+        var exists = new Dictionary<string, bool?>(StringComparer.OrdinalIgnoreCase);
+        var notes = new List<string>();
+
+        for (var attempt = 0; ; attempt++)
+        {
+            var plan = planner(pool);
+            var used = new List<BackupSetInfo>();
+            if (plan.BaseFull is not null) used.Add(plan.BaseFull);
+            if (plan.Differential is not null) used.Add(plan.Differential);
+            used.AddRange(plan.Logs);
+
+            var missing = new List<BackupSetInfo>();
+            foreach (var set in used)
+            {
+                foreach (var device in set.AllDevices)
+                {
+                    if (!exists.TryGetValue(device, out var e))
+                        exists[device] = e = await session.FileExistsOnServerAsync(device, ct);
+                    if (e == false) { missing.Add(set); break; }
+                }
+            }
+
+            if (missing.Count == 0 || attempt >= 30)
+            {
+                plan.Warnings.InsertRange(0, notes);
+                return plan;
+            }
+
+            foreach (var m in missing)
+            {
+                pool.Remove(m);
+                notes.Add($"Backup {m.BackupTypeFriendly} de {m.BackupFinishDate:yyyy-MM-dd HH:mm} ignorado: o arquivo " +
+                          $"'{m.AllDevices.FirstOrDefault()}' não existe mais no servidor.");
+            }
+        }
     }
 
     // ---- Construção de comandos ----

@@ -160,6 +160,34 @@ public sealed class RepairService
             foreach (var f in files)
                 Report(progress, db.Name, RepairLogLevel.Info, $"Arquivo {f.TypeDesc}: {f.PhysicalName}");
 
+            // Arquivos que o SQL Server não encontra no caminho registrado (checado NO SERVIDOR).
+            foreach (var f in files.Where(f => f.IsData || f.IsLog))
+            {
+                if (await session.FileExistsOnServerAsync(f.PhysicalName, ct) == false)
+                {
+                    diag.FileProblems.Add(new FileAccessProblem { LogicalName = f.LogicalName, PhysicalName = f.PhysicalName, IsLog = f.IsLog, Kind = FileProblemKind.Missing });
+                    Report(progress, db.Name, RepairLogLevel.Warning, $"Arquivo AUSENTE no servidor: {f.PhysicalName}");
+                }
+            }
+
+            // Log de transações: uso e o que impede a reutilização (9002 = log cheio, não é corrupção).
+            try
+            {
+                diag.LogSpace = await session.GetLogSpaceInfoAsync(db.Name, ct);
+                var ls = diag.LogSpace;
+                Report(progress, db.Name, ls.IsCritical ? RepairLogLevel.Warning : RepairLogLevel.Info, ls.Summary);
+                foreach (var lf in ls.Files.Where(x => x.AtMaxSize || x.AutoGrowthDisabled || x.VolumeFreeMb is < 1024))
+                    Report(progress, db.Name, RepairLogLevel.Warning, "  • Arquivo de log sem folga para crescer: " + lf.Display);
+                if (ls.IsCritical && diag.StateDesc.Equals("ONLINE", StringComparison.OrdinalIgnoreCase))
+                {
+                    diag.LogFull = true;
+                    Report(progress, db.Name, RepairLogLevel.Warning,
+                        "O log de transações está praticamente CHEIO — logo o banco recusará gravações (erro 9002).");
+                }
+            }
+            catch (OperationCanceledException) { throw; }
+            catch { /* best-effort */ }
+
             // Topologia (espelhamento/AG/log shipping/replicação) — afeta a segurança do reparo.
             diag.Topology = await session.GetTopologyInfoAsync(db.Name, ct);
             if (diag.Topology.IsRisky)
@@ -219,7 +247,24 @@ public sealed class RepairService
                                  .Where(n => !string.IsNullOrEmpty(n)).ToList();
 
             Report(progress, db.Name, RepairLogLevel.Info, "Lendo o log de erros do SQL Server (sp_readerrorlog)...");
-            var lines = await session.ReadErrorLogAsync(db.Name, ct);
+            var lines = await session.ReadErrorLogAsync(db.Name, ct,
+                extraSearchTerms: dataNames.Concat(logNames).Select(n => n!));
+
+            // Falhas ao ABRIR arquivos (permissão, arquivo preso, não encontrado) — só fazem sentido como
+            // causa atual quando o banco NÃO está ONLINE (se está ONLINE, os arquivos abriram).
+            if (!diag.StateDesc.Equals("ONLINE", StringComparison.OrdinalIgnoreCase))
+            {
+                foreach (var line in lines)
+                {
+                    if (FileAccessProblem.Classify(line) is not FileProblemKind kind) continue;
+                    var file = files.FirstOrDefault(f => (f.IsData || f.IsLog) && !string.IsNullOrEmpty(f.PhysicalName)
+                        && line.Contains(Path.GetFileName(f.PhysicalName), StringComparison.OrdinalIgnoreCase));
+                    if (file is null || diag.FileProblems.Any(x => x.PhysicalName == file.PhysicalName)) continue;
+                    diag.FileProblems.Add(new FileAccessProblem { LogicalName = file.LogicalName, PhysicalName = file.PhysicalName, IsLog = file.IsLog, Kind = kind });
+                }
+                foreach (var fp in diag.FileProblems.Where(x => x.Kind != FileProblemKind.Missing))
+                    Report(progress, db.Name, RepairLogLevel.Warning, fp.Display);
+            }
 
             // O log de erros também é HISTÓRICO. Se o CHECKDB ao vivo está limpo, as linhas de
             // corrupção referem-se a um problema JÁ RESOLVIDO — não devem disparar os flags de
@@ -388,8 +433,16 @@ public sealed class RepairService
                 $"{untrusted.Count} constraint(s) NÃO confiável(is) (is_not_trusted): {string.Join(", ", untrusted.Take(10))}.");
         }
 
-        // Violações de FK/CHECK (o caso do registro órfão).
-        var violations = await session.CheckConstraintsAsync(db.Name, ct);
+        // Violações de FK/CHECK (o caso do registro órfão). Constraints DESABILITADAS (NOCHECK) são
+        // apenas informadas: o próprio sistema optou por não aplicá-las — não é corrupção.
+        var all = await session.CheckConstraintsAsync(db.Name, ct, includeDisabled: true);
+        var disabledHits = all.Where(v => v.IsDisabled).ToList();
+        diag.DisabledConstraintHits = disabledHits.Count;
+        if (disabledHits.Count > 0)
+            Report(progress, db.Name, RepairLogLevel.Info,
+                $"{disabledHits.Count} linha(s) violam constraints DESABILITADAS ({string.Join(", ", disabledHits.Select(v => v.Constraint).Distinct().Take(5))}) — " +
+                "dados aceitos pelo sistema por decisão de projeto; NÃO serão tratados como corrupção nem removidos.");
+        var violations = all.Where(v => !v.IsDisabled).ToList();
         if (violations.Count > 0)
         {
             diag.ConstraintViolations.AddRange(violations);
@@ -513,7 +566,7 @@ public sealed class RepairService
         _ => RepairLogLevel.Info
     };
 
-    private static void BuildConclusion(DiagnosisResult d)
+    internal static void BuildConclusion(DiagnosisResult d)
     {
         // Estado íntegro: CHECKDB ao vivo limpo, integridade lógica OK e sem flags ativas.
         if (d.CheckDb is { Executed: true, HasErrors: false }
@@ -529,6 +582,24 @@ public sealed class RepairService
         var topoNote = d.Topology is { IsRisky: true }
             ? " ATENÇÃO: " + d.Topology.Summary + " Reparos destrutivos/restore podem afetar essa configuração."
             : string.Empty;
+
+        // 0) O SQL Server não consegue ABRIR arquivos do banco (ausente/sem permissão/preso) — não é
+        //    corrupção, e nenhum reparo de DBCC resolveria. Tem prioridade: com os arquivos inacessíveis
+        //    o CHECKDB nem roda, e as demais evidências ficam enviesadas.
+        if (d.FileProblems.Count > 0 && !d.StateDesc.Equals("ONLINE", StringComparison.OrdinalIgnoreCase))
+        {
+            d.RecommendedAction = RecommendedActionKind.FixFileAccess;
+            var missing = d.FileProblems.Count(f => f.Kind == FileProblemKind.Missing);
+            var denied = d.FileProblems.Count(f => f.Kind == FileProblemKind.AccessDenied);
+            var locked = d.FileProblems.Count(f => f.Kind == FileProblemKind.InUseByAnotherProcess);
+            d.Summary = "O SQL Server não consegue abrir arquivo(s) do banco — isso NÃO é corrupção.";
+            d.Recommendation =
+                (missing > 0 ? $"{missing} arquivo(s) ausente(s): use 'Localizar arquivo' para apontar onde ele está agora (ex.: disco/letra trocados). " : "") +
+                (denied > 0 ? $"{denied} arquivo(s) sem permissão: 'Corrigir acesso e religar' concede acesso à conta do SQL Server. " : "") +
+                (locked > 0 ? $"{locked} arquivo(s) preso(s) por outro processo: feche antivírus/backup de arquivos/cópias e religue. " : "") +
+                "Nenhum dado é perdido." + topoNote;
+            return;
+        }
 
         // 1) Corrupção restrita a índices não-clusterizados → reconstrução SEM perda de dados.
         if (d.IndexOnlyRepairPossible)
@@ -557,9 +628,11 @@ public sealed class RepairService
         // 2) Log de transações cheio (erro 9002) — não é corrupção.
         if (d.LogFull && !d.DataCorruptionSuspected && !d.LogCorruptionSuspected)
         {
-            d.RecommendedAction = RecommendedActionKind.FreeDiskSpace;
+            d.RecommendedAction = RecommendedActionKind.ResolveLogFull;
             d.Summary = "O LOG de transações está CHEIO (erro 9002) — não é corrupção.";
-            d.Recommendation = "Libere espaço no volume do log, faça BACKUP LOG e/ou adicione espaço ao arquivo de log. Depois religue o banco." + topoNote;
+            d.Recommendation = "Use 'Resolver log cheio (sem perda de dados)': a ferramenta identifica o que segura o log " +
+                (d.LogSpace is { ReuseWait.Length: > 0 } ls ? $"(agora: {ls.ReuseWaitFriendly}) " : "") +
+                "e libera espaço — backup de log, crescimento do arquivo ou um arquivo de log extra em outro disco — e religa o banco." + topoNote;
             return;
         }
 
@@ -693,61 +766,76 @@ public sealed class RepairService
 
         // 4. Reparo SEM perda de dados:
         //    (a) recuperação normal (SET ONLINE); (b) se ONLINE, REPAIR_REBUILD; (c) verificação.
+        //    Com o banco ONLINE + SINGLE_USER, a sessão OCUPA a vaga (USE): sem isso, a aplicação (que
+        //    costuma reconectar sozinha) toma a única vaga entre um comando e outro, o REPAIR_REBUILD
+        //    falha por "banco em uso" e o fluxo escalaria à toa para o reparo COM perda.
         bool safeOk = false;
-        Report(p, db.Name, RepairLogLevel.Info, "Tentando recuperação SEM perda de dados (SET ONLINE)...");
-        await RunStepAsync(s, db, p, "Recuperação normal (SET ONLINE)", AlterDatabase(db.Name, "SET ONLINE"), ct);
+        var occupied = false;
+        try
+        {
+            Report(p, db.Name, RepairLogLevel.Info, "Tentando recuperação SEM perda de dados (SET ONLINE)...");
+            await RunStepAsync(s, db, p, "Recuperação normal (SET ONLINE)", AlterDatabase(db.Name, "SET ONLINE"), ct);
 
-        var stateAfterOnline = await s.GetDatabaseStateAsync(db.Name, ct);
-        if (stateAfterOnline.Equals("ONLINE", StringComparison.OrdinalIgnoreCase))
-        {
-            Report(p, db.Name, RepairLogLevel.Success,
-                "Banco recuperado para ONLINE. Aplicando REPAIR_REBUILD (sem perda) e verificando...");
-            var rebuild = await RunStepAsync(s, db, p, "Reparo SEM perda de dados (REPAIR_REBUILD)",
-                Dbcc(db.Name, "REPAIR_REBUILD", noInfoMsgs: false), ct);
-            var verify = await RunCheckDbStepAsync(s, db, p, "Verificação pós-reparo (DBCC CHECKDB)", db.Name, ct);
-            safeOk = rebuild.Success && verify.Success;
-        }
-        else
-        {
-            Report(p, db.Name, RepairLogLevel.Warning,
-                $"A recuperação normal não foi suficiente (estado atual: {stateAfterOnline}).");
-        }
-
-        if (safeOk)
-        {
-            await TrySetMultiUserAsync(s, db, p, ct);
-            return RepairStatus.Success;
-        }
-
-        // 4b. Antes de escalar para perda de dados: se a corrupção remanescente está restrita a
-        //     índices NÃO clusterizados, reconstruí-los resolve SEM perda de dados.
-        var onlineNow = (await s.GetDatabaseStateAsync(db.Name, ct)).Equals("ONLINE", StringComparison.OrdinalIgnoreCase);
-        if (onlineNow)
-        {
-            var structured = await s.CheckDbWithResultsAsync(db.Name, repairOption: null, ct);
-            if (structured.HasErrors && structured.AllErrorsAreNonClusteredIndex)
+            var stateAfterOnline = await s.GetDatabaseStateAsync(db.Name, ct);
+            if (stateAfterOnline.Equals("ONLINE", StringComparison.OrdinalIgnoreCase))
             {
-                Report(p, db.Name, RepairLogLevel.Info,
-                    "Corrupção restrita a índices não-clusterizados — reconstruindo os índices (SEM perda de dados)...");
-                var rebuilt = await RebuildNonClusteredIndexesAsync(s, db, structured, p, ct);
-                var verifyIdx = await RunCheckDbStepAsync(s, db, p, "Verificação pós-reconstrução de índices (DBCC CHECKDB)", db.Name, ct);
-                if (rebuilt && verifyIdx.Success)
+                await TryOccupySingleUserSlotAsync(s, db, p, ct);
+                occupied = true;
+                Report(p, db.Name, RepairLogLevel.Success,
+                    "Banco recuperado para ONLINE. Aplicando REPAIR_REBUILD (sem perda) e verificando...");
+                var rebuild = await RunStepAsync(s, db, p, "Reparo SEM perda de dados (REPAIR_REBUILD)",
+                    Dbcc(db.Name, "REPAIR_REBUILD", noInfoMsgs: false), ct);
+                var verify = await RunCheckDbStepAsync(s, db, p, "Verificação pós-reparo (DBCC CHECKDB)", db.Name, ct);
+                safeOk = rebuild.Success && verify.Success;
+            }
+            else
+            {
+                Report(p, db.Name, RepairLogLevel.Warning,
+                    $"A recuperação normal não foi suficiente (estado atual: {stateAfterOnline}).");
+            }
+
+            if (safeOk)
+            {
+                await TrySetMultiUserAsync(s, db, p, ct);
+                return RepairStatus.Success;
+            }
+
+            // 4b. Antes de escalar para perda de dados: se a corrupção remanescente está restrita a
+            //     índices NÃO clusterizados, reconstruí-los resolve SEM perda de dados.
+            var onlineNow = (await s.GetDatabaseStateAsync(db.Name, ct)).Equals("ONLINE", StringComparison.OrdinalIgnoreCase);
+            if (onlineNow)
+            {
+                var structured = await s.CheckDbWithResultsAsync(db.Name, repairOption: null, ct);
+                if (structured.HasErrors && structured.AllErrorsAreNonClusteredIndex)
                 {
-                    await TrySetMultiUserAsync(s, db, p, ct);
-                    return RepairStatus.Success;
+                    Report(p, db.Name, RepairLogLevel.Info,
+                        "Corrupção restrita a índices não-clusterizados — reconstruindo os índices (SEM perda de dados)...");
+                    var rebuilt = await RebuildNonClusteredIndexesAsync(s, db, structured, p, ct);
+                    var verifyIdx = await RunCheckDbStepAsync(s, db, p, "Verificação pós-reconstrução de índices (DBCC CHECKDB)", db.Name, ct);
+                    if (rebuilt && verifyIdx.Success)
+                    {
+                        await s.ClearSuspectPagesAsync(db.Name, ct);
+                        await TrySetMultiUserAsync(s, db, p, ct);
+                        return RepairStatus.Success;
+                    }
                 }
             }
-        }
 
-        // 5. Reparo seguro insuficiente
-        if (!allowDataLoss)
+            // 5. Reparo seguro insuficiente
+            if (!allowDataLoss)
+            {
+                Report(p, db.Name, RepairLogLevel.Warning,
+                    "O reparo SEM perda de dados não foi suficiente. É necessária a CONFIRMAÇÃO do usuário para o reparo COM possível perda de dados.");
+                Report(p, db.Name, RepairLogLevel.Info,
+                    "Dica: se o problema for o LOG de transações (corrompido/ausente), considere a opção 'Reconstruir log (último recurso)'.");
+                await TrySetMultiUserAsync(s, db, p, ct);
+                return RepairStatus.NeedsDataLossConfirmation;
+            }
+        }
+        finally
         {
-            Report(p, db.Name, RepairLogLevel.Warning,
-                "O reparo SEM perda de dados não foi suficiente. É necessária a CONFIRMAÇÃO do usuário para o reparo COM possível perda de dados.");
-            Report(p, db.Name, RepairLogLevel.Info,
-                "Dica: se o problema for o LOG de transações (corrompido/ausente), considere a opção 'Reconstruir log (último recurso)'.");
-            await TrySetMultiUserAsync(s, db, p, ct);
-            return RepairStatus.NeedsDataLossConfirmation;
+            // Devolve o contexto a master antes de voltar a EMERGENCY (ou de encerrar o fluxo).
+            if (occupied) await TryReleaseSingleUserSlotAsync(s, CancellationToken.None);
         }
 
         // 6. Reparo COM possível perda de dados — backup de segurança antes (best-effort)
@@ -765,17 +853,40 @@ public sealed class RepairService
             return RepairStatus.Failed;
         }
 
-        await TrySafetyNetAsync(s, db, p, ct);
+        var safety = await TrySafetyNetAsync(s, db, p, ct);
+        var rowsBefore = await s.GetTableRowCountsAsync(db.Name, ct);
 
-        await RunStepAsync(s, db, p, "Reparo COM possível PERDA DE DADOS (REPAIR_ALLOW_DATA_LOSS)",
+        var repairStep = await RunStepAsync(s, db, p, "Reparo COM possível PERDA DE DADOS (REPAIR_ALLOW_DATA_LOSS)",
             Dbcc(db.Name, "REPAIR_ALLOW_DATA_LOSS", noInfoMsgs: false), ct);
+
+        // Se o banco continuar em EMERGENCY (somente leitura) após o reparo, nada do que vem a seguir
+        // (recuperar linhas, reconciliar FKs, reseed) conseguiria gravar: religa-o.
+        if ((await s.GetDatabaseStateAsync(db.Name, ct)).Equals("EMERGENCY", StringComparison.OrdinalIgnoreCase))
+            await RunStepAsync(s, db, p, "Religando o banco após o reparo (SET ONLINE)", AlterDatabase(db.Name, "SET ONLINE"), ct);
 
         var verifyFinal = await RunCheckDbStepAsync(s, db, p, "Verificação final (DBCC CHECKDB)", db.Name, ct);
 
-        // O REPAIR_ALLOW_DATA_LOSS desaloca páginas SEM respeitar constraints — pode deixar
-        // chaves estrangeiras órfãs. Como a perda de dados já foi autorizada, reconciliamos.
-        await TryReconcileConstraintsAsync(s, db, p, allowDataLoss: true, connectionString, recovery, ct);
-        await TryReseedIdentitiesAsync(s, db, p, ct);
+        var occupiedAfter = false;
+        if ((await s.GetDatabaseStateAsync(db.Name, ct)).Equals("ONLINE", StringComparison.OrdinalIgnoreCase))
+        {
+            await TryOccupySingleUserSlotAsync(s, db, p, ct);
+            occupiedAfter = true;
+        }
+        try
+        {
+            // Devolve do backup as linhas que o reparo acabou de descartar (quando dá para saber EXATAMENTE
+            // quais eram) — antes da reconciliação de FKs, pois um pai recuperado aqui deixa de gerar órfão.
+            await TryRecoverRowsLostByRepairAsync(s, db, rowsBefore, repairStep, safety, connectionString, recovery, p, ct);
+
+            // O REPAIR_ALLOW_DATA_LOSS desaloca páginas SEM respeitar constraints — pode deixar
+            // chaves estrangeiras órfãs. Como a perda de dados já foi autorizada, reconciliamos.
+            await TryReconcileConstraintsAsync(s, db, p, allowDataLoss: true, connectionString, recovery, ct);
+            await TryReseedIdentitiesAsync(s, db, p, ct);
+        }
+        finally
+        {
+            if (occupiedAfter) await TryReleaseSingleUserSlotAsync(s, CancellationToken.None);
+        }
 
         await TrySetMultiUserAsync(s, db, p, ct);
         if (verifyFinal.Success)
@@ -866,10 +977,13 @@ public sealed class RepairService
                 }
 
                 Report(p, db.Name, RepairLogLevel.Warning, "ATENÇÃO: reparo COM POSSÍVEL PERDA DE DADOS (autorizado).");
-                await TrySafetyNetAsync(s, db, p, ct);
-                await RunStepAsync(s, db, p, "Reparo COM possível PERDA DE DADOS (REPAIR_ALLOW_DATA_LOSS)",
+                var safety = await TrySafetyNetAsync(s, db, p, ct);
+                var rowsBefore = await s.GetTableRowCountsAsync(db.Name, ct);
+                var repairStep = await RunStepAsync(s, db, p, "Reparo COM possível PERDA DE DADOS (REPAIR_ALLOW_DATA_LOSS)",
                     Dbcc(db.Name, "REPAIR_ALLOW_DATA_LOSS", noInfoMsgs: false), ct);
                 var verifyFinal = await RunCheckDbStepAsync(s, db, p, "Verificação final (DBCC CHECKDB)", db.Name, ct);
+                await TryRecoverRowsLostByRepairAsync(s, db, rowsBefore, repairStep, safety, connectionString, recovery, p, ct,
+                    corruptObjectIds: report.Details.Where(d => d.ObjectId != 0).Select(d => d.ObjectId));
                 await TryReconcileConstraintsAsync(s, db, p, allowDataLoss: true, connectionString, recovery, ct);
                 await TryReseedIdentitiesAsync(s, db, p, ct);
                 if (verifyFinal.Success)
@@ -919,6 +1033,150 @@ public sealed class RepairService
             await TryReleaseSingleUserSlotAsync(s, ct);
             await TrySetMultiUserAsync(s, db, p, ct);
         }
+    }
+
+    /// <summary>
+    /// Depois de um REPAIR_ALLOW_DATA_LOSS, devolve ao banco as linhas que o reparo DESCARTOU, lendo-as de
+    /// uma cópia restaurada da cadeia de backups ATÉ O INSTANTE DO REPARO (FULL → diferencial → logs → o
+    /// tail-log capturado pela rede de segurança). As tabelas afetadas vêm (a) das páginas que o próprio
+    /// reparo diz ter desalocado ("object ID n"), (b) das tabelas cuja contagem de linhas caiu e (c) dos
+    /// objetos com erro no CHECKDB. Só insere o que falta, por chave primária, com gatilhos desligados.
+    ///
+    /// Segurança: só é automático quando a cópia retrata EXATAMENTE o momento anterior ao reparo — aí toda
+    /// linha que existe na cópia e não no banco foi, com certeza, descartada pelo reparo. Sem tail-log
+    /// (modelo SIMPLE, log ilegível) ou com a cadeia quebrada, a cópia seria de um momento ANTERIOR e
+    /// reinserir "o que falta" ressuscitaria registros excluídos de propósito — nesse caso apenas informa
+    /// o que foi perdido e orienta a recuperação manual. Best-effort: nunca derruba o reparo.
+    /// </summary>
+    private async Task TryRecoverRowsLostByRepairAsync(
+        SqlSession s, DatabaseInfo db, IReadOnlyDictionary<string, long> rowsBefore, CommandExecutionResult repairStep,
+        SafetyNet safety, string connectionString, ParentRecoveryOptions? recovery, IProgress<RepairLogEntry> p,
+        CancellationToken ct, IEnumerable<int>? corruptObjectIds = null)
+    {
+        if (recovery is { RecoverLostRows: false }) return;
+        try
+        {
+            var after = await s.GetTableRowCountsAsync(db.Name, ct);
+            var affected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (table, before) in rowsBefore)
+                if (after.TryGetValue(table, out var a) && a < before) affected.Add(table);
+
+            var objectIds = ParseRepairObjectIds(repairStep.InfoMessages.Concat(repairStep.ErrorMessages))
+                .Concat(corruptObjectIds ?? Enumerable.Empty<int>()).Distinct();
+            foreach (var oid in objectIds)
+            {
+                var name = await s.ResolveSchemaTableAsync(db.Name, oid, ct);
+                if (name.Length > 0 && (rowsBefore.Count == 0 || rowsBefore.ContainsKey(name))) affected.Add(name);
+            }
+
+            if (affected.Count == 0)
+            {
+                if (rowsBefore.Count == 0)
+                {
+                    Report(p, db.Name, RepairLogLevel.Warning, "Não foi possível medir as linhas antes do reparo (metadados ilegíveis) — confira os dados; " +
+                        "para revisar o que mudou use 'Recuperar para cópia' + 'Assistente de salvamento'.");
+                    return;
+                }
+                Report(p, db.Name, RepairLogLevel.Success, "O reparo não descartou linhas das tabelas de usuário (contagem antes × depois).");
+                return;
+            }
+
+            Report(p, db.Name, RepairLogLevel.Warning,
+                $"O reparo descartou dados em {affected.Count} tabela(s): " +
+                string.Join("; ", affected.Take(10).Select(t =>
+                    $"{t} ({rowsBefore.GetValueOrDefault(t):N0} → {after.GetValueOrDefault(t):N0})")) + ".");
+
+            if (!safety.TailLogCaptured)
+            {
+                Report(p, db.Name, RepairLogLevel.Warning,
+                    "Não foi possível obter o estado EXATO de antes do reparo (sem tail-log: modelo SIMPLE ou log ilegível), " +
+                    "então as linhas NÃO são devolvidas automaticamente — um backup mais antigo traria de volta também registros " +
+                    "excluídos de propósito. Para revisar e recuperar manualmente: 'Recuperar para cópia' + 'Assistente de salvamento'.");
+                return;
+            }
+
+            var plan = await _restore.PlanAvailableAsync(s, db.Name, h => BackupChainPlanner.Plan(db.Name, h, target: null), ct);
+            var lastLog = plan.Logs.LastOrDefault()?.BackupFinishDate ?? DateTime.MinValue;
+            if (!plan.IsComplete || lastLog < safety.StartedAt.AddMinutes(-1))
+            {
+                Report(p, db.Name, RepairLogLevel.Warning,
+                    "A cadeia de backups não chega até o instante do reparo (" + plan.Summary + ") — as linhas NÃO são devolvidas " +
+                    "automaticamente. Use 'Recuperar para cópia' + 'Assistente de salvamento' para revisar.");
+                return;
+            }
+
+            Report(p, db.Name, RepairLogLevel.Info,
+                "Recuperando as linhas descartadas: restaurando a cadeia de backups até o instante do reparo numa cópia temporária " +
+                "(pode demorar conforme o tamanho do banco)...");
+            var scratch = $"{AppConstants.SanitizeToken(db.Name, "banco")}_LostRows_{DateTime.Now:yyyyMMddHHmmss}_{Guid.NewGuid().ToString("N")[..6]}";
+            try
+            {
+                var copy = await _restore.RestoreAsCopyAsync(db.Name, scratch, connectionString, p, ct);
+                if (copy.Status != RepairStatus.Success)
+                {
+                    Report(p, db.Name, RepairLogLevel.Warning, "Não foi possível montar a cópia de antes do reparo — linhas não recuperadas automaticamente.");
+                    return;
+                }
+
+                // Várias passadas: uma tabela-filha pode depender de um pai que só volta numa tabela seguinte.
+                var pending = affected.ToList();
+                var errors = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                var total = 0;
+                for (var pass = 0; pass < 3 && pending.Count > 0; pass++)
+                {
+                    var failed = new List<string>();
+                    foreach (var t in pending)
+                    {
+                        try
+                        {
+                            var n = await s.SalvageTableAsync(scratch, db.Name, t, ct);
+                            total += n;
+                            errors.Remove(t);
+                            if (n > 0) Report(p, db.Name, RepairLogLevel.Success, $"  ✔ {n} linha(s) de {t} devolvida(s) a partir do backup.");
+                        }
+                        catch (OperationCanceledException) { throw; }
+                        catch (Exception ex) { failed.Add(t); errors[t] = ex.Message; }
+                    }
+                    if (failed.Count == pending.Count) break; // nenhuma evolução nesta passada
+                    pending = failed;
+                }
+                foreach (var (t, msg) in errors)
+                    Report(p, db.Name, RepairLogLevel.Warning, $"  ⚠ {t}: não foi possível devolver as linhas automaticamente — {msg}");
+
+                Report(p, db.Name, total > 0 ? RepairLogLevel.Success : RepairLogLevel.Info,
+                    total > 0
+                        ? $"{total:N0} linha(s) descartada(s) pelo reparo foram RECUPERADAS do backup (sem duplicar; gatilhos desligados)."
+                        : "Nenhuma linha precisou ser devolvida (o backup não tinha linhas ausentes no banco).");
+            }
+            finally
+            {
+                if (!await s.DropDatabaseBestEffortAsync(scratch, CancellationToken.None))
+                    Report(p, db.Name, RepairLogLevel.Warning, $"Não foi possível descartar a cópia temporária [{scratch}] — remova-a manualmente.");
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            Report(p, db.Name, RepairLogLevel.Warning, "Recuperação das linhas descartadas não concluída: " + ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Extrai os object_id das mensagens do DBCC CHECKDB ... REPAIR_ALLOW_DATA_LOSS (ex.: "The page (1:153)
+    /// ... has been deallocated from object ID 245575913, index ID 1 ..."), em inglês ou português.
+    /// Público para testes.
+    /// </summary>
+    public static IReadOnlyList<int> ParseRepairObjectIds(IEnumerable<string> messages)
+    {
+        var ids = new List<int>();
+        var rx = new System.Text.RegularExpressions.Regex(
+            @"(?:object\s+ID|ID\s+(?:de|do)\s+objeto|objeto\s+(?:de\s+)?ID)\s+(-?\d+)",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+        foreach (var m in messages)
+            foreach (System.Text.RegularExpressions.Match x in rx.Matches(m ?? string.Empty))
+                if (int.TryParse(x.Groups[1].Value, out var id) && id > 0 && !ids.Contains(id))
+                    ids.Add(id);
+        return ids;
     }
 
     /// <summary>
@@ -1033,16 +1291,20 @@ public sealed class RepairService
             current = remaining;   // a próxima tentativa mira apenas o que ainda está órfão
         }
 
-        // Remoção dos órfãos que sobraram (exatamente como antes).
+        // Remoção dos órfãos que sobraram — MOVIDOS para a quarentena (reversível), não apagados.
         var deleted = 0;
         var anyDeleteFailed = false;
+        var quarantineTables = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var v in current)
         {
             try
             {
-                var removed = await session.DeleteViolatingRowsAsync(db.Name, v, ct);
+                var (removed, qTable) = await session.QuarantineViolatingRowsAsync(db.Name, v, ct);
                 deleted += removed;
-                Report(progress, db.Name, RepairLogLevel.Success, $"  ✔ {removed} registro(s) órfão(s) removido(s) — {v.Display}");
+                if (qTable is not null) quarantineTables.Add(qTable);
+                Report(progress, db.Name, RepairLogLevel.Success, qTable is not null
+                    ? $"  ✔ {removed} registro(s) órfão(s) movido(s) para a quarentena {qTable} — {v.Display}"
+                    : $"  ✔ {removed} registro(s) órfão(s) removido(s) (quarentena indisponível; há backup de segurança) — {v.Display}");
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
@@ -1051,6 +1313,10 @@ public sealed class RepairService
                 Report(progress, db.Name, RepairLogLevel.Warning, $"  ⚠ Não foi possível remover órfãos de {v.Constraint}: {ex.Message}");
             }
         }
+        if (quarantineTables.Count > 0)
+            Report(progress, db.Name, RepairLogLevel.Info,
+                $"As linhas removidas NÃO foram perdidas: estão guardadas em {string.Join(", ", quarantineTables)} " +
+                "(com a data e a constraint de origem) e podem ser devolvidas quando o registro-pai for recadastrado.");
         return (totalRecovered, deleted, anyDeleteFailed);
     }
 
@@ -1074,14 +1340,13 @@ public sealed class RepairService
             // Checagem barata: só vale a pena tentar se houver uma cadeia de backup COMPLETA (custo ~zero
             // no caso comum de não haver backup). Quando o usuário ESCOLHE um .bak, pulamos esta checagem
             // (o msdb pode nem conhecer o arquivo) e validamos o arquivo direto na restauração.
-            List<BackupSetInfo> history;
-            try { history = await session.GetBackupHistoryAsync(db.Name, ct); }
-            catch (OperationCanceledException) { throw; }
-            catch { history = new List<BackupSetInfo>(); }
-
             // Usa o mesmo critério do restore de recuperação: FULL agendado mais recente (não COPY_ONLY),
-            // sem logs — para não reproduzir a própria perda do pai na cópia.
-            var plan = BackupChainPlanner.PlanBaseFullOnly(db.Name, history);
+            // sem logs — para não reproduzir a própria perda do pai na cópia. Backups cujo arquivo não
+            // existe mais no servidor são descartados já aqui.
+            BackupChainPlan plan;
+            try { plan = await _restore.PlanAvailableAsync(session, db.Name, h => BackupChainPlanner.PlanBaseFullOnly(db.Name, h), ct); }
+            catch (OperationCanceledException) { throw; }
+            catch { plan = BackupChainPlanner.PlanBaseFullOnly(db.Name, new List<BackupSetInfo>()); }
             if (!plan.IsComplete || plan.BaseFull is null)
             {
                 Report(progress, db.Name, RepairLogLevel.Info,
@@ -1954,7 +2219,7 @@ public sealed class RepairService
             // 1) Backup COPY_ONLY do estado ATUAL (numa pasta temporária local da instância).
             var backupSql =
                 "DECLARE @cmd nvarchar(max);\n" +
-                "SET @cmd = N'BACKUP DATABASE ' + QUOTENAME(@db) + N' TO DISK = @f WITH COPY_ONLY, INIT, NAME = @n;';\n" +
+                "SET @cmd = N'BACKUP DATABASE ' + QUOTENAME(@db) + N' TO DISK = @f WITH COPY_ONLY, INIT, CONTINUE_AFTER_ERROR, NAME = @n;';\n" +
                 "EXEC sys.sp_executesql @cmd, N'@f nvarchar(4000), @n nvarchar(256)', @f = @file, @n = @name;";
             var b = await RunStepAsync(session, db, progress, "Copiando o estado atual (BACKUP COPY_ONLY)", backupSql,
                 new Dictionary<string, object?> { ["@db"] = db.Name, ["@file"] = bak, ["@name"] = $"RestoreDB simulação de {db.Name}" }, ct);
@@ -1980,7 +2245,7 @@ public sealed class RepairService
 
             var restoreSql =
                 "DECLARE @cmd nvarchar(max);\n" +
-                "SET @cmd = N'RESTORE DATABASE ' + QUOTENAME(@s) + N' FROM DISK = @f WITH " + moveLiteral + ", REPLACE, RECOVERY;';\n" +
+                "SET @cmd = N'RESTORE DATABASE ' + QUOTENAME(@s) + N' FROM DISK = @f WITH " + moveLiteral + ", REPLACE, RECOVERY, CONTINUE_AFTER_ERROR;';\n" +
                 "EXEC sys.sp_executesql @cmd, N'@f nvarchar(4000)', @f = @file;";
             var rr = await RunStepAsync(session, db, progress, "Restaurando a cópia de simulação", restoreSql,
                 new Dictionary<string, object?> { ["@s"] = scratch, ["@file"] = bak }, ct);
@@ -2122,7 +2387,7 @@ public sealed class RepairService
         return ok;
     }
 
-    private static (string sql, Dictionary<string, object?> prm) RebuildIndex(string db, int objectId, int indexId)
+    internal static (string sql, Dictionary<string, object?> prm) RebuildIndex(string db, int objectId, int indexId)
     {
         // O ALTER INDEX roda NO CONTEXTO do banco alvo (EXEC [db].sys.sp_executesql), montando o
         // nome qualificado (schema.tabela) a partir do object_id já lá dentro.
@@ -2131,18 +2396,38 @@ public sealed class RepairService
         // — se elas estiverem fisicamente corrompidas (erro 824), o comando falha e derruba a
         // conexão. O DISABLE desaloca a estrutura SEM ler as páginas corrompidas, e o REBUILD
         // reconstrói o índice a partir do índice clusterizado/heap (íntegro), sem perda de dados.
-        var sql =
-            "DECLARE @inner nvarchar(max) = N'" +
-            "DECLARE @q nvarchar(300) = QUOTENAME(OBJECT_SCHEMA_NAME(@o)) + N''.'' + QUOTENAME(OBJECT_NAME(@o)); " +
-            "DECLARE @ix sysname = (SELECT name FROM sys.indexes WHERE object_id = @o AND index_id = @i); " +
-            "IF @ix IS NOT NULL BEGIN " +
-            "DECLARE @s1 nvarchar(max) = N''ALTER INDEX '' + QUOTENAME(@ix) + N'' ON '' + @q + N'' DISABLE;''; " +
-            "DECLARE @s2 nvarchar(max) = N''ALTER INDEX '' + QUOTENAME(@ix) + N'' ON '' + @q + N'' REBUILD;''; " +
-            "EXEC sys.sp_executesql @s1; EXEC sys.sp_executesql @s2; " +
-            "END';\n" +
+        //
+        // ATENÇÃO: desabilitar um índice ÚNICO/PK não-clusterizado que é referenciado por chave estrangeira
+        // DESABILITA essas FKs em silêncio — e o REBUILD reabilita o índice, mas NÃO as FKs. Sem o passo
+        // final, o banco ficaria sem integridade referencial depois de um reparo "sem perda". As FKs que o
+        // DISABLE derrubou (e só elas) são reativadas WITH CHECK; se houver linha violando, ficam ativas
+        // WITH NOCHECK (não confiáveis — o diagnóstico seguinte aponta) em vez de desligadas.
+        const string inner = """
+            DECLARE @q nvarchar(300) = QUOTENAME(OBJECT_SCHEMA_NAME(@o)) + N'.' + QUOTENAME(OBJECT_NAME(@o));
+            DECLARE @ix sysname = (SELECT name FROM sys.indexes WHERE object_id = @o AND index_id = @i);
+            IF @ix IS NOT NULL
+            BEGIN
+                DECLARE @before TABLE (id int PRIMARY KEY);
+                INSERT INTO @before SELECT object_id FROM sys.foreign_keys WHERE referenced_object_id = @o AND is_disabled = 1;
+                DECLARE @s1 nvarchar(max) = N'ALTER INDEX ' + QUOTENAME(@ix) + N' ON ' + @q + N' DISABLE;';
+                DECLARE @s2 nvarchar(max) = N'ALTER INDEX ' + QUOTENAME(@ix) + N' ON ' + @q + N' REBUILD;';
+                EXEC sys.sp_executesql @s1;
+                EXEC sys.sp_executesql @s2;
+                DECLARE @re nvarchar(max) = N'';
+                SELECT @re = @re
+                    + N'BEGIN TRY ALTER TABLE ' + QUOTENAME(OBJECT_SCHEMA_NAME(fk.parent_object_id)) + N'.' + QUOTENAME(OBJECT_NAME(fk.parent_object_id))
+                    + N' WITH CHECK CHECK CONSTRAINT ' + QUOTENAME(fk.name) + N'; END TRY BEGIN CATCH ALTER TABLE '
+                    + QUOTENAME(OBJECT_SCHEMA_NAME(fk.parent_object_id)) + N'.' + QUOTENAME(OBJECT_NAME(fk.parent_object_id))
+                    + N' WITH NOCHECK CHECK CONSTRAINT ' + QUOTENAME(fk.name) + N'; END CATCH; '
+                FROM sys.foreign_keys fk
+                WHERE fk.referenced_object_id = @o AND fk.is_disabled = 1 AND fk.object_id NOT IN (SELECT id FROM @before);
+                IF @re <> N'' EXEC sys.sp_executesql @re;
+            END
+            """;
+        const string sql =
             "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
             "EXEC @proc @inner, N'@o int, @i int', @o = @oid, @i = @iid;";
-        return (sql, new Dictionary<string, object?> { ["@db"] = db, ["@oid"] = objectId, ["@iid"] = indexId });
+        return (sql, new Dictionary<string, object?> { ["@db"] = db, ["@oid"] = objectId, ["@iid"] = indexId, ["@inner"] = inner });
     }
 
     // ----------------------------------------------------------------------------------
@@ -2170,12 +2455,18 @@ public sealed class RepairService
     /// 3) cópia física dos arquivos (quando locais) — porque o BACKUP costuma falhar com o banco
     ///    em EMERGENCY (Msg 3033).
     /// </summary>
-    private async Task TrySafetyNetAsync(SqlSession s, DatabaseInfo db, IProgress<RepairLogEntry> p, CancellationToken ct)
+    private async Task<SafetyNet> TrySafetyNetAsync(SqlSession s, DatabaseInfo db, IProgress<RepairLogEntry> p, CancellationToken ct)
     {
-        await TryCaptureTailLogAsync(s, db, p, ct);
+        // Relógio do SERVIDOR: é com ele que o msdb data os backups (a ferramenta pode rodar noutra máquina).
+        var started = await s.GetServerTimeAsync(ct) ?? DateTime.Now;
+        var tail = await TryCaptureTailLogAsync(s, db, p, ct);
         await TryBackupAsync(s, db, p, ct);
         await TryCopyPhysicalFilesAsync(s, db, p, ct);
+        return new SafetyNet(started, tail);
     }
+
+    /// <summary>O que a rede de segurança conseguiu preservar antes de um reparo destrutivo.</summary>
+    private sealed record SafetyNet(DateTime StartedAt, bool TailLogCaptured);
 
     /// <summary>
     /// Captura o tail-log com NO_TRUNCATE + CONTINUE_AFTER_ERROR: funciona mesmo com os arquivos
@@ -2183,13 +2474,13 @@ public sealed class RepairService
     /// MÍNIMA: as transações posteriores ao último backup ficam preservadas num .trn que pode ser
     /// aplicado numa restauração da cadeia. Não altera o estado do banco. Best-effort.
     /// </summary>
-    private async Task TryCaptureTailLogAsync(SqlSession s, DatabaseInfo db, IProgress<RepairLogEntry> p, CancellationToken ct)
+    private async Task<bool> TryCaptureTailLogAsync(SqlSession s, DatabaseInfo db, IProgress<RepairLogEntry> p, CancellationToken ct)
     {
         try
         {
             var model = await s.GetRecoveryModelAsync(db.Name, ct);
             if (model.Length == 0 || model.Equals("SIMPLE", StringComparison.OrdinalIgnoreCase))
-                return; // em SIMPLE não há cadeia de log a preservar
+                return false; // em SIMPLE não há cadeia de log a preservar
 
             var file = $"{AppConstants.SanitizeToken(db.Name, "banco")}_tail_{DateTime.Now:yyyyMMdd_HHmmss}.trn";
             var sql =
@@ -2202,9 +2493,10 @@ public sealed class RepairService
                 r.Success
                     ? $"Tail-log preservado na pasta padrão de backups: {file} — junto com a cadeia de backups, permite restauração SEM perda."
                     : "Não foi possível preservar o tail-log (log inacessível). O reparo prosseguirá conforme autorizado.");
+            return r.Success;
         }
         catch (OperationCanceledException) { throw; }
-        catch { /* best-effort */ }
+        catch { return false; /* best-effort */ }
     }
 
     /// <summary>
@@ -2387,10 +2679,12 @@ public sealed class RepairService
         var backupName = $"RestoreDB COPY_ONLY backup de {db.Name}";
 
         // O caminho relativo faz o SQL Server gravar na pasta padrão de backups da instância.
+        // CONTINUE_AFTER_ERROR: com 'backup checksum default' ligado (2014+), páginas com checksum
+        // inválido abortariam justamente o backup de um banco corrompido — que é quando ele mais importa.
         var comp = await s.SupportsBackupCompressionAsync(ct) ? ", COMPRESSION" : string.Empty;
         var sql =
             "DECLARE @cmd nvarchar(max);\n" +
-            "SET @cmd = N'BACKUP DATABASE ' + QUOTENAME(@db) + N' TO DISK = @bkfile WITH COPY_ONLY, INIT" + comp + ", NAME = @bkname';\n" +
+            "SET @cmd = N'BACKUP DATABASE ' + QUOTENAME(@db) + N' TO DISK = @bkfile WITH COPY_ONLY, INIT, CONTINUE_AFTER_ERROR" + comp + ", NAME = @bkname';\n" +
             "EXEC sys.sp_executesql @cmd, N'@bkfile nvarchar(4000), @bkname nvarchar(256)', @bkfile = @file, @bkname = @name;";
 
         var prm = new Dictionary<string, object?>

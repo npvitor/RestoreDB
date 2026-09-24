@@ -21,10 +21,18 @@ public static class BackupChainPlanner
         bool AtOrBeforeTarget(BackupSetInfo b) =>
             target is null || (b.BackupFinishDate ?? DateTime.MinValue) <= target.Value;
 
-        // 1) FULL base: o mais recente que termina até o alvo.
-        var baseFull = history.Where(b => b.IsFull && AtOrBeforeTarget(b))
-                              .OrderByDescending(b => b.BackupFinishDate ?? DateTime.MinValue)
-                              .FirstOrDefault();
+        // 1) FULL base: o mais recente que termina até o alvo. As cópias COPY_ONLY criadas pela própria
+        //    ferramenta (rede de segurança/simulação) retratam o banco JÁ danificado — só servem de base
+        //    quando não existe nenhum outro FULL.
+        var fulls = history.Where(b => b.IsFull && AtOrBeforeTarget(b)).ToList();
+        var preferred = fulls.Where(b => !b.IsToolSafetyCopy).ToList();
+        if (preferred.Count == 0 && fulls.Count > 0)
+        {
+            plan.Warnings.Add("O único FULL disponível é uma cópia de segurança criada pelo RestoreDB antes de um reparo " +
+                              "(retrata o banco já danificado). Ela será usada como base por falta de outra.");
+            preferred = fulls;
+        }
+        var baseFull = preferred.OrderByDescending(b => b.BackupFinishDate ?? DateTime.MinValue).FirstOrDefault();
         if (baseFull is null)
         {
             plan.Warnings.Add(target is null

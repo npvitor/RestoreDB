@@ -12,6 +12,14 @@ public enum RecommendedActionKind
     RebuildLog,
     FreeDiskSpace,
 
+    /// <summary>Log de transações cheio (9002) ou prestes a encher — NÃO é corrupção: libera-se o espaço
+    /// (backup de log, crescimento/arquivo extra) e o banco volta sem perda de dados.</summary>
+    ResolveLogFull,
+
+    /// <summary>Arquivo do banco ausente, sem permissão ou preso por outro processo — NÃO é corrupção:
+    /// aponta-se o novo caminho / concede-se acesso e o banco é religado sem perda de dados.</summary>
+    FixFileAccess,
+
     /// <summary>Integridade LÓGICA comprometida (FK órfã / violação de constraint) com os
     /// arquivos físicos íntegros — corrige-se removendo as linhas violadoras, não com CHECKDB.</summary>
     FixConstraints
@@ -79,6 +87,15 @@ public sealed class DiagnosisResult
 
     /// <summary>Novidades em relação ao último diagnóstico (ex.: corrupção nova) — detecção precoce.</summary>
     public List<string> NewSinceLastRun { get; } = new();
+
+    /// <summary>Situação do log de transações (uso, motivo de espera, limites dos arquivos).</summary>
+    public LogSpaceInfo? LogSpace { get; set; }
+
+    /// <summary>Arquivos que o SQL Server não consegue abrir (ausentes, sem permissão, presos).</summary>
+    public List<FileAccessProblem> FileProblems { get; } = new();
+
+    /// <summary>Linhas que violam constraints DESABILITADAS (informativo — não são corrupção).</summary>
+    public int DisabledConstraintHits { get; set; }
 
     /// <summary>Linhas violadoras de FK que podem ser removidas para restaurar a integridade.</summary>
     public IReadOnlyList<ConstraintViolation> ForeignKeyViolations =>

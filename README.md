@@ -22,8 +22,9 @@ Todo o T-SQL é **compatível com SQL Server 2008 R2** (e versões superiores).
 - **Diagnóstico autoritativo** (somente leitura) e **abrangente**: `DBCC CHECKDB ... WITH
   TABLERESULTS` (consistência física, estruturada), **`DBCC CHECKCONSTRAINTS`** (integridade
   referencial — FK/CHECK), **`DBCC CHECKCATALOG`** (metadados), constraints **não confiáveis**
-  (`is_not_trusted`), `msdb.dbo.suspect_pages`, log de erros, topologia, espaço em disco e
-  `PAGE_VERIFY`.
+  (`is_not_trusted`) e **desabilitadas** (respeitadas, nunca removidas), `msdb.dbo.suspect_pages`, log de
+  erros, **arquivos do banco** (ausente/sem permissão/preso), **uso do log de transações**, topologia,
+  espaço em disco e `PAGE_VERIFY`.
 - **Diagnóstico de qualquer banco** — inclusive `ONLINE` — sem precisar forçar `EMERGENCY` na mão.
 - **Correção de integridade lógica com recuperação do registro-pai a partir de backup**: antes de
   **remover** um registro órfão (violação de FK), a ferramenta tenta **reinserir o registro-pai que
@@ -32,6 +33,23 @@ Todo o T-SQL é **compatível com SQL Server 2008 R2** (e versões superiores).
   Só cai na **remoção** (destrutiva, com backup de segurança e confirmação) o que não existir em
   backup nenhum; se a recuperação for **parcial/ilegível**, a UI **oferece escolher outro `.bak`**
   antes de qualquer exclusão.
+- **Quarentena em vez de exclusão**: os órfãos que sobram não são apagados — saem da tabela e vão,
+  na MESMA transação, para o banco `RestoreDB_Quarentena` (com data e constraint de origem), de onde
+  podem ser devolvidos. Constraints **desabilitadas** pelo sistema (NOCHECK) são respeitadas: nunca
+  geram remoção.
+- **Devolução automática das linhas que o `REPAIR_ALLOW_DATA_LOSS` descartar**: depois do reparo, a
+  ferramenta mede a perda por tabela (contagem antes × depois + objetos que o reparo diz ter
+  desalocado), restaura numa cópia temporária a cadeia de backups **até o instante do reparo**
+  (FULL → diferencial → logs → tail-log da rede de segurança) e devolve só as linhas que faltam, por
+  chave primária. Só age quando a cópia retrata exatamente o momento anterior ao reparo; senão,
+  informa a perda e orienta a revisão manual.
+- **Log de transações cheio (9002) resolvido sem perda**: identifica o que segura o log
+  (`log_reuse_wait_desc`), faz o backup de log, libera o crescimento, cria um arquivo de log extra
+  no disco com mais espaço e religa o banco; transação aberta é **apontada** (sessão, máquina,
+  programa), nunca encerrada por conta própria.
+- **Arquivos inacessíveis resolvidos sem perda** (causa comum de `RECOVERY_PENDING`): detecta arquivo
+  **ausente** (checado no servidor), **sem permissão** (erro 5) ou **preso** (erro 32); aponta o novo
+  caminho (`MODIFY FILE`), concede acesso à conta de serviço (como Administrador) e religa.
 - **Escalonamento de reparo** do menos ao mais agressivo, **sempre primeiro SEM perda de dados**.
 - **Rede de segurança automática antes do reparo destrutivo**: captura o **tail-log WITH
   NO_TRUNCATE** (funciona mesmo com os arquivos de DADOS danificados — junto com a cadeia de
@@ -81,7 +99,9 @@ Todo o T-SQL é **compatível com SQL Server 2008 R2** (e versões superiores).
   para bancos de **sistema**, aviso de **TDE** nos restores.
 - **Manutenção preventiva**: desfragmentação de índices + estatísticas; e **causa-raiz** (erros de
   E/S, corrupção recorrente ⇒ suspeita de hardware).
-- **Forense de exclusão acidental**: lê o log (`fn_dblog`) e restaura até **logo antes** do DELETE/DROP.
+- **Forense de exclusão acidental**: lê o log (`fn_dblog`), identifica **tabela** e linhas do
+  DELETE e **devolve só as linhas excluídas sem sobrescrever o banco** (cópia até logo antes + retorno
+  por chave primária — o que foi feito depois é preservado); para DROP/TRUNCATE, restaura até logo antes.
 - **Guarda de topologia**: bloqueia reparo destrutivo em bancos espelhados, em Always On,
   log shipping ou replicação.
 - **Reconstrução do log de transações** como último recurso.
@@ -110,6 +130,7 @@ src/
 │   ├─ DatabaseService.cs               Listagem de bancos
 │   ├─ RepairService.cs                 Orquestração do reparo + diagnóstico (escalonamento)
 │   ├─ RestoreService.cs                Restauração de backup (full/diff/log, página, usuários órfãos)
+│   ├─ AvailabilityService.cs           Causas que não são corrupção: log cheio (9002) e arquivos inacessíveis
 │   ├─ ReportService.cs                 Exportação do relatório da sessão (HTML)
 │   └─ LogService.cs                    Log em arquivo (timestamp, thread-safe)
 │
@@ -137,6 +158,7 @@ Pré-requisito: **.NET 10 SDK** (Windows).
 dotnet build RestoreDB.slnx
 dotnet run --project src/RestoreDB.App
 dotnet test RestoreDB.slnx          # testes de lógica (xUnit)
+pwsh docs/build-manual-pdf.ps1      # regera docs/MANUAL.pdf a partir de docs/MANUAL.md (Chrome/Edge headless)
 ```
 
 ---
@@ -181,9 +203,17 @@ Sem modificar nada, ele cruza **fontes autoritativas** e recomenda o melhor cami
 - **`DBCC CHECKCATALOG`** — consistência dos **metadados** do banco;
 - **constraints não confiáveis** (`sys.foreign_keys`/`sys.check_constraints` com `is_not_trusted`)
   — integridade que nunca foi validada (causa comum de FK órfã silenciosa);
+- **constraints desabilitadas** (`is_disabled`, `NOCHECK`) — as linhas que as violam são apenas
+  **informadas**: o próprio sistema optou por não aplicá-las, então não são corrupção nem são removidas;
+- **arquivos do banco** — existência de cada `.mdf`/`.ndf`/`.ldf` checada **no servidor**
+  (`xp_fileexist`) e falhas de abertura no log de erros: **ausente** (erro 2/3), **sem permissão**
+  (erro 5), **preso por outro processo** (erro 32) — EN e PT;
+- **log de transações** — % usado (`sys.dm_db_log_space_usage` no 2012+, `DBCC SQLPERF` no 2008 R2),
+  motivo de espera (`log_reuse_wait_desc`) e limites de crescimento de cada arquivo de log;
 - **log de erros** (`sp_readerrorlog`, vários arquivos) — discrimina **DADOS** (`.mdf`/`.ndf`)
   × **LOG** (`.ldf`) pelo nome físico do arquivo (independe de idioma) e detecta **9002**
-  (log cheio) e **823/824/825** (E/S);
+  (log cheio) e **823/824/825** (E/S); a busca inclui os **nomes dos arquivos** (muitas mensagens de E/S citam
+  só o caminho, não o nome do banco);
 - **topologia** (espelhamento/Always On/log shipping/replicação);
 - **espaço em disco** dos volumes do banco (`sys.dm_os_volume_stats`);
 - **`PAGE_VERIFY`** — recomenda `CHECKSUM` quando estiver `NONE`/`TORN_PAGE_DETECTION`.
@@ -195,7 +225,11 @@ A conclusão define a **ação recomendada** e a UI destaca o caminho certo:
 - **integridade lógica** (FK órfã / constraint) com físico íntegro ⇒ **corrigir integridade**
   (remover registros órfãos) ou restaurar de backup para preservar tudo;
 - corrupção de **log** ⇒ **reconstruir o log**;
-- **log cheio (9002)** ⇒ liberar espaço / `BACKUP LOG` (não é corrupção);
+- **arquivo ausente/sem permissão/preso** (banco fora do ar) ⇒ **corrigir acesso aos arquivos e
+  religar** — tem prioridade: não é corrupção, e com o arquivo inacessível as demais evidências ficam
+  enviesadas;
+- **log cheio (9002)** ou prestes a encher ⇒ **resolver log cheio** (backup de log, crescimento,
+  arquivo de log extra, religar) — não é corrupção;
 - **topologia de alta disponibilidade** ⇒ alerta para tratar antes de reparar.
 
 ## Lógica de reparo (escalonamento: do menos ao mais agressivo)
@@ -206,9 +240,11 @@ A conclusão define a **ação recomendada** e a UI destaca o caminho certo:
 | `OFFLINE`         | `SET ONLINE` → `SET MULTI_USER`                                                    | Não            |
 | `RESTORING`/`RECOVERING` | `RESTORE DATABASE ... WITH RECOVERY`                                        | Não            |
 | `RECOVERY_PENDING`| Tenta `SET ONLINE`; se falhar, cai no fluxo de emergência abaixo                   | Não → (talvez) |
+| Arquivo **inacessível** (diagnóstico) | *(se movido)* `SET OFFLINE` → `MODIFY FILE (FILENAME = novo caminho)`; *(sem permissão, local + Administrador)* `icacls /grant <conta do SQL>` → `SET ONLINE` | **Não** |
+| **Log cheio** (9002) | `BACKUP LOG` (se `LOG_BACKUP`) / `CHECKPOINT` → `MODIFY FILE (MAXSIZE = UNLIMITED, FILEGROWTH)` → `ADD LOG FILE` no disco com mais espaço → `SET ONLINE` (se fora do ar) | **Não** |
 | `SUSPECT`/`EMERGENCY` | `SET EMERGENCY` → `SET SINGLE_USER WITH ROLLBACK IMMEDIATE` → `DBCC CHECKDB` (diagnóstico) → `SET ONLINE` (recuperação) → `REPAIR_REBUILD` → verificação | Não |
 | ↳ se restar só corrupção de **índice não-clusterizado** | `ALTER INDEX ... REBUILD` (reconstrói os índices afetados) → verificação | **Não** |
-| ↳ se o reparo seguro não bastar | **(com confirmação)** `EMERGENCY` + `SINGLE_USER` → **tail-log `NO_TRUNCATE`** + backup `COPY_ONLY` + **cópia física** dos arquivos → `REPAIR_ALLOW_DATA_LOSS` → verificação → reconciliar FKs + reseed de IDENTITY → `MULTI_USER` → **backup FULL pós-reparo** | **Sim*** |
+| ↳ se o reparo seguro não bastar | **(com confirmação)** `EMERGENCY` + `SINGLE_USER` → **tail-log `NO_TRUNCATE`** + backup `COPY_ONLY` + **cópia física** dos arquivos → `REPAIR_ALLOW_DATA_LOSS` → `SET ONLINE` (se ficou em `EMERGENCY`) → verificação → **devolver do backup as linhas descartadas** (cópia até o instante do reparo) → reconciliar FKs (pai do backup; órfão restante → **quarentena**) + reseed de IDENTITY → `MULTI_USER` → **backup FULL pós-reparo** | **Sim*** |
 | **Corrupção de dados** (recomendado) | **Restaurar de backup** (`RESTORE`/`RESTORE ... PAGE`) → corrigir usuários órfãos | Não* |
 
 > \* O `REPAIR_ALLOW_DATA_LOSS` descarta o que está corrompido, **mas** o tail-log capturado
@@ -434,6 +470,22 @@ A cadeia é montada pelo **`BackupChainPlanner`** (validação de LSN): usa o ú
 Na UI, quando o diagnóstico recomenda a restauração de página, o campo `fileId:pageId` já vem
 **pré-preenchido** a partir de `msdb.suspect_pages`.
 
+### Proteções adicionais de integridade
+
+- **Gatilhos não disparam** ao devolver linhas (salvamento, registro-pai, pós-reparo) nem ao mover
+  órfãos para a quarentena: a escrita roda numa transação com `DISABLE TRIGGER` (o bloqueio de
+  esquema impede outras sessões de gravar sem gatilho nesse intervalo) e o `ROLLBACK` desfaz tudo em
+  caso de erro. Essas linhas já existiram — seus efeitos de negócio (estoque, auditoria...) já ocorreram.
+- **Reconstrução de índice não deixa FK desligada**: o `ALTER INDEX … DISABLE` de um índice único/PK
+  referenciado desliga as FKs dependentes; elas são reativadas `WITH CHECK` ao final.
+- **Restauração com a aplicação conectada**: as conexões são encerradas (`SINGLE_USER WITH ROLLBACK
+  IMMEDIATE`) no mesmo lote do `RESTORE`/tail-log, na mesma sessão (de outra, o SQL Server recusa com
+  a Msg 3101), e o banco volta em `MULTI_USER`.
+- **Plano de restauração confiável**: ignora backups cujo arquivo não existe mais no servidor e as
+  cópias `COPY_ONLY` da própria ferramenta (estado já danificado / simulação apagada); o histórico não
+  é mais cortado em 300 conjuntos (cadeias com log a cada 15 min eram vistas como "quebradas"); o
+  tail-log só é aplicado quando o alvo do ponto-no-tempo está além dos backups existentes.
+
 ### Segurança de topologia
 
 Antes de qualquer operação destrutiva (`SET EMERGENCY`/`SINGLE_USER`, detach, `RESTORE`),
@@ -483,7 +535,10 @@ compatibilidade com o TLS de servidores antigos (2008 R2). É possível usar
 
 **Testes de lógica** ([`tests/RestoreDB.Tests`](tests/RestoreDB.Tests), xUnit) — não precisam de
 SQL Server: *connection string* (SQL × Windows auth), script planejado (*dry-run*), classificação
-de corrupção só-índice (`CheckDbReport`), topologia/disco e utilitários de domínio.
+de corrupção só-índice (`CheckDbReport`), topologia/disco, montagem da cadeia de backups (inclusive
+descarte das cópias de segurança da própria ferramenta), conclusões do diagnóstico (arquivo
+inacessível, log cheio), hora do `fn_dblog`/tabela afetada, classificação das falhas de abertura de
+arquivo (EN/PT), `object ID` citados pelo reparo e utilitários de domínio.
 
 ```powershell
 dotnet test RestoreDB.slnx
@@ -493,9 +548,14 @@ dotnet test RestoreDB.slnx
 exercitam os serviços reais contra uma instância SQL: conexão/`ServerInfo`, reparo `OFFLINE`,
 `EMERGENCY` e `RESTORING`, diagnóstico estruturado (CHECKDB/`suspect_pages`/topologia/disco),
 restauração de backup (revertendo perda de dados), **recuperação de registros-pai órfãos a partir
-de backup** (automática, com `.bak` escolhido e com o novo backup interativo via callback) e
-`HEADERONLY`/`FILELISTONLY`. Cada teste cria
-e **derruba** seu próprio banco `RestoreDB_IT_*` (isolado) e limpa os backups gerados. Sem as
+de backup** (automática, com `.bak` escolhido e com o novo backup interativo via callback),
+`HEADERONLY`/`FILELISTONLY` e os caminhos novos: **quarentena** de órfãos, constraints
+**desabilitadas** respeitadas, salvamento **sem disparar gatilhos**, **FKs reativadas** após
+reconstruir índice, **exclusão acidental desfeita sem sobrescrever**, restauração **com a aplicação
+conectada**, plano que **ignora backup apagado**, ponto-no-tempo **sem aplicar o tail-log** quando
+desnecessário, **log cheio (9002)** resolvido e **arquivo ausente** realocado. Cada teste cria
+e **derruba** seu próprio banco `RestoreDB_IT_*` (isolado) e limpa os backups gerados — inclusive os
+que a própria ferramenta criou (tail-log, cópias de segurança) e as tabelas de quarentena. Sem as
 variáveis de ambiente abaixo, esses testes são **ignorados** (o `dotnet test` padrão segue verde).
 
 ```powershell
@@ -509,10 +569,19 @@ $env:RESTOREDB_IT_USE_WINDOWS  = "1"
 dotnet test tests/RestoreDB.IntegrationTests
 ```
 
-> Validado contra **SQL Server 2008 (major 10)** e **SQL Server 2025 (major 17)** — ambos com
-> **autenticação do Windows** — e, em produção, contra **SQL Server 2008 R2 SP3 (Express Edition,
-> 10.50.6000.34)**: **92 testes de lógica + 34 de integração** aprovados **nas duas versões**, e os
-> fluxos de reparo exercitados com **corrupção física real** (`DBCC WRITEPAGE`) sobre cópias de
+> **Situação atual: 121 testes de lógica + 44 de integração aprovados nas duas versões**:
+>
+> | Instância | Versão | Autenticação | Resultado |
+> |---|---|---|---|
+> | `SQL2008-TESTE` | **SQL Server 2008 R2 SP3 Express** (10.50.6220) | SQL (`sa`) | 44/44 |
+> | `SQL2025-TESTE` | **SQL Server 2025 Developer** (17.0) | Windows | 44/44 |
+>
+> Também em produção, contra **SQL Server 2008 R2 SP3 (Express Edition, 10.50.6000.34)**. O
+> diagnóstico (somente leitura) foi conferido nas duas versões sobre um banco real de teste (≈900 MB,
+> sistema de varejo): sem falso positivo nas checagens de arquivos, log e constraints — no 2008 o uso
+> do log é lido pelo `DBCC SQLPERF` (a DMV `sys.dm_db_log_space_usage` só existe do 2012 em diante).
+>
+> Os fluxos de reparo foram exercitados com **corrupção física real** (`DBCC WRITEPAGE`) sobre cópias de
 > bancos de produção de teste (≈900 MB). A **recuperação de registro-pai a partir de backup** foi
 > atestada **ponta a ponta nas duas versões**: remover um registro-pai real, recuperá-lo do backup
 > (histórico e `.bak` escolhido) e **preservar o registro filho** — com efeito líquido zero. O
@@ -543,6 +612,25 @@ num banco de produção de teste, com backup prévio e restauração ao final:
   de recuperação manual — confirmando a garantia de "não piorar o estado".
 - Estados `OFFLINE` e `RESTORING` ⇒ religados sem perda (`SET ONLINE` / `RESTORE WITH RECOVERY`).
 
+> ⚠️ **Pendente:** a **devolução automática das linhas descartadas pelo `REPAIR_ALLOW_DATA_LOSS`**
+> ainda não foi exercitada ponta a ponta com corrupção física real. Suas peças estão cobertas por
+> testes — cópia restaurada até um instante (cadeia + tail-log), reinserção por chave primária com
+> gatilhos desligados, leitura dos `object ID` nas mensagens do reparo —, mas convém repetir o cenário
+> "página de dados corrompida + reparo COM perda" acima e conferir a contagem/checksum final.
+
 O utilitário [`tools/RestoreDB.Probe`](tools/RestoreDB.Probe) é um runner de linha de comando que
-invoca os serviços reais (`diagnose`/`repair`/`repair-indexes`/`fix-constraints`/`simulate-repair`/`monitor`/`maintain`/`fragmentation`/`forensic`/`attach`/`restore`/`restore-pit`/`restore-pages`/`restore-standby`/`finalize-recovery`/`test-restore`/`restore-copy`/`salvage-table`/`verify-backups`/`check-table`/`reseed`/`history`/`rebuild-log`) — usado nessa
+invoca os serviços reais (`diagnose`/`repair`/`repair-indexes`/`fix-constraints`/`simulate-repair`/`monitor`/`maintain`/`fragmentation`/`forensic`/`attach`/`restore`/`restore-pit`/`restore-pages`/`restore-standby`/`finalize-recovery`/`test-restore`/`restore-copy`/`salvage-table`/`verify-backups`/`check-table`/`reseed`/`history`/`rebuild-log`/`resolve-log`/`fix-files`/`recover-deleted`) — usado nessa
 validação e útil para operar a ferramenta sem a interface gráfica.
+
+```powershell
+# Autenticação do Windows:
+$env:PROBE_SERVER = "localhost"
+# ...ou autenticação SQL:
+$env:PROBE_USER = "sa"
+$env:PROBE_PASS = "********"
+
+dotnet run --project tools/RestoreDB.Probe -- diagnose MeuBanco
+dotnet run --project tools/RestoreDB.Probe -- resolve-log MeuBanco
+dotnet run --project tools/RestoreDB.Probe -- fix-files MeuBanco MeuBanco_log=E:\Dados\MeuBanco_log.ldf
+dotnet run --project tools/RestoreDB.Probe -- recover-deleted MeuBanco 2026-09-23T14:05:00 dbo.NotaFiscal
+```

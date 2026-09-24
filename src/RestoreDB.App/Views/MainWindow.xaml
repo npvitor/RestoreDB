@@ -188,7 +188,7 @@
                                                 Style="{StaticResource SecondaryButton}" Height="40" Margin="0,6,0,0"
                                                 Click="ScheduleButton_Click" />
 
-                                        <TextBlock Text="Recuperar de exclusão acidental: lista DELETE/DROP/TRUNCATE recentes no log e restaura até logo antes."
+                                        <TextBlock Text="Recuperar de exclusão acidental: lista DELETE/DROP/TRUNCATE recentes no log. Prefira devolver só as linhas excluídas (o que foi feito depois é preservado); restaurar o banco inteiro até antes descarta tudo o que veio depois."
                                                    Foreground="{DynamicResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,10,0,0" />
                                         <Button x:Name="ForensicButton" Content="Procurar exclusões recentes no log"
                                                 Style="{StaticResource SecondaryButton}" Height="40" Margin="0,6,0,0"
@@ -196,7 +196,10 @@
                                         <ListBox x:Name="ForensicList" Height="92" Margin="0,6,0,0" Visibility="Collapsed"
                                                  Background="{DynamicResource CardBrush}" DisplayMemberPath="Display"
                                                  BorderBrush="{DynamicResource LineBrush}" BorderThickness="1" />
-                                        <Button x:Name="ForensicRestoreButton" Content="Restaurar até ANTES da transação selecionada"
+                                        <Button x:Name="ForensicRecoverRowsButton" Content="Devolver só as linhas excluídas (não sobrescreve o banco)"
+                                                Style="{StaticResource FlatButton}" Height="38" Margin="0,6,0,0" Visibility="Collapsed"
+                                                Click="ForensicRecoverRowsButton_Click" />
+                                        <Button x:Name="ForensicRestoreButton" Content="Restaurar o banco inteiro até ANTES da transação"
                                                 Style="{StaticResource DangerButton}" Height="38" Margin="0,6,0,0" Visibility="Collapsed"
                                                 Click="ForensicRestoreButton_Click" />
                                     </StackPanel>
@@ -278,6 +281,40 @@
                                 </StackPanel>
                             </Border>
 
+                            <!-- [PRIMÁRIO p/ log cheio (9002)] Resolver sem perda de dados -->
+                            <Border x:Name="LogFullPanel" Visibility="Collapsed" Margin="0,8,0,0"
+                                    Background="{DynamicResource OkBackBrush}" BorderBrush="{DynamicResource OkForeBrush}"
+                                    BorderThickness="1" CornerRadius="6" Padding="12">
+                                <StackPanel>
+                                    <TextBlock Text="✔ LOG DE TRANSAÇÕES CHEIO — RESOLVÍVEL SEM PERDA DE DADOS" FontWeight="Bold"
+                                               Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" />
+                                    <TextBlock x:Name="LogFullText" Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" Margin="0,6,0,0"
+                                               Text="Não é corrupção. A ferramenta identifica o que segura o log e libera espaço: backup de log, crescimento do arquivo ou um arquivo de log extra em outro disco — e religa o banco." />
+                                    <Button x:Name="ResolveLogFullButton" Content="Resolver log cheio (sem perda de dados)"
+                                            Style="{StaticResource FlatButton}" Height="42" Margin="0,10,0,0"
+                                            Click="ResolveLogFullButton_Click" />
+                                </StackPanel>
+                            </Border>
+
+                            <!-- [PRIMÁRIO p/ arquivo ausente/sem permissão/preso] Corrigir acesso e religar -->
+                            <Border x:Name="FileAccessPanel" Visibility="Collapsed" Margin="0,8,0,0"
+                                    Background="{DynamicResource OkBackBrush}" BorderBrush="{DynamicResource OkForeBrush}"
+                                    BorderThickness="1" CornerRadius="6" Padding="12">
+                                <StackPanel>
+                                    <TextBlock Text="✔ ARQUIVOS INACESSÍVEIS — RESOLVÍVEL SEM PERDA DE DADOS" FontWeight="Bold"
+                                               Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" />
+                                    <TextBlock x:Name="FileAccessText" Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" Margin="0,6,0,0" />
+                                    <Button x:Name="LocateFileButton" Content="📁  Localizar arquivo ausente…"
+                                            Style="{StaticResource SecondaryButton}" Height="38" Margin="0,10,0,0"
+                                            Click="LocateFileButton_Click" />
+                                    <Button x:Name="FixFileAccessButton" Content="Corrigir acesso aos arquivos e religar"
+                                            Style="{StaticResource FlatButton}" Height="42" Margin="0,8,0,0"
+                                            Click="FixFileAccessButton_Click" />
+                                    <TextBlock Text="Conceder permissão exige executar a ferramenta como Administrador no próprio servidor; sem isso, os comandos para o suporte aparecem no registro."
+                                               Foreground="{DynamicResource OkForeBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,6,0,0" />
+                                </StackPanel>
+                            </Border>
+
                             <!-- [PRIMÁRIO p/ corrupção LÓGICA] Corrigir integridade (remover registros órfãos) -->
                             <Border x:Name="ConstraintFixPanel" Visibility="Collapsed" Margin="0,8,0,0"
                                     Background="{DynamicResource WarnBackBrush}" BorderBrush="{DynamicResource WarnLineBrush}"
@@ -286,7 +323,7 @@
                                     <TextBlock Text="⚠ INTEGRIDADE LÓGICA: REGISTROS ÓRFÃOS"
                                                FontWeight="Bold" Foreground="{DynamicResource WarnForeBrush}" TextWrapping="Wrap" />
                                     <TextBlock x:Name="ConstraintFixText" Margin="0,8,0,0" Foreground="{DynamicResource WarnForeBrush}" TextWrapping="Wrap"
-                                               Text="Há linhas cuja chave estrangeira aponta para um registro inexistente (o DBCC CHECKDB não detecta isso). A correção REMOVE essas linhas órfãs para restaurar a integridade — operação destrutiva, com backup de segurança antes. Para preservar 100% dos registros, prefira restaurar de backup." />
+                                               Text="Há linhas cuja chave estrangeira aponta para um registro inexistente (o DBCC CHECKDB não detecta isso). A correção primeiro tenta recuperar o registro-pai do backup; o que sobrar é retirado da tabela e guardado na QUARENTENA (banco RestoreDB_Quarentena), de onde pode ser devolvido depois. Há backup de segurança antes." />
                                     <StackPanel Margin="0,12,0,0">
                                         <TextBlock Text="RECUPERAÇÃO DE REGISTROS-PAI (OPCIONAL)" Style="{StaticResource FieldLabel}" Foreground="{DynamicResource WarnForeBrush}" />
                                         <StackPanel Orientation="Horizontal">
@@ -431,6 +468,10 @@
                                                    Foreground="{DynamicResource DangerDarkBrush}"
                                                    Text="Automático: usa o backup FULL mais recente do histórico. Escolha um .bak se o backup estiver em outra mídia (o SQL Server precisa conseguir lê-lo)." />
                                     </StackPanel>
+                                    <CheckBox x:Name="RecoverLostRowsCheck" Margin="0,12,0,0" IsChecked="True" Foreground="{DynamicResource DangerDarkBrush}">
+                                        <TextBlock TextWrapping="Wrap" Foreground="{DynamicResource DangerDarkBrush}"
+                                                   Text="Devolver automaticamente, a partir dos backups, as linhas que o reparo descartar (recomendado — só age quando a cadeia de backups chega até o instante do reparo)." />
+                                    </CheckBox>
                                     <CheckBox x:Name="DataLossConfirmCheck" Margin="0,12,0,0" Foreground="{DynamicResource DangerDarkBrush}"
                                               Content="Estou ciente e autorizo o reparo com possível perda de dados."
                                               Checked="DataLossConfirmCheck_Changed" Unchecked="DataLossConfirmCheck_Changed" />

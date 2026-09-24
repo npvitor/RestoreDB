@@ -26,6 +26,13 @@ public sealed class ConstraintViolation
     /// Só FKs têm remoção automática de órfãos; violações de CHECK são apenas reportadas.</summary>
     public bool IsForeignKey { get; set; }
 
+    /// <summary>
+    /// true quando a constraint está DESABILITADA (NOCHECK) — o próprio sistema optou por não
+    /// aplicá-la, então as linhas que a violam NÃO são corrupção e jamais devem ser removidas.
+    /// (DBCC CHECKCONSTRAINTS WITH ALL_CONSTRAINTS também verifica as desabilitadas.)
+    /// </summary>
+    public bool IsDisabled { get; set; }
+
     public string Display =>
-        $"{(IsForeignKey ? "FK" : "CHECK")} {Constraint} em {Table} — {Where}".TrimEnd(' ', '—');
+        $"{(IsForeignKey ? "FK" : "CHECK")}{(IsDisabled ? " (desabilitada)" : "")} {Constraint} em {Table} — {Where}".TrimEnd(' ', '—');
 }

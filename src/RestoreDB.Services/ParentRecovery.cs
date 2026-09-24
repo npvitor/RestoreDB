@@ -42,4 +42,11 @@ public sealed class ParentRecoveryOptions
 
     /// <summary>Callback para escolher outro .bak quando a recuperação falha/é parcial (null = não interativo).</summary>
     public ChooseAnotherBackupAsync? ChooseAnotherBackup { get; init; }
+
+    /// <summary>
+    /// Após um REPAIR_ALLOW_DATA_LOSS, devolver automaticamente as linhas que o reparo descartou, lendo-as
+    /// de uma cópia da cadeia de backups restaurada até o instante do reparo (padrão: ligado). Só age quando
+    /// a cópia retrata EXATAMENTE o momento anterior ao reparo (tail-log capturado + cadeia contínua).
+    /// </summary>
+    public bool RecoverLostRows { get; init; } = true;
 }

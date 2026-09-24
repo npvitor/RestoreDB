@@ -113,6 +113,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
             "END";
         try
         {
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@db", databaseName);
             await cmd.ExecuteNonQueryAsync(ct);
@@ -151,6 +152,235 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         catch { /* best-effort */ }
     }
 
+    /// <summary>Data/hora atual do SERVIDOR (GETDATE()) — a mesma referência das datas do msdb. Best-effort.</summary>
+    public async Task<DateTime?> GetServerTimeAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            await EnsureOpenAsync(ct);
+            await using var cmd = new SqlCommand("SELECT GETDATE();", _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            return (DateTime?)await cmd.ExecuteScalarAsync(ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// Situação do LOG de transações: motivo de espera (log_reuse_wait_desc), % usado (DBCC SQLPERF —
+    /// funciona no 2008 R2; só para bancos ONLINE) e, por arquivo, tamanho/limite/crescimento e espaço
+    /// livre no volume (sys.dm_os_volume_stats, 2008 R2 SP1+). Best-effort: campos indisponíveis ficam nulos.
+    /// </summary>
+    public async Task<LogSpaceInfo> GetLogSpaceInfoAsync(string databaseName, CancellationToken ct = default)
+    {
+        string model = string.Empty, wait = string.Empty;
+        double? used = null, total = null;
+        try
+        {
+            await EnsureOpenAsync(ct);
+            await using var cmd = new SqlCommand(
+                "SELECT recovery_model_desc, log_reuse_wait_desc FROM sys.databases WHERE name = @db;", _connection)
+            { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            if (await r.ReadAsync(ct))
+            {
+                model = r.IsDBNull(0) ? string.Empty : r.GetString(0);
+                wait = r.IsDBNull(1) ? string.Empty : r.GetString(1);
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* best-effort */ }
+
+        // 2012+: sys.dm_db_log_space_usage no contexto do banco (abre o banco mesmo com AUTO_CLOSE, que o
+        // DBCC SQLPERF omite). No 2008 R2 a DMV não existe e o SQLPERF abaixo cobre.
+        try
+        {
+            await EnsureOpenAsync(ct);
+            await using var cmd = new SqlCommand(
+                "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
+                "EXEC @proc N'SELECT total_log_size_in_bytes / 1048576.0, used_log_space_in_percent FROM sys.dm_db_log_space_usage;';",
+                _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            if (await r.ReadAsync(ct))
+            {
+                total = r.IsDBNull(0) ? null : Convert.ToDouble(r.GetValue(0));
+                used = r.IsDBNull(1) ? null : Convert.ToDouble(r.GetValue(1));
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* 2008 R2 ou banco inacessível */ }
+
+        if (used is null)
+        try
+        {
+            await EnsureOpenAsync(ct);
+            await using var cmd = new SqlCommand(
+                "DECLARE @t TABLE (DbName sysname, LogSizeMb float, LogUsedPct float, Status int);\n" +
+                "INSERT INTO @t EXEC (N'DBCC SQLPERF(LOGSPACE) WITH NO_INFOMSGS');\n" +
+                "SELECT LogSizeMb, LogUsedPct FROM @t WHERE DbName = @db;", _connection)
+            { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            if (await r.ReadAsync(ct))
+            {
+                total = r.IsDBNull(0) ? null : Convert.ToDouble(r.GetValue(0));
+                used = r.IsDBNull(1) ? null : Convert.ToDouble(r.GetValue(1));
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* best-effort */ }
+
+        var info = new LogSpaceInfo { RecoveryModel = model, ReuseWait = wait, UsedPercent = used, TotalSizeMb = total };
+
+        // Arquivos de log: size/max_size em páginas de 8 KB; max_size -1 = ilimitado; growth em páginas ou %.
+        const string filesSql =
+            "SELECT mf.name, mf.physical_name, mf.size, mf.max_size, mf.growth, mf.is_percent_growth, mf.file_id " +
+            "FROM sys.master_files mf WHERE mf.database_id = DB_ID(@db) AND mf.type = 1 ORDER BY mf.file_id;";
+        var fileIds = new List<(int id, LogFileInfo f)>();
+        try
+        {
+            await EnsureOpenAsync(ct);
+            await using var cmd = new SqlCommand(filesSql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+            {
+                var size = Convert.ToDouble(r.GetValue(2)) * 8 / 1024;
+                var max = Convert.ToInt64(r.GetValue(3));
+                var pct = !r.IsDBNull(5) && r.GetBoolean(5);
+                var growth = Convert.ToDouble(r.GetValue(4));
+                fileIds.Add((Convert.ToInt32(r.GetValue(6)), new LogFileInfo
+                {
+                    LogicalName = r.GetString(0),
+                    PhysicalName = r.GetString(1),
+                    SizeMb = size,
+                    // max_size: -1 = ilimitado; 268435456 = 2 TB (o "ilimitado" do log).
+                    MaxSizeMb = max is -1 or >= 268435456 ? null : max * 8.0 / 1024,
+                    Growth = pct ? growth : growth * 8 / 1024,
+                    GrowthIsPercent = pct
+                }));
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* best-effort */ }
+
+        foreach (var (id, f) in fileIds)
+        {
+            double? free = null;
+            try
+            {
+                await EnsureOpenAsync(ct);
+                await using var cmd = new SqlCommand(
+                    "SELECT available_bytes FROM sys.dm_os_volume_stats(DB_ID(@db), @fid);", _connection)
+                { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+                cmd.Parameters.AddWithValue("@db", databaseName);
+                cmd.Parameters.AddWithValue("@fid", id);
+                var v = await cmd.ExecuteScalarAsync(ct);
+                if (v is not null && v != DBNull.Value) free = Convert.ToDouble(v) / 1024 / 1024;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch { /* DMF indisponível (2008 R2 sem SP1) / banco inacessível */ }
+            info.Files.Add(new LogFileInfo
+            {
+                LogicalName = f.LogicalName, PhysicalName = f.PhysicalName, SizeMb = f.SizeMb, MaxSizeMb = f.MaxSizeMb,
+                Growth = f.Growth, GrowthIsPercent = f.GrowthIsPercent, VolumeFreeMb = free
+            });
+        }
+        return info;
+    }
+
+    /// <summary>
+    /// A transação ABERTA mais antiga do banco (a que segura o log em ACTIVE_TRANSACTION), com quem a
+    /// abriu. Somente leitura (DMVs de transação, 2005+). Null quando não há/sem permissão.
+    /// </summary>
+    public async Task<(int SessionId, DateTime Started, string Login, string Host, string Program)?> GetOldestOpenTransactionAsync(
+        string databaseName, CancellationToken ct = default)
+    {
+        try
+        {
+            const string sql =
+                "SELECT TOP (1) st.session_id, dt.database_transaction_begin_time, ISNULL(es.login_name, N''), " +
+                "       ISNULL(es.host_name, N''), ISNULL(es.program_name, N'') " +
+                "FROM sys.dm_tran_database_transactions dt " +
+                "JOIN sys.dm_tran_session_transactions st ON st.transaction_id = dt.transaction_id " +
+                "LEFT JOIN sys.dm_exec_sessions es ON es.session_id = st.session_id " +
+                "WHERE dt.database_id = DB_ID(@db) AND dt.database_transaction_begin_time IS NOT NULL " +
+                "ORDER BY dt.database_transaction_begin_time;";
+            await EnsureOpenAsync(ct);
+            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            if (!await r.ReadAsync(ct)) return null;
+            return (Convert.ToInt32(r.GetValue(0)), r.GetDateTime(1), r.GetString(2), r.GetString(3), r.GetString(4));
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// Pastas candidatas para acomodar um arquivo de log EXTRA: as pastas dos arquivos da instância
+    /// (todos os bancos), com o espaço livre do volume de cada uma, da mais livre para a menos livre.
+    /// Best-effort (sys.dm_os_volume_stats, 2008 R2 SP1+).
+    /// </summary>
+    public async Task<List<(string Directory, double FreeMb)>> GetInstanceFoldersByFreeSpaceAsync(CancellationToken ct = default)
+    {
+        var list = new List<(string, double)>();
+        try
+        {
+            const string sql =
+                "SELECT mf.physical_name, vs.available_bytes, vs.volume_mount_point FROM sys.master_files mf " +
+                "CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) vs WHERE mf.type IN (0, 1);";
+            await EnsureOpenAsync(ct);
+            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            while (await r.ReadAsync(ct))
+            {
+                var dir = System.IO.Path.GetDirectoryName(r.GetString(0)) ?? string.Empty;
+                if (dir.Length == 0 || !seen.Add(dir)) continue;
+                list.Add((dir, Convert.ToDouble(r.GetValue(1)) / 1024 / 1024));
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* best-effort */ }
+        return list.OrderByDescending(x => x.Item2).ToList();
+    }
+
+    /// <summary>
+    /// Conta de serviço do SQL Server (sys.dm_server_services, 2008 R2 SP1+) — quem precisa de permissão
+    /// sobre os arquivos do banco. Fallback: a identidade virtual do serviço ("NT SERVICE\MSSQLSERVER" ou
+    /// "NT SERVICE\MSSQL$INSTANCIA"), que é a conta padrão desde o 2012 e sempre existe como SID de serviço.
+    /// </summary>
+    public async Task<List<string>> GetSqlServiceAccountsAsync(CancellationToken ct = default)
+    {
+        var accounts = new List<string>();
+        try
+        {
+            await EnsureOpenAsync(ct);
+            await using var cmd = new SqlCommand(
+                "SELECT service_account FROM sys.dm_server_services WHERE servicename LIKE N'SQL Server (%';", _connection)
+            { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            var v = await cmd.ExecuteScalarAsync(ct) as string;
+            if (!string.IsNullOrWhiteSpace(v)) accounts.Add(v.Trim());
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* DMV indisponível */ }
+
+        try
+        {
+            await EnsureOpenAsync(ct);
+            await using var cmd = new SqlCommand("SELECT CAST(SERVERPROPERTY('InstanceName') AS nvarchar(128));", _connection)
+            { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            var inst = await cmd.ExecuteScalarAsync(ct) as string;
+            var svc = string.IsNullOrEmpty(inst) ? @"NT SERVICE\MSSQLSERVER" : @"NT SERVICE\MSSQL$" + inst;
+            if (!accounts.Contains(svc, StringComparer.OrdinalIgnoreCase)) accounts.Add(svc);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* best-effort */ }
+        return accounts;
+    }
+
     /// <summary>Lê o modelo de recuperação do banco (FULL / BULK_LOGGED / SIMPLE). Best-effort.</summary>
     public async Task<string> GetRecoveryModelAsync(string databaseName, CancellationToken ct = default)
     {
@@ -178,6 +408,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
             const string sql =
                 "SELECT TOP (1) physical_name FROM sys.master_files " +
                 "WHERE database_id = DB_ID(N'tempdb') AND type = 0 ORDER BY file_id;";
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
             var path = (await cmd.ExecuteScalarAsync(ct)) as string;
             return string.IsNullOrEmpty(path) ? string.Empty : (System.IO.Path.GetDirectoryName(path) ?? string.Empty);
@@ -198,6 +429,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
                 "FROM sys.dm_exec_requests r " +
                 "WHERE r.database_id = DB_ID(@db) AND r.percent_complete > 0 " +
                 "ORDER BY r.percent_complete DESC;";
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@db", databaseName);
             await using var r = await cmd.ExecuteReaderAsync(ct);
@@ -220,6 +452,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
     {
         try
         {
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand("SELECT is_encrypted FROM sys.databases WHERE name = @db;", _connection)
             { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@db", databaseName);
@@ -234,6 +467,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
     {
         try
         {
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(
                 "SELECT page_verify_option_desc FROM sys.databases WHERE name = @db;", _connection)
             { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
@@ -281,6 +515,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         var list = new List<SuspectPageInfo>();
         try
         {
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@db", databaseName);
             await using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -308,7 +543,25 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
     /// (sp_readerrorlog). Somente leitura. Best-effort: se não houver permissão/sp, devolve vazio.
     /// Compatível com SQL Server 2008 R2.
     /// </summary>
-    public async Task<List<string>> ReadErrorLogAsync(string databaseName, CancellationToken ct = default, int maxArchives = 3)
+    public async Task<List<string>> ReadErrorLogAsync(string databaseName, CancellationToken ct = default, int maxArchives = 3,
+        IEnumerable<string>? extraSearchTerms = null)
+    {
+        // Muitas mensagens de E/S citam só o CAMINHO do arquivo ("FCB::Open failed: Could not open file
+        // D:\dados\x.mdf ... OS error: 5"), não o nome do banco: procura também pelos nomes de arquivo.
+        var terms = new List<string> { databaseName };
+        foreach (var t in extraSearchTerms ?? Enumerable.Empty<string>())
+            if (!string.IsNullOrWhiteSpace(t) && !terms.Any(x => t.Contains(x, StringComparison.OrdinalIgnoreCase)))
+                terms.Add(t);
+
+        var lines = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var term in terms)
+            foreach (var l in await ReadErrorLogTermAsync(term, ct, maxArchives))
+                if (seen.Add(l)) lines.Add(l);
+        return lines;
+    }
+
+    private async Task<List<string>> ReadErrorLogTermAsync(string databaseName, CancellationToken ct, int maxArchives)
     {
         var lines = new List<string>();
         // Varre o log atual (0) e os arquivos arquivados mais recentes, pois um rollover pode
@@ -318,6 +571,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
             try
             {
                 // @arch (0 = atual), @logtype = 1 (SQL Server, não Agent), @search = texto a filtrar.
+                await EnsureOpenAsync(ct);
                 await using var cmd = new SqlCommand("EXEC sys.sp_readerrorlog @arch, @logtype, @search;", _connection)
                 {
                     CommandTimeout = AppConstants.QueryCommandTimeoutSeconds
@@ -440,6 +694,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
             const string sql =
                 "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
                 "EXEC @proc @stmt;";
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@db", databaseName);
             cmd.Parameters.AddWithValue("@stmt", inner);
@@ -483,17 +738,27 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         var list = new List<ForensicTransaction>();
         try
         {
+            // Uma única leitura de fn_dblog (cara) para uma tabela temporária. A contagem de linhas usa a
+            // unidade de alocação com MAIS exclusões (a tabela base): somar todas contaria também as
+            // entradas de cada índice não-clusterizado. A tabela afetada vem do AllocUnitName
+            // ("schema.tabela.índice"); objetos de sistema (sys.*) são ignorados.
             const string sql =
                 "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
                 "DECLARE @stmt nvarchar(max) = N'" +
-                "SELECT TOP (@m) [Transaction ID], MAX([Transaction Name]), MIN([Begin Time]), " +
-                "SUM(CASE WHEN Operation = ''LOP_DELETE_ROWS'' THEN 1 ELSE 0 END) " +
-                "FROM fn_dblog(NULL, NULL) " +
-                "GROUP BY [Transaction ID] " +
-                "HAVING SUM(CASE WHEN Operation = ''LOP_DELETE_ROWS'' THEN 1 ELSE 0 END) > 0 " +
-                "   OR MAX([Transaction Name]) IN (''DROPOBJ'', ''TRUNCATE'') " +
-                "ORDER BY MIN([Begin Time]) DESC;';\n" +
+                "SELECT [Transaction ID] AS tid, [Transaction Name] AS tname, [Begin Time] AS btime, Operation AS op, AllocUnitName AS au " +
+                "INTO #l FROM fn_dblog(NULL, NULL) WHERE Operation IN (''LOP_BEGIN_XACT'', ''LOP_DELETE_ROWS''); " +
+                "SELECT au_tid = tid, au, n = COUNT(*) INTO #d FROM #l " +
+                "WHERE op = ''LOP_DELETE_ROWS'' AND au IS NOT NULL AND au NOT LIKE ''sys.%'' GROUP BY tid, au; " +
+                "SELECT TOP (@m) b.tid, MAX(b.tname), MIN(b.btime), " +
+                "  ISNULL((SELECT MAX(d.n) FROM #d d WHERE d.au_tid = b.tid), 0), " +
+                "  (SELECT TOP (1) d.au FROM #d d WHERE d.au_tid = b.tid ORDER BY d.n DESC) " +
+                "FROM #l b WHERE b.op = ''LOP_BEGIN_XACT'' " +
+                "GROUP BY b.tid " +
+                "HAVING EXISTS (SELECT 1 FROM #d d WHERE d.au_tid = b.tid) " +
+                "    OR MAX(b.tname) = ''DROPOBJ'' OR MAX(b.tname) LIKE ''TRUNCATE%'' " +
+                "ORDER BY MIN(b.btime) DESC;';\n" +
                 "EXEC @proc @stmt, N'@m int', @m = @max;";
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@db", databaseName);
             cmd.Parameters.AddWithValue("@max", max);
@@ -503,17 +768,18 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
                 var txName = r.IsDBNull(1) ? string.Empty : r.GetString(1);
                 var beginRaw = r.IsDBNull(2) ? string.Empty : Convert.ToString(r.GetValue(2)) ?? string.Empty;
                 var deletes = r.IsDBNull(3) ? 0 : Convert.ToInt32(r.GetValue(3));
+                var allocUnit = r.IsDBNull(4) ? string.Empty : r.GetString(4);
                 var kind = txName.Equals("DROPOBJ", StringComparison.OrdinalIgnoreCase) ? "DROP"
-                         : txName.Equals("TRUNCATE", StringComparison.OrdinalIgnoreCase) ? "TRUNCATE"
+                         : txName.StartsWith("TRUNCATE", StringComparison.OrdinalIgnoreCase) ? "TRUNCATE"
                          : "DELETE";
-                DateTime? begin = DateTime.TryParse(beginRaw.Replace('/', '-'), out var dt) ? dt : null;
                 list.Add(new ForensicTransaction
                 {
                     TransactionId = r.IsDBNull(0) ? string.Empty : Convert.ToString(r.GetValue(0)) ?? string.Empty,
                     Kind = kind,
                     BeginTimeRaw = beginRaw,
-                    BeginTime = begin,
-                    RowsAffected = deletes
+                    BeginTime = ForensicTransaction.ParseLogTime(beginRaw),
+                    RowsAffected = deletes,
+                    Table = ForensicTransaction.TableFromAllocUnit(allocUnit)
                 });
             }
         }
@@ -534,6 +800,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
                 "FROM sys.indexes i JOIN sys.tables t ON t.object_id = i.object_id " +
                 "WHERE i.is_disabled = 1 AND t.is_ms_shipped = 0;';\n" +
                 "EXEC @proc @stmt;";
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@db", databaseName);
             await using var r = await cmd.ExecuteReaderAsync(ct);
@@ -563,6 +830,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
                 "AND d.is_ambiguous = 0 AND OBJECT_NAME(d.referencing_id) IS NOT NULL " +
                 "AND OBJECT_ID(ISNULL(d.referenced_schema_name + N''.'', N'''') + d.referenced_entity_name) IS NULL;';\n" +
                 "EXEC @proc @stmt;";
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@db", databaseName);
             await using var r = await cmd.ExecuteReaderAsync(ct);
@@ -594,6 +862,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
                 "WHERE ips.index_id > 0 AND ips.page_count >= @min AND i.name IS NOT NULL AND o.is_ms_shipped = 0 " +
                 "ORDER BY ips.avg_fragmentation_in_percent DESC;';\n" +
                 "EXEC @proc @stmt, N'@min int', @min = @minp;";
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@db", databaseName);
             cmd.Parameters.AddWithValue("@minp", minPages);
@@ -620,6 +889,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         try
         {
             // EngineEdition: 2 = Standard, 3 = Enterprise/Developer (suportam). 4 = Express (não).
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand("SELECT CAST(SERVERPROPERTY('EngineEdition') AS int);", _connection)
             { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
             var v = await cmd.ExecuteScalarAsync(ct);
@@ -647,6 +917,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
                 "JOIN sys.schemas s ON s.schema_id = t.schema_id " +
                 "WHERE ps.index_id IN (0,1) AND t.is_ms_shipped = 0 GROUP BY s.name, t.name;';\n" +
                 "EXEC @proc @stmt;";
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@db", databaseName);
             await using var r = await cmd.ExecuteReaderAsync(ct);
@@ -669,6 +940,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
                 "DECLARE @stmt nvarchar(max) = N'SELECT s.name + N''.'' + t.name FROM sys.tables t " +
                 "JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE t.is_ms_shipped = 0 ORDER BY s.name, t.name;';\n" +
                 "EXEC @proc @stmt;";
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@db", databaseName);
             await using var r = await cmd.ExecuteReaderAsync(ct);
@@ -691,7 +963,6 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         var (schema, table) = SplitSchemaTable(schemaTable);
         var qTarget = $"{Quote(schema)}.{Quote(table)}";                          // no contexto de toDb
         var qSource = $"{Quote(fromDb)}.{Quote(schema)}.{Quote(table)}";          // 3 partes
-        var objRef = $"{schema}.{table}";
 
         // Colunas não-computadas (na ordem) + se há IDENTITY.
         var (cols, hasIdentity) = await GetInsertableColumnsAsync(toDb, schema, table, ct);
@@ -699,41 +970,93 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
             throw new InvalidOperationException($"Tabela '{schemaTable}' não encontrada em [{toDb}].");
 
         // Colunas da chave primária (para não duplicar).
-        var pk = new List<string>();
-        {
-            var sql =
-                $"SELECT c.name FROM {Quote(toDb)}.sys.indexes i " +
-                $"JOIN {Quote(toDb)}.sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id " +
-                $"JOIN {Quote(toDb)}.sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id " +
-                $"WHERE i.is_primary_key = 1 AND i.object_id = OBJECT_ID(@o) ORDER BY ic.key_ordinal;";
-            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
-            cmd.Parameters.AddWithValue("@o", $"{toDb}.{objRef}");
-            await using var r = await cmd.ExecuteReaderAsync(ct);
-            while (await r.ReadAsync(ct))
-                pk.Add(r.GetString(0));
-        }
+        var pk = await GetPrimaryKeyColumnsAsync(toDb, schema, table, ct);
         if (pk.Count == 0)
             throw new InvalidOperationException($"A tabela '{schemaTable}' não tem chave primária — o salvamento seguro (sem duplicar) não é possível.");
 
         var colList = string.Join(", ", cols.Select(Quote));
         var joinOn = string.Join(" AND ", pk.Select(p => $"dst.{Quote(p)} = src.{Quote(p)}"));
-        var idOn = hasIdentity ? $"SET IDENTITY_INSERT {qTarget} ON; " : string.Empty;
-        var idOff = hasIdentity ? $" SET IDENTITY_INSERT {qTarget} OFF;" : string.Empty;
-
-        var inner =
-            idOn +
+        var insert =
             $"INSERT INTO {qTarget} ({colList}) SELECT {colList} FROM {qSource} src " +
-            $"WHERE NOT EXISTS (SELECT 1 FROM {qTarget} dst WHERE {joinOn}); " +
-            "DECLARE @rc int = @@ROWCOUNT;" + idOff + " SELECT @rc;";
+            $"WHERE NOT EXISTS (SELECT 1 FROM {qTarget} dst WHERE {joinOn});";
 
+        var (rows, err, msg) = await RunRecoveryWriteAsync(toDb, qTarget, insert, hasIdentity, ct);
+        if (err != 0)
+            throw new InvalidOperationException($"Msg {err}: {msg}");
+        return rows;
+    }
+
+    /// <summary>Colunas da chave primária de uma tabela (na ordem da chave). Vazio = sem PK.</summary>
+    public async Task<List<string>> GetPrimaryKeyColumnsAsync(string db, string schema, string table, CancellationToken ct = default)
+    {
+        var pk = new List<string>();
+        var sql =
+            $"SELECT c.name FROM {Quote(db)}.sys.indexes i " +
+            $"JOIN {Quote(db)}.sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id " +
+            $"JOIN {Quote(db)}.sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id " +
+            $"WHERE i.is_primary_key = 1 AND i.object_id = OBJECT_ID(@o) ORDER BY ic.key_ordinal;";
+        await EnsureOpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+        cmd.Parameters.AddWithValue("@o", $"{Quote(db)}.{Quote(schema)}.{Quote(table)}");
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        while (await r.ReadAsync(ct))
+            pk.Add(r.GetString(0));
+        return pk;
+    }
+
+    /// <summary>
+    /// Executa uma escrita de RECUPERAÇÃO (reinserir linhas salvas de um backup, mover órfãos para a
+    /// quarentena) no contexto de <paramref name="db"/> com os GATILHOS da tabela alvo DESLIGADOS.
+    ///
+    /// Por quê: essas linhas JÁ existiram — os efeitos dos gatilhos (baixa de estoque, auditoria,
+    /// lançamentos...) já aconteceram quando foram gravadas pela aplicação. Deixar um gatilho de INSERT/
+    /// DELETE disparar de novo duplicaria regras de negócio. Tudo roda numa transação: o DISABLE TRIGGER
+    /// segura o bloqueio de esquema até o COMMIT, então nenhuma outra sessão grava na tabela sem os
+    /// gatilhos nesse intervalo; em erro, o ROLLBACK desfaz tudo (inclusive o DISABLE).
+    ///
+    /// <paramref name="statement"/> é o DML (pode ter vários comandos); o nº de linhas do ÚLTIMO comando
+    /// é devolvido. Erros do servidor não lançam: voltam como (−1, número, mensagem) para o chamador
+    /// distinguir, p.ex., violação de PK (2627/2601). Compatível com 2008 R2 (sem THROW).
+    /// </summary>
+    internal async Task<(int Rows, int ErrorNumber, string ErrorMessage)> RunRecoveryWriteAsync(
+        string db, string quotedTargetTable, string statement, bool identityInsert, CancellationToken ct)
+    {
+        var inner =
+            (identityInsert ? $"SET IDENTITY_INSERT {quotedTargetTable} ON; " : string.Empty) +
+            statement + " SET @rc = @@ROWCOUNT;" +
+            (identityInsert ? $" SET IDENTITY_INSERT {quotedTargetTable} OFF;" : string.Empty);
+
+        const string stmt =
+            "SET XACT_ABORT ON; " +
+            "DECLARE @rc int = 0, @dis nvarchar(max) = N'', @en nvarchar(max) = N''; " +
+            "SELECT @dis = @dis + N'DISABLE TRIGGER ' + QUOTENAME(name) + N' ON ' + @tbl + N'; ', " +
+            "       @en  = @en  + N'ENABLE TRIGGER '  + QUOTENAME(name) + N' ON ' + @tbl + N'; ' " +
+            "FROM sys.triggers WHERE parent_id = OBJECT_ID(@tbl) AND is_disabled = 0; " +
+            "BEGIN TRY " +
+            "  BEGIN TRAN; " +
+            "  IF @dis <> N'' EXEC sys.sp_executesql @dis; " +
+            "  EXEC sys.sp_executesql @ins, N'@rc int OUTPUT', @rc = @rc OUTPUT; " +
+            "  IF @en <> N'' EXEC sys.sp_executesql @en; " +
+            "  COMMIT; " +
+            "  SELECT @rc, 0, N''; " +
+            "END TRY " +
+            "BEGIN CATCH " +
+            "  IF @@TRANCOUNT > 0 ROLLBACK; " +
+            "  SELECT -1, ERROR_NUMBER(), ERROR_MESSAGE(); " +
+            "END CATCH";
         const string runner =
             "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
-            "EXEC @proc @stmt;";
-        await using var run = new SqlCommand(runner, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
-        run.Parameters.AddWithValue("@db", toDb);
-        run.Parameters.AddWithValue("@stmt", inner);
-        var n = await run.ExecuteScalarAsync(ct);
-        return n is null || n == DBNull.Value ? 0 : Convert.ToInt32(n);
+            "EXEC @proc @stmt, N'@tbl nvarchar(600), @ins nvarchar(max)', @tbl = @target, @ins = @inner;";
+
+        await EnsureOpenAsync(ct);
+        await using var cmd = new SqlCommand(runner, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
+        cmd.Parameters.AddWithValue("@db", db);
+        cmd.Parameters.AddWithValue("@stmt", stmt);
+        cmd.Parameters.AddWithValue("@target", quotedTargetTable);
+        cmd.Parameters.AddWithValue("@inner", inner);
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        if (!await r.ReadAsync(ct)) return (0, 0, string.Empty);
+        return (Convert.ToInt32(r.GetValue(0)), Convert.ToInt32(r.GetValue(1)), r.IsDBNull(2) ? string.Empty : r.GetString(2));
     }
 
     /// <summary>
@@ -747,7 +1070,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
     {
         var cols = new List<string>();
         var hasIdentity = false;
-        var objRef = $"{db}.{schema}.{table}";
+        var objRef = $"{Quote(db)}.{Quote(schema)}.{Quote(table)}";
         // Exclui colunas COMPUTADAS e rowversion/timestamp (system_type_id 189) — nenhuma delas aceita
         // valor explícito num INSERT; incluí-las derrubaria o INSERT ... SELECT (erro 273).
         var sql =
@@ -794,6 +1117,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
                 "JOIN sys.schemas s ON s.schema_id = t.schema_id " +
                 "WHERE t.is_ms_shipped = 0 AND EXISTS (SELECT 1 FROM sys.identity_columns ic WHERE ic.object_id = t.object_id);';\n" +
                 "EXEC @proc @stmt;";
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(q, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@db", databaseName);
             await using var r = await cmd.ExecuteReaderAsync(ct);
@@ -813,6 +1137,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
                 const string sql =
                     "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
                     "EXEC @proc @stmt;";
+                await EnsureOpenAsync(ct);
                 await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
                 cmd.Parameters.AddWithValue("@db", databaseName);
                 cmd.Parameters.AddWithValue("@stmt", inner);
@@ -838,6 +1163,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
             const string sql =
                 "SELECT TOP (1) physical_name FROM sys.master_files " +
                 "WHERE database_id = DB_ID(N'master') AND type = @t ORDER BY file_id;";
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@t", fileType);
             var path = (await cmd.ExecuteScalarAsync(ct)) as string;
@@ -856,6 +1182,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         try
         {
             // xp_fileexist devolve: [File Exists], [File is a Directory], [Parent Directory Exists]
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(
                 "DECLARE @r TABLE (FileExists int, IsDir int, ParentExists int);\n" +
                 "INSERT INTO @r EXEC master.dbo.xp_fileexist @p;\n" +
@@ -869,12 +1196,44 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Verifica, no sistema de arquivos DO SERVIDOR, se um ARQUIVO existe. Diferente de
+    /// <see cref="PathExistsOnServerAsync"/>, distingue "não existe" (false) de "não foi possível
+    /// verificar" (null — sem permissão para xp_fileexist, caminho de rede inacessível à sonda...),
+    /// para que quem chama não descarte um backup válido só porque a checagem falhou.
+    /// </summary>
+    public async Task<bool?> FileExistsOnServerAsync(string path, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return false;
+        try
+        {
+            await EnsureOpenAsync(ct);
+            await using var cmd = new SqlCommand(
+                "DECLARE @r TABLE (FileExists int, IsDir int, ParentExists int);\n" +
+                "INSERT INTO @r EXEC master.dbo.xp_fileexist @p;\n" +
+                "SELECT FileExists, ParentExists FROM @r;", _connection)
+            { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@p", path);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            if (!await r.ReadAsync(ct)) return null;
+            var exists = !r.IsDBNull(0) && Convert.ToInt32(r.GetValue(0)) == 1;
+            var parent = !r.IsDBNull(1) && Convert.ToInt32(r.GetValue(1)) == 1;
+            if (exists) return true;
+            // Pasta-mãe inalcançável num caminho de REDE (compartilhamento fora do ar / sem permissão da
+            // conta de serviço) = não dá para afirmar. Em disco local, pasta ausente = arquivo ausente.
+            return parent || !path.StartsWith(@"\\", StringComparison.Ordinal) ? false : null;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { return null; }
+    }
+
+    /// <summary>
     /// Executa DBCC CHECKCONSTRAINTS WITH ALL_CONSTRAINTS, ALL_ERRORMSGS no contexto
     /// do banco alvo e devolve as violações de integridade LÓGICA (FK/CHECK) — que o CHECKDB NÃO
     /// detecta. Resolve, para cada violação, se a constraint é uma chave estrangeira (sys.foreign_keys),
     /// pois só FKs têm remoção automática de linhas órfãs. Best-effort. Compatível com 2008 R2.
     /// </summary>
-    public async Task<List<ConstraintViolation>> CheckConstraintsAsync(string databaseName, CancellationToken ct = default)
+    public async Task<List<ConstraintViolation>> CheckConstraintsAsync(string databaseName, CancellationToken ct = default,
+        bool includeDisabled = false)
     {
         var list = new List<ConstraintViolation>();
         try
@@ -908,31 +1267,49 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         catch { return list; /* banco inacessível / sem permissão */ }
 
         if (list.Count > 0)
-            await ResolveForeignKeyFlagsAsync(databaseName, list, ct);
-        return list;
+            await ResolveConstraintFlagsAsync(databaseName, list, ct);
+        // Constraints DESABILITADAS (NOCHECK) não são aplicadas por decisão do próprio sistema: as linhas
+        // que as violam são dados legítimos, não corrupção. Por padrão ficam FORA da lista — assim nenhum
+        // fluxo de correção as remove. O diagnóstico pede includeDisabled=true apenas para informar.
+        return includeDisabled ? list : list.Where(v => !v.IsDisabled).ToList();
     }
 
-    /// <summary>Marca quais violações pertencem a chaves estrangeiras (sys.foreign_keys do banco alvo).</summary>
-    private async Task ResolveForeignKeyFlagsAsync(string databaseName, List<ConstraintViolation> violations, CancellationToken ct)
+    /// <summary>
+    /// Marca quais violações pertencem a chaves estrangeiras e quais constraints estão DESABILITADAS
+    /// (sys.foreign_keys / sys.check_constraints do banco alvo).
+    /// </summary>
+    private async Task ResolveConstraintFlagsAsync(string databaseName, List<ConstraintViolation> violations, CancellationToken ct)
     {
         var fkNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var disabled = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         try
         {
             const string sql =
                 "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
-                "DECLARE @stmt nvarchar(max) = N'SELECT name FROM sys.foreign_keys;';\n" +
+                "DECLARE @stmt nvarchar(max) = N'SELECT name, 1, is_disabled FROM sys.foreign_keys " +
+                "UNION ALL SELECT name, 0, is_disabled FROM sys.check_constraints;';\n" +
                 "EXEC @proc @stmt;";
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@db", databaseName);
             await using var r = await cmd.ExecuteReaderAsync(ct);
             while (await r.ReadAsync(ct))
-                if (!r.IsDBNull(0)) fkNames.Add(r.GetString(0));
+            {
+                if (r.IsDBNull(0)) continue;
+                var name = r.GetString(0);
+                if (Convert.ToInt32(r.GetValue(1)) == 1) fkNames.Add(name);
+                if (!r.IsDBNull(2) && r.GetBoolean(2)) disabled.Add(name);
+            }
         }
         catch (OperationCanceledException) { throw; }
         catch { /* best-effort */ }
 
         foreach (var v in violations)
-            v.IsForeignKey = fkNames.Contains(Unbracket(v.Constraint));
+        {
+            var name = Unbracket(v.Constraint);
+            v.IsForeignKey = fkNames.Contains(name);
+            v.IsDisabled = disabled.Contains(name);
+        }
     }
 
     /// <summary>Remove um nível de QUOTENAME: "[Nome]]X]" → "Nome]X". A saída do CHECKCONSTRAINTS
@@ -955,6 +1332,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
                 "DECLARE @stmt nvarchar(max) = N'SELECT name FROM sys.foreign_keys WHERE is_not_trusted = 1 " +
                 "UNION ALL SELECT name FROM sys.check_constraints WHERE is_not_trusted = 1;';\n" +
                 "EXEC @proc @stmt;";
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@db", databaseName);
             await using var r = await cmd.ExecuteReaderAsync(ct);
@@ -987,6 +1365,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
             const string sql =
                 "DECLARE @cmd nvarchar(max) = N'DBCC CHECKCATALOG (' + QUOTENAME(@db) + N') WITH NO_INFOMSGS;';\n" +
                 "EXEC sys.sp_executesql @cmd;";
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@db", databaseName);
             await cmd.ExecuteNonQueryAsync(ct);
@@ -1016,15 +1395,124 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
             return 0;
 
         // O DELETE roda NO CONTEXTO do banco alvo. Tabela e predicado vêm de metadados do servidor
-        // (DBCC CHECKCONSTRAINTS), não de entrada do usuário. Aspas simples são escapadas para o literal.
-        var inner = $"DELETE FROM {violation.Table} WHERE {violation.Where}";
+        // (DBCC CHECKCONSTRAINTS), não de entrada do usuário. Gatilhos desligados: é um reparo de dados,
+        // não uma exclusão de negócio (um gatilho de DELETE poderia, p.ex., estornar estoque).
+        var (rows, err, msg) = await RunRecoveryWriteAsync(databaseName, violation.Table,
+            $"DELETE FROM {violation.Table} WHERE {violation.Where};", identityInsert: false, ct);
+        if (err != 0) throw new InvalidOperationException($"Msg {err}: {msg}");
+        return rows;
+    }
+
+    /// <summary>
+    /// Remove as linhas violadoras de uma FK MOVENDO-AS para a QUARENTENA — uma tabela no banco
+    /// <see cref="AppConstants.QuarantineDatabaseName"/> (mesma instância), com a data e a constraint de
+    /// origem — numa ÚNICA transação (cópia + exclusão; nunca uma sem a outra). A remoção deixa de ser
+    /// irreversível: as linhas podem ser consultadas e devolvidas depois (ex.: quando o registro-pai for
+    /// recadastrado). Se a quarentena não puder ser usada (tipo de coluna não copiável, sem espaço...), cai
+    /// para a exclusão simples de antes. Devolve (linhas removidas, tabela de quarentena ou null).
+    /// </summary>
+    public async Task<(int Rows, string? QuarantineTable)> QuarantineViolatingRowsAsync(
+        string databaseName, ConstraintViolation violation, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(violation.Table) || string.IsNullOrWhiteSpace(violation.Where))
+            return (0, null);
+
+        string? qTable = null;
+        try { qTable = await PrepareQuarantineTableAsync(databaseName, violation.Table, forceNew: false, ct); }
+        catch (OperationCanceledException) { throw; }
+        catch { /* sem quarentena: exclusão simples abaixo */ }
+
+        for (var attempt = 0; qTable is not null && attempt < 2; attempt++)
+        {
+            var (selectList, colNames) = await GetQuarantineColumnsAsync(databaseName, violation.Table, ct);
+            var move =
+                $"INSERT INTO {qTable} ([_RestoreDB_QuarentenadoEm], [_RestoreDB_Constraint], {colNames}) " +
+                $"SELECT GETDATE(), N'{violation.Constraint.Replace("'", "''")}', {selectList} FROM {violation.Table} t WHERE {violation.Where}; " +
+                $"DELETE FROM {violation.Table} WHERE {violation.Where};";
+            var (rows, err, _) = await RunRecoveryWriteAsync(databaseName, violation.Table, move, identityInsert: false, ct);
+            if (err == 0) return (rows, qTable);
+
+            // A tabela de quarentena existente pode ter o formato de uma versão ANTERIOR da tabela
+            // (colunas alteradas desde então): cria uma nova, com sufixo de data, e tenta mais uma vez.
+            qTable = attempt == 0
+                ? await TryOrNullAsync(() => PrepareQuarantineTableAsync(databaseName, violation.Table, forceNew: true, ct))
+                : null;
+        }
+
+        return (await DeleteViolatingRowsAsync(databaseName, violation, ct), null);
+    }
+
+    private static async Task<string?> TryOrNullAsync(Func<Task<string>> f)
+    {
+        try { return await f(); }
+        catch (OperationCanceledException) { throw; }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// Garante o banco de quarentena e a tabela para a tabela de origem, com as colunas de controle
+    /// (_RestoreDB_QuarentenadoEm / _RestoreDB_Constraint) + as colunas da origem. O CROSS JOIN no
+    /// SELECT INTO evita herdar a propriedade IDENTITY (junto da expressão na coluna identidade — ver GetQuarantineColumnsAsync).
+    /// Devolve o nome de 3 partes já entre colchetes.
+    /// </summary>
+    private async Task<string> PrepareQuarantineTableAsync(string databaseName, string quotedTable, bool forceNew, CancellationToken ct)
+    {
+        var (schema, table) = SplitSchemaTable(quotedTable);
+        var baseName = $"{AppConstants.SanitizeToken(databaseName)}__{schema}__{table}";
+        if (forceNew) baseName += "_" + DateTime.Now.ToString("yyyyMMddHHmmss");
+        var qdb = Quote(AppConstants.QuarantineDatabaseName);
+        var target = $"{qdb}.[dbo].{Quote(baseName)}";
+
+        await EnsureOpenAsync(ct);
+        await using (var mk = new SqlCommand(
+            "IF DB_ID(@q) IS NULL\n" +
+            "BEGIN\n" +
+            "  DECLARE @c nvarchar(max) = N'CREATE DATABASE ' + QUOTENAME(@q) + N';'; EXEC sys.sp_executesql @c;\n" +
+            "  SET @c = N'ALTER DATABASE ' + QUOTENAME(@q) + N' SET RECOVERY SIMPLE;'; EXEC sys.sp_executesql @c;\n" +
+            "END", _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds })
+        {
+            mk.Parameters.AddWithValue("@q", AppConstants.QuarantineDatabaseName);
+            await mk.ExecuteNonQueryAsync(ct);
+        }
+
+        var (selectList, _) = await GetQuarantineColumnsAsync(databaseName, quotedTable, ct);
+        var create =
+            $"IF OBJECT_ID(N'{target.Replace("'", "''")}') IS NULL " +
+            $"SELECT TOP (0) CAST(NULL AS datetime) AS [_RestoreDB_QuarentenadoEm], CAST(NULL AS nvarchar(256)) AS [_RestoreDB_Constraint], {selectList} " +
+            $"INTO {target} FROM {Quote(databaseName)}.{Quote(schema)}.{Quote(table)} t CROSS JOIN (SELECT 1 AS _x) AS _j;";
+        await using (var cmd = new SqlCommand(create, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds })
+            await cmd.ExecuteNonQueryAsync(ct);
+        return target;
+    }
+
+    /// <summary>
+    /// Lista de SELECT (t.[col] ..., rowversion convertido em binary(8) — não aceita valor explícito)
+    /// e lista de nomes de coluna da tabela de origem, para copiar linhas para a quarentena.
+    /// </summary>
+    private async Task<(string SelectList, string ColumnNames)> GetQuarantineColumnsAsync(string databaseName, string quotedTable, CancellationToken ct)
+    {
+        var (schema, table) = SplitSchemaTable(quotedTable);
+        var sel = new List<string>();
+        var names = new List<string>();
         var sql =
-            "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
-            "EXEC @proc @inner;";
-        await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
-        cmd.Parameters.AddWithValue("@db", databaseName);
-        cmd.Parameters.AddWithValue("@inner", inner);
-        return await cmd.ExecuteNonQueryAsync(ct);
+            $"SELECT c.name, c.system_type_id, c.is_identity FROM {Quote(databaseName)}.sys.columns c " +
+            $"WHERE c.object_id = OBJECT_ID(@o) ORDER BY c.column_id;";
+        await EnsureOpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+        cmd.Parameters.AddWithValue("@o", $"{Quote(databaseName)}.{Quote(schema)}.{Quote(table)}");
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        while (await r.ReadAsync(ct))
+        {
+            var n = Quote(r.GetString(0));
+            var type = Convert.ToInt32(r.GetValue(1));
+            var identity = !r.IsDBNull(2) && r.GetBoolean(2);
+            // rowversion não aceita valor explícito; a IDENTITY numa expressão não é herdada pelo SELECT INTO
+            // (a quarentena guarda o valor original, sem gerar novos).
+            sel.Add(type == 189 ? $"CAST(t.{n} AS binary(8)) AS {n}" : identity ? $"t.{n} * 1 AS {n}" : $"t.{n}");
+            names.Add(n);
+        }
+        if (names.Count == 0) throw new InvalidOperationException($"Tabela {quotedTable} não encontrada.");
+        return (string.Join(", ", sel), string.Join(", ", names));
     }
 
     /// <summary>
@@ -1103,51 +1591,22 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         var qTarget = $"{Quote(schema)}.{Quote(parentTable)}";                     // no contexto de liveDb
         var qSource = $"{Quote(scratchDb)}.{Quote(schema)}.{Quote(parentTable)}";  // 3 partes
         var colList = string.Join(", ", cols.Select(Quote));
-        var idOn = hasIdentity ? $"SET IDENTITY_INSERT {qTarget} ON; " : string.Empty;
 
         // O predicado usa as colunas do PAI (= valor exato da PK ausente), reescrito na camada de serviço.
-        var inner =
-            idOn +
-            $"INSERT INTO {qTarget} ({colList}) SELECT {colList} FROM {qSource} src WHERE {predicate}; " +
-            "SELECT @@ROWCOUNT;";
-        const string runner =
-            "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
-            "EXEC @proc @stmt;";
+        // Gatilhos desligados: o registro-pai JÁ existiu; seus efeitos de negócio já foram aplicados.
+        var insert = $"INSERT INTO {qTarget} ({colList}) SELECT {colList} FROM {qSource} src WHERE {predicate};";
         try
         {
-            await EnsureOpenAsync(ct);
-            await using var run = new SqlCommand(runner, _connection) { CommandTimeout = AppConstants.RepairCommandTimeoutSeconds };
-            run.Parameters.AddWithValue("@db", liveDb);
-            run.Parameters.AddWithValue("@stmt", inner);
-            var n = await run.ExecuteScalarAsync(ct);
-            var rows = n is null || n == DBNull.Value ? 0 : Convert.ToInt32(n);
+            var (rows, err, _) = await RunRecoveryWriteAsync(liveDb, qTarget, insert, hasIdentity, ct);
+            // Violação de PK: a linha-pai já existe no banco vivo — a FK já não está órfã por essa chave.
+            if (err is 2627 or 2601) return ParentRecoveryOutcome.AlreadyPresent;
+            if (err != 0) return ParentRecoveryOutcome.Failed;
             return rows > 0 ? ParentRecoveryOutcome.Inserted : ParentRecoveryOutcome.NotFoundInBackup;
         }
         catch (OperationCanceledException) { throw; }
-        catch (SqlException ex) when (ex.Errors.Cast<SqlError>().Any(e => e.Number is 2627 or 2601))
-        {
-            // A linha-pai já existe no banco vivo — a FK já não está órfã por essa chave. Sucesso silencioso.
-            return ParentRecoveryOutcome.AlreadyPresent;
-        }
         catch
         {
             return ParentRecoveryOutcome.Failed;
-        }
-        finally
-        {
-            // Um erro (ex.: violação de PK) aborta o lote com o IDENTITY_INSERT ainda LIGADO na sessão,
-            // o que impediria inserir noutra tabela adiante. Garante o desligamento (best-effort).
-            if (hasIdentity)
-            {
-                try
-                {
-                    await using var offCmd = new SqlCommand(runner, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
-                    offCmd.Parameters.AddWithValue("@db", liveDb);
-                    offCmd.Parameters.AddWithValue("@stmt", $"SET IDENTITY_INSERT {qTarget} OFF;");
-                    await offCmd.ExecuteNonQueryAsync(CancellationToken.None);
-                }
-                catch { /* best-effort */ }
-            }
         }
     }
 
@@ -1164,6 +1623,24 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
             cmd.Parameters.AddWithValue("@db", databaseName);
             return (await cmd.ExecuteScalarAsync(ct)) as string ?? string.Empty;
         }
+        catch { return string.Empty; }
+    }
+
+    /// <summary>"schema.tabela" (sem colchetes) de um object_id no banco alvo; vazio se não resolver.</summary>
+    public async Task<string> ResolveSchemaTableAsync(string databaseName, int objectId, CancellationToken ct = default)
+    {
+        if (objectId == 0) return string.Empty;
+        try
+        {
+            await EnsureOpenAsync(ct);
+            await using var cmd = new SqlCommand(
+                "SELECT OBJECT_SCHEMA_NAME(@oid, DB_ID(@db)) + N'.' + OBJECT_NAME(@oid, DB_ID(@db));", _connection)
+            { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
+            cmd.Parameters.AddWithValue("@oid", objectId);
+            cmd.Parameters.AddWithValue("@db", databaseName);
+            return (await cmd.ExecuteScalarAsync(ct)) as string ?? string.Empty;
+        }
+        catch (OperationCanceledException) { throw; }
         catch { return string.Empty; }
     }
 
@@ -1199,6 +1676,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         // Espelhamento (existe desde o 2005)
         await ProbeAsync(async () =>
         {
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(
                 "SELECT mirroring_role_desc, mirroring_state_desc FROM sys.database_mirroring " +
                 "WHERE database_id = DB_ID(@db) AND mirroring_guid IS NOT NULL;", _connection)
@@ -1217,6 +1695,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         // Always On AG (2012+)
         await ProbeAsync(async () =>
         {
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(
                 "SELECT ag.name FROM sys.databases d " +
                 "JOIN sys.availability_databases_cluster adc ON adc.database_name = d.name " +
@@ -1236,6 +1715,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         // Replicação (colunas existentes no 2008 R2)
         await ProbeAsync(async () =>
         {
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(
                 "SELECT is_published, is_subscribed, is_merge_published FROM sys.databases WHERE name = @db;", _connection)
             { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
@@ -1254,6 +1734,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         // Log shipping (msdb)
         await ProbeAsync(async () =>
         {
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(
                 "SELECT (SELECT COUNT(*) FROM msdb.dbo.log_shipping_primary_databases WHERE primary_database = @db), " +
                 "       (SELECT COUNT(*) FROM msdb.dbo.log_shipping_secondary_databases WHERE secondary_database = @db);", _connection)
@@ -1286,6 +1767,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
                 "FROM sys.master_files AS mf " +
                 "CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) AS vs " +
                 "WHERE mf.database_id = DB_ID(@db);";
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@db", databaseName);
             await using var r = await cmd.ExecuteReaderAsync(ct);
@@ -1311,6 +1793,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
     public async Task<List<BackupSetInfo>> RestoreHeaderOnlyAsync(string diskPath, CancellationToken ct = default)
     {
         var list = new List<BackupSetInfo>();
+        await EnsureOpenAsync(ct);
         await using var cmd = new SqlCommand("RESTORE HEADERONLY FROM DISK = @path;", _connection)
         { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
         cmd.Parameters.AddWithValue("@path", diskPath);
@@ -1330,12 +1813,14 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         var oDbBak = Ordinal(r, "DatabaseBackupLSN");
         var oChk = Ordinal(r, "CheckpointLSN");
         var oCompressed = Ordinal(r, "Compressed");
+        var oBackupName = Ordinal(r, "BackupName");
 
         while (await r.ReadAsync(ct))
         {
             var typeInt = GetInt(r, oType);
             list.Add(new BackupSetInfo
             {
+                Name = GetStr(r, oBackupName),
                 DatabaseName = GetStr(r, oName),
                 BackupTypeCode = BackupTypeIntToCode(typeInt),
                 Position = GetInt(r, oPos),
@@ -1360,6 +1845,7 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
     public async Task<List<BackupFileInfo>> RestoreFileListOnlyAsync(string diskPath, int position, CancellationToken ct = default)
     {
         var list = new List<BackupFileInfo>();
+        await EnsureOpenAsync(ct);
         await using var cmd = new SqlCommand("RESTORE FILELISTONLY FROM DISK = @path WITH FILE = @pos;", _connection)
         { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
         cmd.Parameters.AddWithValue("@path", diskPath);
@@ -1390,16 +1876,26 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         var list = new List<BackupSetInfo>();
         // Um backup STRIPED tem várias linhas em backupmediafamily (uma por arquivo); agrupamos por
         // backup_set_id e reunimos todos os dispositivos. compressed_backup_size < backup_size = comprimido.
+        //
+        // Janela: tudo desde o 3º FULL agendado (não COPY_ONLY) mais recente (ou todo o histórico, se houver menos). Um corte fixo
+        // (ex.: TOP 300) QUEBRAVA a cadeia em bancos com backup de log frequente — 15 em 15 min são ~100
+        // logs/dia, e uma FULL semanal ficava fora da janela, fazendo a restauração "achar" uma quebra que
+        // não existe. O teto de segurança (5000 conjuntos) só protege contra um msdb nunca expurgado.
         const string sql = @"
-SELECT TOP (300)
+DECLARE @since datetime;
+SELECT @since = MIN(x.backup_finish_date)
+FROM (SELECT TOP (3) backup_finish_date FROM msdb.dbo.backupset
+      WHERE database_name = @db AND type = 'D' AND is_copy_only = 0 ORDER BY backup_finish_date DESC) AS x;
+SELECT TOP (5000)
        bs.backup_set_id, bs.database_name, bs.type, bmf.physical_device_name,
        bs.backup_start_date, bs.backup_finish_date, bs.is_copy_only,
        bs.backup_size, ISNULL(bs.recovery_model, N''), ISNULL(bs.server_name, N''),
        bs.first_lsn, bs.last_lsn, bs.database_backup_lsn, bs.checkpoint_lsn,
-       bs.position, ISNULL(bs.compressed_backup_size, 0)
+       bs.position, ISNULL(bs.compressed_backup_size, 0), ISNULL(bs.name, N'')
 FROM   msdb.dbo.backupset AS bs
 JOIN   msdb.dbo.backupmediafamily AS bmf ON bmf.media_set_id = bs.media_set_id
 WHERE  bs.database_name = @db AND bmf.device_type IN (2, 102)  /* disco */
+  AND  (@since IS NULL OR bs.backup_finish_date >= @since)
 ORDER BY bs.backup_finish_date DESC, bs.backup_set_id, bmf.family_sequence_number;";
         try
         {
@@ -1407,6 +1903,7 @@ ORDER BY bs.backup_finish_date DESC, bs.backup_set_id, bmf.family_sequence_numbe
             var order = new List<int>();
             var groups = new Dictionary<int, (BackupSetInfo info, List<string> devices)>();
 
+            await EnsureOpenAsync(ct);
             await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@db", databaseName);
             await using var r = await cmd.ExecuteReaderAsync(ct);
@@ -1435,7 +1932,8 @@ ORDER BY bs.backup_finish_date DESC, bs.backup_set_id, bmf.family_sequence_numbe
                         DatabaseBackupLsn = r.IsDBNull(12) ? 0 : Convert.ToDecimal(r.GetValue(12)),
                         CheckpointLsn = r.IsDBNull(13) ? 0 : Convert.ToDecimal(r.GetValue(13)),
                         Position = r.IsDBNull(14) ? 1 : Convert.ToInt32(r.GetValue(14)),
-                        IsCompressed = comp > 0 && comp < size
+                        IsCompressed = comp > 0 && comp < size,
+                        Name = r.IsDBNull(16) ? string.Empty : r.GetString(16)
                     };
                     g = (info, new List<string>());
                     groups[setId] = g;
