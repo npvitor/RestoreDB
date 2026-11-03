@@ -581,24 +581,34 @@ public sealed class RestoreService
         // além dos backups existentes: aplicar um log depois de o STOPAT já ter sido atingido faz o
         // RESTORE falhar e deixaria o banco em RESTORING.
         var pieces = new List<RestorePiece>(plan.Pieces);
-        if (tailLogBackup)
+        try
         {
-            var tail = await TryBackupTailLogAsync(session, databaseName, progress, ct);
-            if (tail is not null && (target is null || !plan.ReachesTarget))
-                pieces.Add(tail);
-            else if (tail is not null)
-                Report(progress, databaseName, RepairLogLevel.Info,
-                    $"O instante alvo já é coberto pelos backups existentes — o tail-log ({tail.DiskPath}) fica guardado, mas não é aplicado.");
-        }
+            if (tailLogBackup)
+            {
+                var tail = await TryBackupTailLogAsync(session, databaseName, progress, ct);
+                if (tail is not null && (target is null || !plan.ReachesTarget))
+                    pieces.Add(tail);
+                else if (tail is not null)
+                    Report(progress, databaseName, RepairLogLevel.Info,
+                        $"O instante alvo já é coberto pelos backups existentes — o tail-log ({tail.DiskPath}) fica guardado, mas não é aplicado.");
+            }
 
-        var request = new RestoreRequest
+            var request = new RestoreRequest
+            {
+                DatabaseName = databaseName,
+                Replace = true,
+                StopAt = target,
+                Pieces = pieces
+            };
+            return await RestoreDatabaseAsync(session, request, progress, ct);
+        }
+        catch
         {
-            DatabaseName = databaseName,
-            Replace = true,
-            StopAt = target,
-            Pieces = pieces
-        };
-        return await RestoreDatabaseAsync(session, request, progress, ct);
+            // O tail-log toma o acesso exclusivo (SINGLE_USER) ANTES do BACKUP LOG: se ele falhou e a operação foi
+            // cancelada (ou caiu) antes da restauração, o banco continua ONLINE, mas preso a uma única conexão.
+            await EnsureMultiUserAsync(session, databaseName, progress);
+            throw;
+        }
     }
 
     /// <summary>

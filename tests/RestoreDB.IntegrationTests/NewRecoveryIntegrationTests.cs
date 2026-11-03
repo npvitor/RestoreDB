@@ -207,6 +207,30 @@ public sealed class NewRecoveryIntegrationTests
         finally { await It.TryDeleteBackupFileAsync(log); }
     }
 
+    /// <summary>Progresso SÍNCRONO que cancela a operação assim que uma mensagem contendo <c>trigger</c> é relatada.</summary>
+    private sealed class CancelOn(CancellationTokenSource cts, string trigger) : IProgress<RepairLogEntry>
+    {
+        public void Report(RepairLogEntry e) { if (e.Message.Contains(trigger)) cts.Cancel(); }
+    }
+
+    [IntegrationFact]
+    public async Task PontoNoTempo_CanceladoDepoisDoTailLog_NaoDeixaOBancoEmSingleUser()
+    {
+        await using var db = await TestDatabase.CreateAsync("pitcancel");
+        await It.ExecAsync($"ALTER DATABASE {It.Q(db.Name)} SET RECOVERY FULL;");
+        await db.BackupAsync();
+        // Cadeia de log quebrada (passagem por SIMPLE): o BACKUP LOG do tail-log falha DEPOIS de tomar o acesso exclusivo.
+        await It.ExecAsync($"ALTER DATABASE {It.Q(db.Name)} SET RECOVERY SIMPLE; ALTER DATABASE {It.Q(db.Name)} SET RECOVERY FULL;");
+
+        using var cts = new CancellationTokenSource();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Restore().RestoreToPointInTimeAsync(
+            db.Name, null, tailLogBackup: true, It.Conn, new CancelOn(cts, "não concluído: Capturando o tail-log"), cts.Token));
+
+        Assert.Equal("ONLINE", await It.GetStateAsync(db.Name));
+        Assert.Equal("MULTI_USER", await It.ScalarAsync("SELECT user_access_desc FROM sys.databases WHERE name = @n;", ("@n", db.Name)) as string);
+        Assert.Equal(3, await It.RowCountAsync(db.Name)); // nada foi restaurado
+    }
+
     [IntegrationFact]
     public async Task RecuperarParaCopia_FalhaNoMeio_NaoDeixaACopiaPresaEmRestoring()
     {
