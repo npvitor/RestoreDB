@@ -1,7 +1,7 @@
 namespace RestoreDB.Domain.Models;
 
 /// <summary>
-/// Instantâneo persistível de um diagnóstico — usado pelo histórico (B5) para detecção precoce:
+/// Instantâneo persistível de um diagnóstico — usado pelo histórico para detecção precoce:
 /// comparando o snapshot atual com o anterior, identifica corrupção/violações NOVAS desde a última
 /// verificação. Serializado em JSON sob %LOCALAPPDATA%\RestoreDB\History.
 /// </summary>

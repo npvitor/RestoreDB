@@ -87,14 +87,13 @@ public class DiagnosisModelTests
     }
 
     [Theory]
-    [InlineData(5, true, false)]   // Azure SQL DB
-    [InlineData(3, false, true)]   // Enterprise/Developer
-    [InlineData(4, false, false)]  // Express
-    public void ServerInfo_EditionFlags(int engineEdition, bool azure, bool onlinePageRestore)
+    [InlineData(5, true)]   // Azure SQL DB
+    [InlineData(3, false)]  // Enterprise/Developer
+    [InlineData(4, false)]  // Express
+    public void ServerInfo_EditionFlags(int engineEdition, bool azure)
     {
         var s = new ServerInfo { EngineEdition = engineEdition };
         Assert.Equal(azure, s.IsAzureSqlDatabase);
-        Assert.Equal(onlinePageRestore, s.SupportsOnlinePageRestore);
     }
 
     [Theory]

@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.IO;
 using System.Security.Principal;
 using RestoreDB.DataAccess;
 using RestoreDB.Domain.Constants;

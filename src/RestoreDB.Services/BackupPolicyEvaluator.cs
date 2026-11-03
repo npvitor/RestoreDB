@@ -18,7 +18,6 @@ public static class BackupPolicyEvaluator
         var a = new BackupPolicyAssessment { DatabaseName = databaseName, RecoveryModel = recoveryModel };
 
         a.LastFull = history.Where(b => b.IsFull).Max(b => b.BackupFinishDate);
-        a.LastDifferential = history.Where(b => b.IsDifferential).Max(b => b.BackupFinishDate);
         a.LastLog = history.Where(b => b.IsLog).Max(b => b.BackupFinishDate);
 
         var model = (recoveryModel ?? string.Empty).Trim().ToUpperInvariant();

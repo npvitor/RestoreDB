@@ -58,7 +58,9 @@ public sealed class SqlDataAccess
 SELECT  d.name                                   AS [name],
         CAST(d.state AS int)                      AS [state],
         d.state_desc                              AS [state_desc],
-        ISNULL(d.recovery_model_desc, N'')        AS [recovery_model_desc]
+        ISNULL(d.recovery_model_desc, N'')        AS [recovery_model_desc],
+        ISNULL(d.user_access_desc, N'')           AS [user_access_desc],
+        CAST(d.is_read_only AS bit)               AS [is_read_only]
 FROM    sys.databases AS d
 ORDER BY CASE WHEN d.state <> 0 THEN 0 ELSE 1 END, d.name;";
 
@@ -74,7 +76,9 @@ ORDER BY CASE WHEN d.state <> 0 THEN 0 ELSE 1 END, d.name;";
                 Name = reader.GetString(0),
                 State = reader.GetInt32(1),
                 StateDesc = reader.IsDBNull(2) ? "DESCONHECIDO" : reader.GetString(2),
-                RecoveryModel = reader.IsDBNull(3) ? string.Empty : reader.GetString(3)
+                RecoveryModel = reader.IsDBNull(3) ? string.Empty : reader.GetString(3),
+                UserAccess = reader.IsDBNull(4) ? string.Empty : reader.GetString(4),
+                IsReadOnly = !reader.IsDBNull(5) && reader.GetBoolean(5)
             });
         }
         return list;

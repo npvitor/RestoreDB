@@ -8,8 +8,7 @@ namespace RestoreDB.Domain.Constants;
 /// </summary>
 public static class AppConstants
 {
-    // ----- Identidade / branding -----
-    public const string ApplicationDisplayName = "RestoreDB — Diagnóstico e Reparo de Bancos (Módulo de Faturamento)";
+    // ----- Identidade -----
     public const string ConnectionApplicationName = "RestoreDB - Faturamento";
 
     // ----- Connection string (valores pré-definidos) -----

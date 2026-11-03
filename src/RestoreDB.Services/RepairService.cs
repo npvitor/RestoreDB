@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.IO;
 using System.Security.Principal;
 using System.Text;
 using RestoreDB.DataAccess;
@@ -22,6 +21,13 @@ public sealed class RepairService
     private readonly LogService _log;
     private readonly RestoreService _restore;
 
+    /// <summary>
+    /// Resultado da recuperação de linhas da execução corrente (uma operação por vez — a UI não permite
+    /// duas): banco de salvamento mantido para revisão e o resumo, em linguagem simples, do que ficou perdido.
+    /// </summary>
+    private string? _keptSalvageDb;
+    private string _lossSummary = string.Empty;
+
     public RepairService(LogService log, RestoreService restore)
     {
         _log = log;
@@ -42,6 +48,8 @@ public sealed class RepairService
         ParentRecoveryOptions? recovery = null)
     {
         var result = new RepairResult();
+        _keptSalvageDb = null;
+        _lossSummary = string.Empty;
         var mode = allowDataLoss ? "COM possível PERDA DE DADOS" : "seguro (sem perda de dados)";
         Report(progress, db.Name, RepairLogLevel.Info, $"════════ Iniciando reparo de [{db.Name}] — modo {mode} ════════");
 
@@ -102,6 +110,12 @@ public sealed class RepairService
                 "O reparo SEM perda de dados não foi suficiente. É possível tentar o reparo COM possível perda de dados (requer confirmação).",
             _ => $"Não foi possível reparar automaticamente. Estado atual: {finalState}."
         };
+        if (_lossSummary.Length > 0) result.Message += " " + _lossSummary;
+        if (_keptSalvageDb is not null)
+        {
+            result.SalvageDatabase = _keptSalvageDb;
+            result.Message += $" A cópia de salvamento [{_keptSalvageDb}] foi mantida para revisão.";
+        }
 
         var level = status switch
         {
@@ -141,6 +155,19 @@ public sealed class RepairService
 
             await using var session = await _data.OpenSessionAsync(connectionString, ct);
             diag.StateDesc = await session.GetDatabaseStateAsync(db.Name, ct);
+
+            // Configurações e ACESSO antes do CHECKDB: preso em SINGLE_USER por outra sessão, o banco
+            // aparece ONLINE mas ninguém (nem o CHECKDB) consegue entrar.
+            await AdjustmentService.ReadAccessAndSettingsAsync(session, db, diag, ct);
+            if (diag.AccessRestricted)
+            {
+                Report(progress, db.Name, RepairLogLevel.Warning,
+                    $"ACESSO TRAVADO: o banco está em {diag.Settings?.UserAccess} — o sistema não consegue usá-lo normalmente.");
+                foreach (var h in diag.AccessHolders)
+                    Report(progress, db.Name, RepairLogLevel.Warning, "  • Segurando o acesso: " + h.Display);
+            }
+            if (diag.Settings is { IsReadOnly: true })
+                Report(progress, db.Name, RepairLogLevel.Warning, "O banco está em modo SOMENTE LEITURA (READ_ONLY).");
 
             // TDE: avisa que restaurar em outra instância exige o certificado.
             diag.IsEncrypted = await session.IsEncryptedAsync(db.Name, ct);
@@ -196,12 +223,6 @@ public sealed class RepairService
                 foreach (var w in diag.Topology.Warnings)
                     Report(progress, db.Name, RepairLogLevel.Warning, "  ⚠ " + w);
             }
-
-            // Recomendação preventiva: PAGE_VERIFY = CHECKSUM detecta corrupção futura.
-            var pageVerify = await session.GetPageVerifyOptionAsync(db.Name, ct);
-            if (pageVerify.Length > 0 && !pageVerify.Equals("CHECKSUM", StringComparison.OrdinalIgnoreCase))
-                Report(progress, db.Name, RepairLogLevel.Warning,
-                    $"PAGE_VERIFY está como {pageVerify}. Recomenda-se: ALTER DATABASE [{db.Name}] SET PAGE_VERIFY CHECKSUM; (detecta corrupção futura).");
 
             // Espaço em disco dos volumes do banco.
             diag.Disks.AddRange(await session.GetDiskSpaceAsync(db.Name, ct));
@@ -291,7 +312,7 @@ public sealed class RepairService
             // Avaliação da política de backup/recuperação (RPO) — advisory, não muda a ação recomendada.
             await TryAssessBackupPolicyAsync(session, db, diag, progress, ct);
 
-            // Saúde lógica adicional (B4): índices desabilitados, dependências quebradas, constraints não confiáveis.
+            // Saúde lógica adicional: configurações, índices desabilitados, referências quebradas → ajustes recomendados.
             await TryLogicalHealthChecksAsync(session, db, diag, progress, ct);
 
             // Causa-raiz: erros de E/S e corrupção recorrente (suspeita de hardware/volume).
@@ -299,7 +320,7 @@ public sealed class RepairService
 
             BuildConclusion(diag);
 
-            // Histórico (B5): compara com a última verificação para apontar o que é NOVO (detecção precoce).
+            // Histórico: compara com a última verificação para apontar o que é NOVO (detecção precoce).
             TryRecordHistory(db, diag, progress);
 
             if (checkDbClean && diag.Evidence.Count > 0)
@@ -424,8 +445,9 @@ public sealed class RepairService
             foreach (var e in catalog.Take(5)) Report(progress, db.Name, RepairLogLevel.Warning, "  • " + e);
         }
 
-        // Constraints não confiáveis: integridade nunca validada (causa comum de FK órfã silenciosa).
-        var untrusted = await session.GetUntrustedConstraintsAsync(db.Name, ct);
+        // Constraints não confiáveis: integridade nunca validada (causa comum de FK órfã silenciosa). Mesma
+        // consulta da correção (só as HABILITADAS), para o ajuste sumir depois de aplicado.
+        var untrusted = (await session.GetUntrustedEnabledConstraintsAsync(db.Name, ct)).Select(c => c.Constraint).ToList();
         if (untrusted.Count > 0)
         {
             diag.UntrustedConstraints.AddRange(untrusted);
@@ -459,37 +481,36 @@ public sealed class RepairService
     }
 
     /// <summary>
-    /// Saúde lógica adicional (B4), somente leitura: índices DESABILITADOS, dependências QUEBRADAS
-    /// (views/procs referenciando objetos inexistentes) e constraints NÃO confiáveis. Advisory.
+    /// Saúde lógica adicional, somente leitura: índices DESABILITADOS e views/procedures com referência
+    /// QUEBRADA, somados às configurações e constraints não confiáveis já lidas — tudo vira AJUSTES RECOMENDADOS.
     /// </summary>
     private async Task TryLogicalHealthChecksAsync(SqlSession session, DatabaseInfo db, DiagnosisResult diag, IProgress<RepairLogEntry> progress, CancellationToken ct)
     {
-        if (diag.CheckDb is not { Executed: true }) return; // banco precisa estar acessível
         try
         {
-            var disabled = await session.GetDisabledIndexesAsync(db.Name, ct);
-            if (disabled.Count > 0)
-            {
-                diag.HealthFindings.Add(new PolicyFinding { Severity = FindingSeverity.Medium,
-                    Message = $"{disabled.Count} índice(s) DESABILITADO(s) (consultas podem estar lentas): {string.Join(", ", disabled.Take(8))}." });
-            }
+            // Índices desabilitados e referências quebradas só podem ser lidos com o banco acessível; as
+            // configurações (PAGE_VERIFY, AUTO_SHRINK, crescimento...) já foram lidas no início. As consultas
+            // são as mesmas das correções, para o diagnóstico listar exatamente o que o ajuste resolve.
+            var accessible = diag.CheckDb is { Executed: true };
+            var disabled = accessible
+                ? (await session.GetDisabledIndexDetailsAsync(db.Name, ct)).Select(i => PlainName($"{i.Table}.{i.Index}")).ToList()
+                : new List<string>();
+            var broken = accessible
+                ? (await session.GetModulesWithBrokenReferencesAsync(db.Name, ct)).Select(PlainName).ToList()
+                : new List<string>();
 
-            var broken = await session.GetBrokenDependenciesAsync(db.Name, ct);
-            if (broken.Count > 0)
-            {
-                diag.HealthFindings.Add(new PolicyFinding { Severity = FindingSeverity.High,
-                    Message = $"{broken.Count} dependência(s) QUEBRADA(s) (objeto referenciado não existe): {string.Join("; ", broken.Take(6))}." });
-            }
-
-            if (diag.UntrustedConstraints.Count > 0)
-                diag.HealthFindings.Add(new PolicyFinding { Severity = FindingSeverity.Low,
-                    Message = $"{diag.UntrustedConstraints.Count} constraint(s) NÃO confiável(is) (is_not_trusted)." });
-
-            foreach (var f in diag.HealthFindings)
-                Report(progress, db.Name, SeverityToLevel(f.Severity), "  • Saúde lógica: " + f.Message);
+            // Vira AJUSTES RECOMENDADOS (corrigíveis sem perda de dados, ou só avisos com o motivo).
+            AdjustmentService.BuildAdjustments(db, diag, disabled, broken);
+            foreach (var a in diag.Adjustments)
+                Report(progress, db.Name, SeverityToLevel(a.Severity),
+                    "  • Ajuste recomendado: " + a.Title + (a.CanFix ? "" : " (apenas aviso)"));
         }
+        catch (OperationCanceledException) { throw; }
         catch { /* best-effort */ }
     }
+
+    /// <summary>"[dbo].[Pedido].[IX_Data]" → "dbo.Pedido.IX_Data" (só para exibir).</summary>
+    private static string PlainName(string quoted) => quoted.Replace("[", "").Replace("]", "");
 
     /// <summary>
     /// Análise de CAUSA-RAIZ: erros de E/S físicos (823/824/825) apontam para storage/disco; e
@@ -519,7 +540,7 @@ public sealed class RepairService
         catch { /* best-effort */ }
     }
 
-    /// <summary>Persiste o snapshot do diagnóstico e reporta o que é NOVO desde a última verificação (B5).</summary>
+    /// <summary>Persiste o snapshot do diagnóstico e reporta o que é NOVO desde a última verificação.</summary>
     private void TryRecordHistory(DatabaseInfo db, DiagnosisResult diag, IProgress<RepairLogEntry> progress)
     {
         try
@@ -568,6 +589,24 @@ public sealed class RepairService
 
     internal static void BuildConclusion(DiagnosisResult d)
     {
+        // Acesso travado (SINGLE_USER/RESTRICTED_USER) num banco ONLINE, sem corrupção confirmada: o problema
+        // é o acesso. Se o CHECKDB nem rodou (a vaga está com outra sessão), liberar vem antes de qualquer reparo.
+        var anyCorruption = d.DataCorruptionSuspected || d.LogCorruptionSuspected || d.LogicalCorruptionSuspected || d.LogFull;
+        if (d.AccessRestricted && (!anyCorruption || d.CheckDb is not { Executed: true }))
+        {
+            var mode = d.Settings?.UserAccess ?? "SINGLE_USER";
+            d.RecommendedAction = RecommendedActionKind.FixAccess;
+            d.Summary = d.CheckDb is { Executed: true, HasErrors: false }
+                ? $"Banco íntegro, mas TRAVADO em {mode}: o sistema não consegue usá-lo."
+                : $"Banco TRAVADO em {mode}: o sistema (e a verificação) não consegue usá-lo.";
+            d.Recommendation = (d.AccessHolders.Count > 0
+                    ? $"{d.AccessHolders.Count} sessão(ões) presa(s) segura(m) o acesso (ex.: {d.AccessHolders[0].Display}). "
+                    : "Nenhuma sessão está usando o banco agora — a opção ficou ligada (ex.: reparo interrompido). ")
+                + "Use 'Liberar acesso': devolve o modo normal (MULTI_USER), desconectando a sessão presa se preciso. Nenhum dado gravado é perdido."
+                + (d.CheckDb is not { Executed: true } ? " Depois, diagnostique de novo para conferir a integridade." : string.Empty);
+            return;
+        }
+
         // Estado íntegro: CHECKDB ao vivo limpo, integridade lógica OK e sem flags ativas.
         if (d.CheckDb is { Executed: true, HasErrors: false }
             && !d.DataCorruptionSuspected && !d.LogCorruptionSuspected && !d.LogFull
@@ -575,7 +614,10 @@ public sealed class RepairService
         {
             d.RecommendedAction = RecommendedActionKind.NoAction;
             d.Summary = "Nenhuma corrupção detectada — DBCC CHECKDB e integridade lógica íntegros.";
-            d.Recommendation = string.Empty;
+            var fixable = d.Adjustments.Count(a => a.CanFix);
+            d.Recommendation = fixable > 0
+                ? $"Há {fixable} ajuste(s) recomendado(s) de configuração — opcionais, sem perda de dados (veja 'Ajustes recomendados')."
+                : string.Empty;
             return;
         }
 
@@ -856,6 +898,9 @@ public sealed class RepairService
         var safety = await TrySafetyNetAsync(s, db, p, ct);
         var rowsBefore = await s.GetTableRowCountsAsync(db.Name, ct);
 
+        // Cópia das linhas ainda legíveis das tabelas danificadas (salvamento mesmo sem backup).
+        var extraction = await TryPreRepairExtractionAsync(s, db, rowsBefore, corruptObjectIds: null, recovery, p, ct);
+
         var repairStep = await RunStepAsync(s, db, p, "Reparo COM possível PERDA DE DADOS (REPAIR_ALLOW_DATA_LOSS)",
             Dbcc(db.Name, "REPAIR_ALLOW_DATA_LOSS", noInfoMsgs: false), ct);
 
@@ -876,7 +921,8 @@ public sealed class RepairService
         {
             // Devolve do backup as linhas que o reparo acabou de descartar (quando dá para saber EXATAMENTE
             // quais eram) — antes da reconciliação de FKs, pois um pai recuperado aqui deixa de gerar órfão.
-            await TryRecoverRowsLostByRepairAsync(s, db, rowsBefore, repairStep, safety, connectionString, recovery, p, ct);
+            await TryRecoverRowsLostByRepairAsync(s, db, rowsBefore, repairStep, safety, connectionString, recovery, p, ct,
+                extraction: extraction);
 
             // O REPAIR_ALLOW_DATA_LOSS desaloca páginas SEM respeitar constraints — pode deixar
             // chaves estrangeiras órfãs. Como a perda de dados já foi autorizada, reconciliamos.
@@ -979,11 +1025,13 @@ public sealed class RepairService
                 Report(p, db.Name, RepairLogLevel.Warning, "ATENÇÃO: reparo COM POSSÍVEL PERDA DE DADOS (autorizado).");
                 var safety = await TrySafetyNetAsync(s, db, p, ct);
                 var rowsBefore = await s.GetTableRowCountsAsync(db.Name, ct);
+                var corruptIds = report.Details.Where(d => d.ObjectId != 0).Select(d => d.ObjectId).Distinct().ToList();
+                var extraction = await TryPreRepairExtractionAsync(s, db, rowsBefore, corruptIds, recovery, p, ct);
                 var repairStep = await RunStepAsync(s, db, p, "Reparo COM possível PERDA DE DADOS (REPAIR_ALLOW_DATA_LOSS)",
                     Dbcc(db.Name, "REPAIR_ALLOW_DATA_LOSS", noInfoMsgs: false), ct);
                 var verifyFinal = await RunCheckDbStepAsync(s, db, p, "Verificação final (DBCC CHECKDB)", db.Name, ct);
                 await TryRecoverRowsLostByRepairAsync(s, db, rowsBefore, repairStep, safety, connectionString, recovery, p, ct,
-                    corruptObjectIds: report.Details.Where(d => d.ObjectId != 0).Select(d => d.ObjectId));
+                    corruptObjectIds: corruptIds, extraction: extraction);
                 await TryReconcileConstraintsAsync(s, db, p, allowDataLoss: true, connectionString, recovery, ct);
                 await TryReseedIdentitiesAsync(s, db, p, ct);
                 if (verifyFinal.Success)
@@ -1036,26 +1084,75 @@ public sealed class RepairService
     }
 
     /// <summary>
-    /// Depois de um REPAIR_ALLOW_DATA_LOSS, devolve ao banco as linhas que o reparo DESCARTOU, lendo-as de
-    /// uma cópia restaurada da cadeia de backups ATÉ O INSTANTE DO REPARO (FULL → diferencial → logs → o
-    /// tail-log capturado pela rede de segurança). As tabelas afetadas vêm (a) das páginas que o próprio
-    /// reparo diz ter desalocado ("object ID n"), (b) das tabelas cuja contagem de linhas caiu e (c) dos
-    /// objetos com erro no CHECKDB. Só insere o que falta, por chave primária, com gatilhos desligados.
+    /// Antes do REPAIR_ALLOW_DATA_LOSS, guarda num banco de salvamento as linhas ainda LEGÍVEIS das tabelas
+    /// danificadas (ver <see cref="PreRepairExtractor"/>). As tabelas vêm dos objetos com erro no CHECKDB
+    /// (estruturado; roda aqui quando o chamador não os tem). Desligado junto com "devolver as linhas
+    /// descartadas" (<see cref="ParentRecoveryOptions.RecoverLostRows"/>). Best-effort: nunca impede o reparo.
+    /// </summary>
+    private async Task<PreRepairExtraction?> TryPreRepairExtractionAsync(
+        SqlSession s, DatabaseInfo db, IReadOnlyDictionary<string, long> rowsBefore, IReadOnlyCollection<int>? corruptObjectIds,
+        ParentRecoveryOptions? recovery, IProgress<RepairLogEntry> p, CancellationToken ct)
+    {
+        if (recovery is { RecoverLostRows: false }) return null;
+        try
+        {
+            var ids = corruptObjectIds;
+            if (ids is null)
+            {
+                Report(p, db.Name, RepairLogLevel.Info, "Identificando as tabelas danificadas antes do reparo (DBCC CHECKDB estruturado)...");
+                var rep = await s.CheckDbWithResultsAsync(db.Name, repairOption: null, ct);
+                ids = rep.Details.Where(d => d.ObjectId > 100).Select(d => d.ObjectId).Distinct().ToList();
+            }
+
+            var tables = new List<string>();
+            foreach (var oid in ids.Where(i => i > 100).Distinct())
+            {
+                var name = await s.ResolveSchemaTableAsync(db.Name, oid, ct);
+                if (name.Length > 0 && (rowsBefore.Count == 0 || rowsBefore.ContainsKey(name)) && !tables.Contains(name, StringComparer.OrdinalIgnoreCase))
+                    tables.Add(name);
+            }
+            if (tables.Count == 0)
+            {
+                Report(p, db.Name, RepairLogLevel.Info, "Nenhuma tabela de usuário identificada como danificada — cópia de salvamento dispensada.");
+                return null;
+            }
+
+            var extractor = new PreRepairExtractor((lvl, msg) => Report(p, db.Name, lvl, msg));
+            return await extractor.ExtractAsync(s, db.Name, tables, rowsBefore, ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            Report(p, db.Name, RepairLogLevel.Warning, "Cópia de salvamento antes do reparo não concluída: " + ex.Message);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Depois de um REPAIR_ALLOW_DATA_LOSS, devolve ao banco as linhas que o reparo DESCARTOU. Duas fontes,
+    /// nesta ordem:
+    /// (1) BACKUPS: uma cópia restaurada da cadeia ATÉ O INSTANTE DO REPARO (FULL → diferencial → logs → o
+    ///     tail-log da rede de segurança) — traz inclusive o que estava nas páginas destruídas;
+    /// (2) CÓPIA DE SALVAMENTO feita antes do reparo — funciona SEM backup, para tudo o que ainda era legível.
+    /// As tabelas afetadas vêm (a) das páginas que o próprio reparo diz ter desalocado ("object ID n"),
+    /// (b) das tabelas cuja contagem de linhas caiu e (c) dos objetos com erro no CHECKDB. Só insere o que
+    /// falta, por chave primária, com gatilhos desligados.
     ///
-    /// Segurança: só é automático quando a cópia retrata EXATAMENTE o momento anterior ao reparo — aí toda
-    /// linha que existe na cópia e não no banco foi, com certeza, descartada pelo reparo. Sem tail-log
-    /// (modelo SIMPLE, log ilegível) ou com a cadeia quebrada, a cópia seria de um momento ANTERIOR e
-    /// reinserir "o que falta" ressuscitaria registros excluídos de propósito — nesse caso apenas informa
-    /// o que foi perdido e orienta a recuperação manual. Best-effort: nunca derruba o reparo.
+    /// Segurança: as duas fontes retratam EXATAMENTE o momento anterior ao reparo — toda linha que está nelas
+    /// e não no banco foi descartada pelo reparo. Um backup de um momento ANTERIOR (sem tail-log, cadeia
+    /// quebrada) ressuscitaria registros excluídos de propósito, então ele não é usado. Ao final, resume em
+    /// linguagem simples o que ainda ficou perdido. Best-effort: nunca derruba o reparo.
     /// </summary>
     private async Task TryRecoverRowsLostByRepairAsync(
         SqlSession s, DatabaseInfo db, IReadOnlyDictionary<string, long> rowsBefore, CommandExecutionResult repairStep,
         SafetyNet safety, string connectionString, ParentRecoveryOptions? recovery, IProgress<RepairLogEntry> p,
-        CancellationToken ct, IEnumerable<int>? corruptObjectIds = null)
+        CancellationToken ct, IEnumerable<int>? corruptObjectIds = null, PreRepairExtraction? extraction = null)
     {
-        if (recovery is { RecoverLostRows: false }) return;
+        var keepSalvage = false;
         try
         {
+            if (recovery is { RecoverLostRows: false }) return;
+
             var after = await s.GetTableRowCountsAsync(db.Name, ct);
             var affected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var (table, before) in rowsBefore)
@@ -1075,9 +1172,11 @@ public sealed class RepairService
                 {
                     Report(p, db.Name, RepairLogLevel.Warning, "Não foi possível medir as linhas antes do reparo (metadados ilegíveis) — confira os dados; " +
                         "para revisar o que mudou use 'Recuperar para cópia' + 'Assistente de salvamento'.");
+                    keepSalvage = extraction is { Performed: true };
                     return;
                 }
                 Report(p, db.Name, RepairLogLevel.Success, "O reparo não descartou linhas das tabelas de usuário (contagem antes × depois).");
+                _lossSummary = "Nenhuma linha foi perdida.";
                 return;
             }
 
@@ -1086,78 +1185,134 @@ public sealed class RepairService
                 string.Join("; ", affected.Take(10).Select(t =>
                     $"{t} ({rowsBefore.GetValueOrDefault(t):N0} → {after.GetValueOrDefault(t):N0})")) + ".");
 
+            // (1) Backups até o instante do reparo.
+            var hasSalvage = extraction is { Performed: true };
             if (!safety.TailLogCaptured)
             {
-                Report(p, db.Name, RepairLogLevel.Warning,
-                    "Não foi possível obter o estado EXATO de antes do reparo (sem tail-log: modelo SIMPLE ou log ilegível), " +
-                    "então as linhas NÃO são devolvidas automaticamente — um backup mais antigo traria de volta também registros " +
-                    "excluídos de propósito. Para revisar e recuperar manualmente: 'Recuperar para cópia' + 'Assistente de salvamento'.");
-                return;
+                Report(p, db.Name, RepairLogLevel.Info,
+                    "Sem o estado EXATO de antes do reparo nos backups (sem tail-log: modelo SIMPLE ou log ilegível) — um backup mais antigo " +
+                    "traria de volta também registros excluídos de propósito, então ele não é usado." +
+                    (hasSalvage ? " Usando a cópia de salvamento feita antes do reparo." : string.Empty));
+            }
+            else
+            {
+                var plan = await _restore.PlanAvailableAsync(s, db.Name, h => BackupChainPlanner.Plan(db.Name, h, target: null), ct);
+                var lastLog = plan.Logs.LastOrDefault()?.BackupFinishDate ?? DateTime.MinValue;
+                if (!plan.IsComplete || lastLog < safety.StartedAt.AddMinutes(-1))
+                    Report(p, db.Name, RepairLogLevel.Info,
+                        "A cadeia de backups não chega até o instante do reparo (" + plan.Summary + ")" +
+                        (hasSalvage ? " — usando a cópia de salvamento feita antes do reparo." : "."));
+                else
+                    await TryReturnRowsFromBackupChainAsync(s, db, affected, connectionString, p, ct);
             }
 
-            var plan = await _restore.PlanAvailableAsync(s, db.Name, h => BackupChainPlanner.Plan(db.Name, h, target: null), ct);
-            var lastLog = plan.Logs.LastOrDefault()?.BackupFinishDate ?? DateTime.MinValue;
-            if (!plan.IsComplete || lastLog < safety.StartedAt.AddMinutes(-1))
+            // (2) Cópia de salvamento (sem backup). Inserir só o que falta torna as duas fontes complementares.
+            if (hasSalvage)
             {
-                Report(p, db.Name, RepairLogLevel.Warning,
-                    "A cadeia de backups não chega até o instante do reparo (" + plan.Summary + ") — as linhas NÃO são devolvidas " +
-                    "automaticamente. Use 'Recuperar para cópia' + 'Assistente de salvamento' para revisar.");
-                return;
+                var extractor = new PreRepairExtractor((lvl, msg) => Report(p, db.Name, lvl, msg));
+                var (returned, notReturned) = await extractor.ReturnRowsAsync(s, db.Name, extraction!, affected, ct);
+                Report(p, db.Name, returned > 0 ? RepairLogLevel.Success : RepairLogLevel.Info,
+                    returned > 0
+                        ? $"{returned:N0} linha(s) descartada(s) pelo reparo foram DEVOLVIDAS a partir da cópia de salvamento."
+                        : "A cópia de salvamento não tinha linhas a devolver (o que o reparo descartou já estava ilegível antes dele).");
+                keepSalvage = notReturned.Count > 0 || extraction!.Tables.Any(t => t.PartialRows > 0);
             }
 
-            Report(p, db.Name, RepairLogLevel.Info,
-                "Recuperando as linhas descartadas: restaurando a cadeia de backups até o instante do reparo numa cópia temporária " +
-                "(pode demorar conforme o tamanho do banco)...");
-            var scratch = $"{AppConstants.SanitizeToken(db.Name, "banco")}_LostRows_{DateTime.Now:yyyyMMddHHmmss}_{Guid.NewGuid().ToString("N")[..6]}";
-            try
+            // (3) O que ainda ficou perdido — em linguagem simples, para quem vai explicar ao cliente.
+            var final = await s.GetTableRowCountsAsync(db.Name, ct);
+            var lost = affected
+                .Select(t => (Table: t, Rows: rowsBefore.GetValueOrDefault(t) - final.GetValueOrDefault(t)))
+                .Where(x => x.Rows > 0).OrderByDescending(x => x.Rows).ToList();
+            if (lost.Count == 0)
             {
-                var copy = await _restore.RestoreAsCopyAsync(db.Name, scratch, connectionString, p, ct);
-                if (copy.Status != RepairStatus.Success)
-                {
-                    Report(p, db.Name, RepairLogLevel.Warning, "Não foi possível montar a cópia de antes do reparo — linhas não recuperadas automaticamente.");
-                    return;
-                }
-
-                // Várias passadas: uma tabela-filha pode depender de um pai que só volta numa tabela seguinte.
-                var pending = affected.ToList();
-                var errors = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                var total = 0;
-                for (var pass = 0; pass < 3 && pending.Count > 0; pass++)
-                {
-                    var failed = new List<string>();
-                    foreach (var t in pending)
-                    {
-                        try
-                        {
-                            var n = await s.SalvageTableAsync(scratch, db.Name, t, ct);
-                            total += n;
-                            errors.Remove(t);
-                            if (n > 0) Report(p, db.Name, RepairLogLevel.Success, $"  ✔ {n} linha(s) de {t} devolvida(s) a partir do backup.");
-                        }
-                        catch (OperationCanceledException) { throw; }
-                        catch (Exception ex) { failed.Add(t); errors[t] = ex.Message; }
-                    }
-                    if (failed.Count == pending.Count) break; // nenhuma evolução nesta passada
-                    pending = failed;
-                }
-                foreach (var (t, msg) in errors)
-                    Report(p, db.Name, RepairLogLevel.Warning, $"  ⚠ {t}: não foi possível devolver as linhas automaticamente — {msg}");
-
-                Report(p, db.Name, total > 0 ? RepairLogLevel.Success : RepairLogLevel.Info,
-                    total > 0
-                        ? $"{total:N0} linha(s) descartada(s) pelo reparo foram RECUPERADAS do backup (sem duplicar; gatilhos desligados)."
-                        : "Nenhuma linha precisou ser devolvida (o backup não tinha linhas ausentes no banco).");
+                _lossSummary = "Todas as linhas que o reparo descartou foram recuperadas.";
+                Report(p, db.Name, RepairLogLevel.Success, _lossSummary);
             }
-            finally
+            else
             {
-                if (!await s.DropDatabaseBestEffortAsync(scratch, CancellationToken.None))
-                    Report(p, db.Name, RepairLogLevel.Warning, $"Não foi possível descartar a cópia temporária [{scratch}] — remova-a manualmente.");
+                _lossSummary = $"{lost.Sum(x => x.Rows):N0} linha(s) não puderam ser recuperadas (estavam em páginas destruídas): " +
+                               string.Join(", ", lost.Take(5).Select(x => $"{x.Table} ({x.Rows:N0})")) + ".";
+                Report(p, db.Name, RepairLogLevel.Warning, _lossSummary +
+                    " Só um backup íntegro traz essas linhas de volta ('Recuperar para cópia' + 'Assistente de salvamento').");
             }
         }
-        catch (OperationCanceledException) { throw; }
+        catch (OperationCanceledException) { keepSalvage = extraction is { Performed: true }; throw; }
         catch (Exception ex)
         {
+            keepSalvage = extraction is { Performed: true };
             Report(p, db.Name, RepairLogLevel.Warning, "Recuperação das linhas descartadas não concluída: " + ex.Message);
+        }
+        finally
+        {
+            if (extraction is { SalvageDatabase.Length: > 0 } x)
+            {
+                if (keepSalvage)
+                {
+                    _keptSalvageDb = x.SalvageDatabase;
+                    Report(p, db.Name, RepairLogLevel.Warning,
+                        $"A cópia de salvamento [{x.SalvageDatabase}] foi MANTIDA: há linhas que não voltaram sozinhas (tabela sem chave primária, " +
+                        "linhas parciais ou erro ao devolver). Use o 'Assistente de salvamento' ou acione o DBA para revisá-las.");
+                }
+                else if (!await s.DropDatabaseBestEffortAsync(x.SalvageDatabase, CancellationToken.None))
+                    Report(p, db.Name, RepairLogLevel.Warning, $"Não foi possível descartar a cópia de salvamento [{x.SalvageDatabase}] — remova-a manualmente.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Restaura numa cópia temporária a cadeia de backups até o instante do reparo e devolve, por chave
+    /// primária, as linhas que faltam nas tabelas afetadas. Descarta a cópia ao final.
+    /// </summary>
+    private async Task TryReturnRowsFromBackupChainAsync(
+        SqlSession s, DatabaseInfo db, IReadOnlyCollection<string> affected, string connectionString, IProgress<RepairLogEntry> p, CancellationToken ct)
+    {
+        Report(p, db.Name, RepairLogLevel.Info,
+            "Recuperando as linhas descartadas: restaurando a cadeia de backups até o instante do reparo numa cópia temporária " +
+            "(pode demorar conforme o tamanho do banco)...");
+        var scratch = $"{AppConstants.SanitizeToken(db.Name, "banco")}_LostRows_{DateTime.Now:yyyyMMddHHmmss}_{Guid.NewGuid().ToString("N")[..6]}";
+        try
+        {
+            var copy = await _restore.RestoreAsCopyAsync(db.Name, scratch, connectionString, p, ct);
+            if (copy.Status != RepairStatus.Success)
+            {
+                Report(p, db.Name, RepairLogLevel.Warning, "Não foi possível montar a cópia de antes do reparo a partir dos backups.");
+                return;
+            }
+
+            // Várias passadas: uma tabela-filha pode depender de um pai que só volta numa tabela seguinte.
+            var pending = affected.ToList();
+            var errors = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var total = 0;
+            for (var pass = 0; pass < 3 && pending.Count > 0; pass++)
+            {
+                var failed = new List<string>();
+                foreach (var t in pending)
+                {
+                    try
+                    {
+                        var n = await s.SalvageTableAsync(scratch, db.Name, t, ct);
+                        total += n;
+                        errors.Remove(t);
+                        if (n > 0) Report(p, db.Name, RepairLogLevel.Success, $"  ✔ {n} linha(s) de {t} devolvida(s) a partir do backup.");
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex) { failed.Add(t); errors[t] = ex.Message; }
+                }
+                if (failed.Count == pending.Count) break; // nenhuma evolução nesta passada
+                pending = failed;
+            }
+            foreach (var (t, msg) in errors)
+                Report(p, db.Name, RepairLogLevel.Warning, $"  ⚠ {t}: não foi possível devolver as linhas automaticamente — {msg}");
+
+            Report(p, db.Name, total > 0 ? RepairLogLevel.Success : RepairLogLevel.Info,
+                total > 0
+                    ? $"{total:N0} linha(s) descartada(s) pelo reparo foram RECUPERADAS do backup (sem duplicar; gatilhos desligados)."
+                    : "Nenhuma linha precisou ser devolvida a partir do backup.");
+        }
+        finally
+        {
+            if (!await s.DropDatabaseBestEffortAsync(scratch, CancellationToken.None))
+                Report(p, db.Name, RepairLogLevel.Warning, $"Não foi possível descartar a cópia temporária [{scratch}] — remova-a manualmente.");
         }
     }
 
@@ -1264,7 +1419,7 @@ public sealed class RepairService
                 another = await chooseAnother(new ParentRecoveryPrompt
                 {
                     DatabaseName = db.Name, Recovered = totalRecovered, RemainingOrphans = remaining.Count,
-                    Reason = reason, LastTriedPath = source
+                    Reason = reason
                 }, ct);
             }
             catch (OperationCanceledException) { throw; }
@@ -2301,7 +2456,7 @@ public sealed class RepairService
     }
 
     // ----------------------------------------------------------------------------------
-    // Checagens granulares (B1): CHECKTABLE dirigido e reseed de IDENTITY
+    // Checagens granulares: CHECKTABLE dirigido e reseed de IDENTITY
     // ----------------------------------------------------------------------------------
 
     /// <summary>Verificação dirigida de UMA tabela (DBCC CHECKTABLE) — mais rápida que o CHECKDB completo.</summary>

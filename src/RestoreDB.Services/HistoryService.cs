@@ -1,4 +1,3 @@
-using System.IO;
 using System.Text.Json;
 using RestoreDB.Domain.Constants;
 using RestoreDB.Domain.Models;
@@ -6,7 +5,7 @@ using RestoreDB.Domain.Models;
 namespace RestoreDB.Services;
 
 /// <summary>
-/// Histórico de diagnósticos (B5): persiste um snapshot por verificação em JSON local e compara o
+/// Histórico de diagnósticos: persiste um snapshot por verificação em JSON local e compara o
 /// atual com o anterior para detecção PRECOCE — aponta corrupção/violações NOVAS desde a última vez.
 /// Best-effort: nunca lança para o chamador (falha de E/S só significa "sem histórico").
 /// </summary>

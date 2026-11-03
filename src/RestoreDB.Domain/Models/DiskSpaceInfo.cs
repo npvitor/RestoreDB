@@ -12,7 +12,6 @@ public sealed class DiskSpaceInfo
     public long TotalBytes { get; init; }
     public long AvailableBytes { get; init; }
 
-    public double TotalGb => TotalBytes / 1024.0 / 1024.0 / 1024.0;
     public double AvailableGb => AvailableBytes / 1024.0 / 1024.0 / 1024.0;
 
     public double PercentFree => TotalBytes == 0 ? 0 : 100.0 * AvailableBytes / TotalBytes;

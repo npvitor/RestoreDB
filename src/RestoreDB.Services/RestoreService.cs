@@ -29,12 +29,6 @@ public sealed class RestoreService
         return await session.RestoreHeaderOnlyAsync(diskPath, ct);
     }
 
-    public async Task<List<BackupFileInfo>> GetBackupFilesAsync(string diskPath, int position, string connectionString, CancellationToken ct = default)
-    {
-        await using var session = await _data.OpenSessionAsync(connectionString, ct);
-        return await session.RestoreFileListOnlyAsync(diskPath, position, ct);
-    }
-
     public async Task<List<BackupSetInfo>> ListBackupHistoryAsync(string databaseName, string connectionString, CancellationToken ct = default)
     {
         await using var session = await _data.OpenSessionAsync(connectionString, ct);

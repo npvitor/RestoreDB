@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="RestoreDB — Diagnóstico e Reparo (Módulo de Faturamento)"
         Icon="/Assets/app.ico"
-        Height="780" Width="1360" MinHeight="620" MinWidth="1080"
+        Height="820" Width="1360" MinHeight="620" MinWidth="1080"
         WindowStartupLocation="CenterScreen"
         Foreground="{DynamicResource TextBrush}"
         Background="{DynamicResource WindowBackBrush}">
@@ -11,527 +11,1019 @@
     <Grid Margin="14">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
-            <RowDefinition Height="*" MinHeight="220" />
-            <RowDefinition Height="6" />
-            <RowDefinition Height="230" MinHeight="120" />
+            <RowDefinition Height="*" MinHeight="260" />
+            <RowDefinition Height="8" />
+            <RowDefinition Height="190" MinHeight="90" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
-        <!-- ===== Barra superior ===== -->
-        <Border Grid.Row="0" Background="{DynamicResource CardBrush}" BorderBrush="{DynamicResource LineBrush}"
-                BorderThickness="1" CornerRadius="6" Padding="14,10" Margin="0,0,0,12">
+        <!-- ===== Cabeçalho: identidade + servidor + ações globais ===== -->
+        <Border Grid.Row="0" Style="{StaticResource Card}" Padding="16,10" Margin="0,0,0,12">
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
-                <StackPanel Grid.Column="0">
-                    <TextBlock Text="Bancos de dados do servidor" Style="{StaticResource HeaderText}" FontSize="17" />
-                    <TextBlock x:Name="ServerInfoText" Foreground="{DynamicResource MutedTextBrush}" FontSize="12" Margin="0,2,0,0" />
+                <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="RestoreDB" Style="{StaticResource HeaderText}" FontSize="18" />
+                        <TextBlock Text="Diagnóstico e reparo de bancos SQL Server" Foreground="{DynamicResource MutedTextBrush}"
+                                   FontSize="13" VerticalAlignment="Bottom" Margin="10,0,0,2" />
+                    </StackPanel>
+                    <TextBlock x:Name="ServerInfoText" Foreground="{DynamicResource MutedTextBrush}" FontSize="12" Margin="0,2,0,0"
+                               TextTrimming="CharacterEllipsis" />
                 </StackPanel>
                 <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                    <ToggleButton x:Name="ThemeToggleButton" Content="🌙  Tema escuro" Style="{StaticResource ThemeToggle}"
-                                  Margin="0,0,8,0" Click="ThemeToggleButton_Click" />
-                    <Button x:Name="CancelButton" Content="Cancelar" Style="{StaticResource DangerButton}"
-                            Click="CancelButton_Click" Margin="0,0,8,0" IsEnabled="False" />
-                    <Button x:Name="AttachButton" Content="Anexar .mdf" Style="{StaticResource SecondaryButton}"
-                            Click="AttachButton_Click" Margin="0,0,8,0" />
-                    <Button x:Name="RefreshButton" Content="Atualizar lista" Style="{StaticResource SecondaryButton}"
-                            Click="RefreshButton_Click" Margin="0,0,8,0" />
+                    <Button x:Name="RefreshButton" Content="⟳  Atualizar lista" Style="{StaticResource SecondaryButton}"
+                            Padding="12,6" FontSize="13" Click="RefreshButton_Click" Margin="0,0,8,0"
+                            ToolTip="Recarrega a lista de bancos e o estado de cada um." />
+                    <Button x:Name="AttachButton" Content="📎  Anexar .mdf" Style="{StaticResource SecondaryButton}"
+                            Padding="12,6" FontSize="13" Click="AttachButton_Click" Margin="0,0,8,0"
+                            ToolTip="Recupera um banco a partir de um arquivo de dados (.mdf) solto." />
                     <Button x:Name="ReconnectButton" Content="Trocar conexão" Style="{StaticResource SecondaryButton}"
-                            Click="ReconnectButton_Click" />
+                            Padding="12,6" FontSize="13" Click="ReconnectButton_Click" Margin="0,0,16,0" />
+                    <ToggleButton x:Name="ThemeToggleButton" Content="🌙  Tema escuro" Style="{StaticResource ThemeToggle}"
+                                  Click="ThemeToggleButton_Click" />
                 </StackPanel>
             </Grid>
         </Border>
 
-        <!-- ===== Conteúdo: lista (master) + painel de ações (detalhe, dominante) ===== -->
+        <!-- ===== Conteúdo: lista de bancos (esquerda) + fluxo guiado (direita) ===== -->
         <Grid Grid.Row="1">
             <Grid.ColumnDefinitions>
-                <!-- Lista compacta e redimensionável; o painel de ações recebe o maior espaço. -->
-                <ColumnDefinition Width="360" MinWidth="260" />
-                <ColumnDefinition Width="10" />
-                <ColumnDefinition Width="*" MinWidth="560" />
+                <ColumnDefinition Width="300" MinWidth="240" />
+                <ColumnDefinition Width="12" />
+                <ColumnDefinition Width="*" MinWidth="600" />
             </Grid.ColumnDefinitions>
 
             <!-- Lista de bancos -->
-            <Border Grid.Column="0" Background="{DynamicResource CardBrush}" BorderBrush="{DynamicResource LineBrush}"
-                    BorderThickness="1" CornerRadius="6" Margin="0">
-                <DataGrid x:Name="DatabasesGrid" AutoGenerateColumns="False" IsReadOnly="True"
-                          HeadersVisibility="Column" GridLinesVisibility="Horizontal" BorderThickness="0"
-                          Background="Transparent" RowBackground="Transparent"
-                          Foreground="{DynamicResource TextBrush}"
-                          HorizontalGridLinesBrush="{DynamicResource LineBrush}"
-                          AlternatingRowBackground="{DynamicResource GridAltRowBrush}"
-                          SelectionMode="Single" SelectionUnit="FullRow" CanUserAddRows="False"
-                          SelectionChanged="DatabasesGrid_SelectionChanged"
-                          HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
-                    <DataGrid.RowStyle>
-                        <Style TargetType="DataGridRow">
-                            <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
-                            <Style.Triggers>
-                                <DataTrigger Binding="{Binding IsProblematic}" Value="True">
-                                    <Setter Property="Background" Value="{DynamicResource ProblemBackBrush}" />
-                                    <Setter Property="Foreground" Value="{DynamicResource ProblemForeBrush}" />
-                                    <Setter Property="FontWeight" Value="SemiBold" />
-                                </DataTrigger>
-                            </Style.Triggers>
-                        </Style>
-                    </DataGrid.RowStyle>
-                    <DataGrid.Columns>
-                        <DataGridTextColumn Header="Banco" Binding="{Binding Name}" Width="*" />
-                        <DataGridTextColumn Header="Estado" Binding="{Binding StateDesc}" Width="Auto" MinWidth="96" />
-                    </DataGrid.Columns>
-                </DataGrid>
+            <Border Grid.Column="0" Style="{StaticResource Card}" Padding="0">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+
+                    <StackPanel Grid.Row="0" Margin="14,12,14,10">
+                        <TextBlock Text="Bancos de dados" Style="{StaticResource SectionTitle}" />
+                        <TextBlock x:Name="DbCountText" Style="{StaticResource HintText}" Margin="0,2,0,8" Text="Carregando..." />
+                        <!-- Filtro por nome (com texto de ajuda quando vazio) -->
+                        <Grid>
+                            <TextBox x:Name="DbFilterBox" FontSize="13" Padding="8,5" TextChanged="DbFilterBox_TextChanged" />
+                            <TextBlock Text="🔍  Filtrar por nome..." IsHitTestVisible="False" FontSize="13"
+                                       Margin="11,0,0,0" VerticalAlignment="Center" Foreground="{DynamicResource MutedTextBrush}">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="Visibility" Value="Collapsed" />
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding Text, ElementName=DbFilterBox}" Value="">
+                                                <Setter Property="Visibility" Value="Visible" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+                        </Grid>
+                    </StackPanel>
+
+                    <DataGrid x:Name="DatabasesGrid" Grid.Row="1" AutoGenerateColumns="False" IsReadOnly="True"
+                              HeadersVisibility="Column" GridLinesVisibility="Horizontal" BorderThickness="0,1,0,0"
+                              BorderBrush="{DynamicResource LineBrush}"
+                              Background="Transparent" RowBackground="Transparent"
+                              Foreground="{DynamicResource TextBrush}"
+                              HorizontalGridLinesBrush="{DynamicResource LineBrush}"
+                              AlternatingRowBackground="{DynamicResource GridAltRowBrush}"
+                              SelectionMode="Single" SelectionUnit="FullRow" CanUserAddRows="False"
+                              SelectionChanged="DatabasesGrid_SelectionChanged"
+                              HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
+                        <DataGrid.RowStyle>
+                            <Style TargetType="DataGridRow">
+                                <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
+                                <Setter Property="Cursor" Value="Hand" />
+                                <Style.Triggers>
+                                    <!-- ONLINE, mas travado (SINGLE_USER/somente leitura): atenção, sem o vermelho de problema grave. -->
+                                    <DataTrigger Binding="{Binding HasAccessRestriction}" Value="True">
+                                        <Setter Property="Background" Value="{DynamicResource WarnBackBrush}" />
+                                        <Setter Property="Foreground" Value="{DynamicResource WarnForeBrush}" />
+                                        <Setter Property="FontWeight" Value="SemiBold" />
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding IsProblematic}" Value="True">
+                                        <Setter Property="Background" Value="{DynamicResource ProblemBackBrush}" />
+                                        <Setter Property="Foreground" Value="{DynamicResource ProblemForeBrush}" />
+                                        <Setter Property="FontWeight" Value="SemiBold" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </DataGrid.RowStyle>
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="Banco" Binding="{Binding Name}" Width="*" />
+                            <DataGridTextColumn Header="Estado" Binding="{Binding StateDisplay}" Width="Auto" MinWidth="96" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+
+                    <TextBlock Grid.Row="2" Style="{StaticResource HintText}" Margin="14,8,14,10"
+                               Text="Vermelho: estado problemático. Amarelo: ONLINE, mas travado (acesso restrito ou somente leitura). Um banco ONLINE também pode ter corrupção — na dúvida, diagnostique." />
+                </Grid>
             </Border>
 
-            <!-- Divisor ajustável entre a lista e o painel de ações -->
-            <GridSplitter Grid.Column="1" Width="10" HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+            <!-- Divisor ajustável entre a lista e o fluxo -->
+            <GridSplitter Grid.Column="1" Width="12" HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
                           Background="Transparent" ResizeBehavior="PreviousAndNext" ResizeDirection="Columns" />
 
-            <!-- Painel de ações (diagnóstico, reparo e restauração) — área principal -->
-            <Border Grid.Column="2" Background="{DynamicResource CardBrush}" BorderBrush="{DynamicResource LineBrush}"
-                    BorderThickness="1" CornerRadius="6" Padding="22,18">
-                <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="0,0,8,0">
-                    <StackPanel MaxWidth="1400" HorizontalAlignment="Left">
-                        <TextBlock Text="Diagnóstico, reparo e restauração" Style="{StaticResource HeaderText}" FontSize="17" Margin="0,0,0,4" />
-                        <TextBlock Text="Selecione um banco à esquerda, diagnostique e siga a ação recomendada. Operações destrutivas sempre pedem confirmação."
-                                   Foreground="{DynamicResource MutedTextBrush}" FontSize="12" TextWrapping="Wrap" Margin="0,0,0,14" />
+            <!-- Fluxo guiado: 1 Diagnosticar → 2 Resolver → 3 Conferir -->
+            <ScrollViewer Grid.Column="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Padding="0,0,6,0">
+                <Grid>
+                    <!-- Sem seleção: explica o fluxo antes de começar -->
+                    <Border x:Name="NoSelectionPanel" Style="{StaticResource Card}" Padding="28,24" VerticalAlignment="Top">
+                        <StackPanel MaxWidth="640" HorizontalAlignment="Left">
+                            <TextBlock Text="Selecione um banco na lista à esquerda" Style="{StaticResource HeaderText}" FontSize="18" />
+                            <TextBlock Style="{StaticResource HintText}" FontSize="13" Margin="0,6,0,18"
+                                       Text="A ferramenta conduz o trabalho em três passos e só libera a próxima ação quando faz sentido — sempre da menos para a mais arriscada." />
 
-                        <!-- Sem seleção -->
-                        <TextBlock x:Name="NoSelectionText"
-                                   Text="Selecione um banco na lista para ver os detalhes."
-                                   Foreground="{DynamicResource MutedTextBrush}" TextWrapping="Wrap" />
+                            <Grid Margin="0,0,0,12">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <Border Style="{StaticResource StepCircle}" Background="{DynamicResource PrimaryBrush}" VerticalAlignment="Top">
+                                    <TextBlock Text="1" Style="{StaticResource StepNumber}" Foreground="{DynamicResource CardBrush}" />
+                                </Border>
+                                <StackPanel Grid.Column="1" Margin="12,2,0,0">
+                                    <TextBlock Text="Diagnosticar" FontWeight="SemiBold" />
+                                    <TextBlock Style="{StaticResource HintText}" Text="Verificação completa, somente leitura: nada é alterado no banco." />
+                                </StackPanel>
+                            </Grid>
+                            <Grid Margin="0,0,0,12">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <Border Style="{StaticResource StepCircle}" Background="{DynamicResource PrimaryBrush}" VerticalAlignment="Top">
+                                    <TextBlock Text="2" Style="{StaticResource StepNumber}" Foreground="{DynamicResource CardBrush}" />
+                                </Border>
+                                <StackPanel Grid.Column="1" Margin="12,2,0,0">
+                                    <TextBlock Text="Resolver" FontWeight="SemiBold" />
+                                    <TextBlock Style="{StaticResource HintText}" Text="Aparecem só as opções que se aplicam ao que foi encontrado, em ordem de risco. As que podem perder dados exigem confirmação explícita." />
+                                </StackPanel>
+                            </Grid>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <Border Style="{StaticResource StepCircle}" Background="{DynamicResource PrimaryBrush}" VerticalAlignment="Top">
+                                    <TextBlock Text="3" Style="{StaticResource StepNumber}" Foreground="{DynamicResource CardBrush}" />
+                                </Border>
+                                <StackPanel Grid.Column="1" Margin="12,2,0,0">
+                                    <TextBlock Text="Conferir" FontWeight="SemiBold" />
+                                    <TextBlock Style="{StaticResource HintText}" Text="Depois de corrigir, diagnostique de novo para confirmar que o banco ficou íntegro." />
+                                </StackPanel>
+                            </Grid>
+                        </StackPanel>
+                    </Border>
 
-                        <!-- Detalhes: 2 colunas — diagnóstico à esquerda, resolução à direita (aproveita widescreen) -->
-                        <Grid x:Name="DetailsPanel" Visibility="Collapsed">
+                    <StackPanel x:Name="DetailsPanel" Visibility="Collapsed">
+
+                        <!-- ===== Banco selecionado + progresso do fluxo ===== -->
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Grid.Column="0">
+                                        <TextBlock x:Name="DbNameText" FontSize="20" FontWeight="Bold"
+                                                   Foreground="{DynamicResource PrimaryDarkBrush}" TextWrapping="Wrap" />
+                                        <Grid Margin="0,6,0,0">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+                                            <Border x:Name="StateBadge" CornerRadius="10" Padding="10,3" VerticalAlignment="Top"
+                                                    Background="{DynamicResource OkBackBrush}" ToolTip="Estado atual do banco no SQL Server">
+                                                <TextBlock x:Name="StateText" FontWeight="SemiBold" FontSize="12" Foreground="{DynamicResource OkForeBrush}" />
+                                            </Border>
+                                            <TextBlock x:Name="StateFriendlyText" Grid.Column="1" Margin="10,2,0,0" TextWrapping="Wrap"
+                                                       Foreground="{DynamicResource MutedTextBrush}" />
+                                        </Grid>
+                                        <TextBlock x:Name="RecommendedActionText" Style="{StaticResource HintText}" Margin="0,6,0,0" />
+                                    </StackPanel>
+
+                                    <!-- Indicador de passos -->
+                                    <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top" Margin="20,2,0,0">
+                                        <Border x:Name="Step1Circle" Style="{StaticResource StepCircle}">
+                                            <TextBlock x:Name="Step1Num" Text="1" Style="{StaticResource StepNumber}" />
+                                        </Border>
+                                        <TextBlock x:Name="Step1Label" Text="Diagnosticar" Margin="6,0,0,0" VerticalAlignment="Center" />
+                                        <Rectangle Width="22" Height="2" Margin="8,0" VerticalAlignment="Center" Fill="{DynamicResource LineBrush}" />
+                                        <Border x:Name="Step2Circle" Style="{StaticResource StepCircle}">
+                                            <TextBlock x:Name="Step2Num" Text="2" Style="{StaticResource StepNumber}" />
+                                        </Border>
+                                        <TextBlock x:Name="Step2Label" Text="Resolver" Margin="6,0,0,0" VerticalAlignment="Center" />
+                                        <Rectangle Width="22" Height="2" Margin="8,0" VerticalAlignment="Center" Fill="{DynamicResource LineBrush}" />
+                                        <Border x:Name="Step3Circle" Style="{StaticResource StepCircle}">
+                                            <TextBlock x:Name="Step3Num" Text="3" Style="{StaticResource StepNumber}" />
+                                        </Border>
+                                        <TextBlock x:Name="Step3Label" Text="Conferir" Margin="6,0,0,0" VerticalAlignment="Center" />
+                                    </StackPanel>
+                                </Grid>
+
+                                <!-- O que fazer agora (atualizado a cada etapa) -->
+                                <Border Background="{DynamicResource SelectionBrush}" CornerRadius="6" Padding="12,9" Margin="0,14,0,0">
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="PRÓXIMO PASSO" FontSize="11" FontWeight="Bold" VerticalAlignment="Center"
+                                                   Foreground="{DynamicResource PrimaryDarkBrush}" Margin="0,0,12,0" />
+                                        <TextBlock x:Name="FlowHintText" Grid.Column="1" TextWrapping="Wrap" VerticalAlignment="Center"
+                                                   Foreground="{DynamicResource TextBrush}" />
+                                    </Grid>
+                                </Border>
+
+                                <!-- Banco aparentemente saudável -->
+                                <Border x:Name="HealthyPanel" Visibility="Collapsed" Margin="0,10,0,0"
+                                        Background="{DynamicResource OkBackBrush}" BorderBrush="{DynamicResource OkForeBrush}"
+                                        BorderThickness="1" CornerRadius="6" Padding="12,9">
+                                    <TextBlock Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap"
+                                               Text="Banco ONLINE e aparentemente saudável. Corrupção física ou registros órfãos só aparecem numa verificação completa — use o Passo 1 para uma checagem profunda (CHECKDB + CHECKCONSTRAINTS + CHECKCATALOG)." />
+                                </Border>
+
+                                <!-- Banco de sistema -->
+                                <Border x:Name="SystemDbPanel" Visibility="Collapsed" Margin="0,10,0,0"
+                                        Background="{DynamicResource WarnBackBrush}" BorderBrush="{DynamicResource WarnLineBrush}"
+                                        BorderThickness="1" CornerRadius="6" Padding="12,9">
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="Banco de sistema: o reparo automático destrutivo não é permitido por esta ferramenta. Acione o DBA/suporte."
+                                                   Foreground="{DynamicResource WarnForeBrush}" TextWrapping="Wrap" VerticalAlignment="Center" />
+                                        <Button x:Name="RunbookButton" Grid.Column="1" Content="Ver procedimento manual"
+                                                Style="{StaticResource SecondaryButton}" Padding="12,6" FontSize="13" Margin="12,0,0,0"
+                                                Click="RunbookButton_Click" />
+                                    </Grid>
+                                </Border>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- ===== Resultado da última operação (fica no topo para ser visto) ===== -->
+                        <Border x:Name="ResultPanel" Visibility="Collapsed" Margin="0,12,0,0"
+                                BorderThickness="1" CornerRadius="8" Padding="16,10">
+                            <StackPanel>
+                                <TextBlock Text="RESULTADO DA ÚLTIMA OPERAÇÃO" Style="{StaticResource FieldLabel}" />
+                                <TextBlock x:Name="ResultText" TextWrapping="Wrap" FontWeight="SemiBold" />
+                            </StackPanel>
+                        </Border>
+
+                        <!-- ===== Passos 1 e 2 (lado a lado em telas largas; empilhados em telas estreitas) ===== -->
+                        <Grid Margin="0,12,0,0" SizeChanged="FlowGrid_SizeChanged">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="12" />
                                 <ColumnDefinition Width="*" />
                             </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
 
-                            <!-- Coluna esquerda: estado + diagnóstico (Passo 1) + resultado -->
-                            <StackPanel Grid.Column="0" VerticalAlignment="Top">
-                            <TextBlock x:Name="DbNameText" FontSize="18" FontWeight="Bold"
-                                       Foreground="{DynamicResource PrimaryDarkBrush}" TextWrapping="Wrap" />
-
-                            <TextBlock Text="ESTADO ATUAL" Style="{StaticResource FieldLabel}" Margin="0,14,0,4" />
-                            <Border x:Name="StateBadge" CornerRadius="4" Padding="8,4" HorizontalAlignment="Left"
-                                    Background="{DynamicResource OkBackBrush}">
-                                <TextBlock x:Name="StateText" FontWeight="SemiBold" Foreground="{DynamicResource OkForeBrush}" />
-                            </Border>
-                            <TextBlock x:Name="StateFriendlyText" Foreground="{DynamicResource MutedTextBrush}"
-                                       TextWrapping="Wrap" Margin="0,6,0,0" />
-
-                            <TextBlock Text="AÇÃO RECOMENDADA" Style="{StaticResource FieldLabel}" Margin="0,14,0,4" />
-                            <TextBlock x:Name="RecommendedActionText" TextWrapping="Wrap" />
-
-                            <!-- Banco saudável -->
-                            <Border x:Name="HealthyPanel" Visibility="Collapsed" Margin="0,16,0,0"
-                                    Background="{DynamicResource OkBackBrush}" BorderBrush="{DynamicResource OkForeBrush}"
-                                    BorderThickness="1" CornerRadius="6" Padding="12">
-                                <TextBlock Text="Este banco está ONLINE. O estado aparenta saúde, mas pode haver corrupção que só uma verificação completa revela — use 'Diagnosticar' abaixo para uma checagem profunda (CHECKDB + CHECKCONSTRAINTS + CHECKCATALOG)."
-                                           Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" />
-                            </Border>
-
-                            <!-- Banco de sistema -->
-                            <Border x:Name="SystemDbPanel" Visibility="Collapsed" Margin="0,16,0,0"
-                                    Background="{DynamicResource WarnBackBrush}" BorderBrush="{DynamicResource WarnLineBrush}"
-                                    BorderThickness="1" CornerRadius="6" Padding="12">
+                            <!-- ========== PASSO 1 — DIAGNOSTICAR ========== -->
+                            <Border x:Name="DiagnoseCard" Grid.Column="0" Style="{StaticResource Card}" VerticalAlignment="Top">
                                 <StackPanel>
-                                    <TextBlock Text="Banco de sistema: o reparo automático destrutivo não é permitido por esta ferramenta. Acione o DBA/suporte."
-                                               Foreground="{DynamicResource WarnForeBrush}" TextWrapping="Wrap" />
-                                    <Button x:Name="RunbookButton" Content="Ver procedimento manual recomendado"
-                                            Style="{StaticResource SecondaryButton}" Height="38" Margin="0,10,0,0"
-                                            Click="RunbookButton_Click" />
-                                </StackPanel>
-                            </Border>
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <Border Style="{StaticResource StepCircle}" Background="{DynamicResource PrimaryBrush}">
+                                            <TextBlock Text="1" Style="{StaticResource StepNumber}" Foreground="{DynamicResource CardBrush}" />
+                                        </Border>
+                                        <StackPanel Grid.Column="1" Margin="10,0,0,0">
+                                            <TextBlock Text="Diagnosticar" Style="{StaticResource SectionTitle}" />
+                                            <TextBlock Text="Somente leitura — não altera nada no banco." Style="{StaticResource HintText}" />
+                                        </StackPanel>
+                                    </Grid>
 
-                            <!-- Diagnóstico (somente leitura) — passo 1, ação principal -->
-                            <StackPanel x:Name="DiagnosePanel" Visibility="Collapsed" Margin="0,18,0,0">
-                                <TextBlock Text="PASSO 1 — DIAGNOSTICAR" Style="{StaticResource FieldLabel}" />
-                                <Button x:Name="DiagnoseButton" Content="🔍  Diagnosticar (sem alterar o banco)"
-                                        Style="{StaticResource FlatButton}" Height="48" FontSize="15" Click="DiagnoseButton_Click" />
-                                <CheckBox x:Name="PhysicalOnlyCheck" Content="Verificação rápida (PHYSICAL_ONLY) — para bancos muito grandes"
-                                          Margin="0,8,0,0" Foreground="{DynamicResource MutedTextBrush}" />
-                                <TextBlock Text="Verificação completa SEM alterar nada: DBCC CHECKDB com DATA_PURITY (consistência física e valores inválidos), CHECKCONSTRAINTS (chaves estrangeiras/CHECK), CHECKCATALOG (metadados), páginas suspeitas e log de erros. Detecta corrupção mesmo em bancos que parecem saudáveis (ONLINE). Se houver corrupção física, as checagens lógicas são adiadas até o reparo."
-                                           Foreground="{DynamicResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,8,0,0" />
-
-                                <!-- Verificações avançadas (dirigidas) -->
-                                <Expander x:Name="AdvancedChecksExpander" Header="Verificações avançadas" Margin="0,10,0,0"
-                                          Foreground="{DynamicResource MutedTextBrush}">
-                                    <StackPanel Margin="0,6,0,0">
-                                        <TextBlock Text="Verificação dirigida de UMA tabela (DBCC CHECKTABLE) — mais rápida que o CHECKDB completo."
-                                                   Foreground="{DynamicResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" />
-                                        <ComboBox x:Name="CheckTableCombo" Height="28" Margin="0,6,0,0" IsEditable="True"
-                                                  DropDownOpened="CheckTableCombo_DropDownOpened" />
-                                        <Button x:Name="CheckTableButton" Content="Verificar tabela (CHECKTABLE)"
-                                                Style="{StaticResource SecondaryButton}" Height="40" Margin="0,6,0,0"
-                                                Click="CheckTableButton_Click" />
-                                        <Button x:Name="ReseedButton" Content="Reajustar identidades (CHECKIDENT RESEED)"
-                                                Style="{StaticResource SecondaryButton}" Height="40" Margin="0,6,0,0"
-                                                Click="ReseedButton_Click" />
-                                        <TextBlock Text="O reajuste de identidade é útil após remoção de linhas (reparo com perda / salvamento)."
-                                                   Foreground="{DynamicResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,6,0,0" />
+                                    <StackPanel x:Name="DiagnosePanel" Visibility="Collapsed" Margin="0,14,0,0">
+                                        <Button x:Name="DiagnoseButton" Content="🔍  Diagnosticar (sem alterar o banco)"
+                                                Style="{StaticResource FlatButton}" MinHeight="46" FontSize="15" Click="DiagnoseButton_Click" />
+                                        <CheckBox x:Name="PhysicalOnlyCheck" Margin="0,10,0,0" Foreground="{DynamicResource TextBrush}"
+                                                  ToolTip="Checa só a estrutura física (PHYSICAL_ONLY). Mais rápido, porém menos completo.">
+                                            <TextBlock Text="Verificação rápida (PHYSICAL_ONLY) — para bancos muito grandes" TextWrapping="Wrap" />
+                                        </CheckBox>
+                                        <Expander Header="O que é verificado?" Margin="0,8,0,0" Foreground="{DynamicResource MutedTextBrush}" FontSize="12">
+                                            <TextBlock Style="{StaticResource HintText}" Margin="18,4,0,0"
+                                                       Text="DBCC CHECKDB com DATA_PURITY (consistência física e valores inválidos), CHECKCONSTRAINTS (chaves estrangeiras/CHECK), CHECKCATALOG (metadados), páginas suspeitas, log de erros, arquivos do banco, uso do log, topologia, espaço em disco e política de backup. Se houver corrupção física, as checagens lógicas são adiadas até o reparo." />
+                                        </Expander>
                                     </StackPanel>
-                                </Expander>
 
-                                <!-- Manutenção e ferramentas (preventivo + forense + agendamento) -->
-                                <Expander x:Name="ToolsExpander" Header="Manutenção e ferramentas" Margin="0,8,0,0"
-                                          Foreground="{DynamicResource MutedTextBrush}">
-                                    <StackPanel Margin="0,6,0,0">
-                                        <TextBlock Text="Manutenção preventiva: desfragmenta índices (REORGANIZE/REBUILD) e atualiza estatísticas."
-                                                   Foreground="{DynamicResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" />
-                                        <Button x:Name="MaintainButton" Content="Otimizar índices e estatísticas"
-                                                Style="{StaticResource SecondaryButton}" Height="40" Margin="0,6,0,0"
-                                                Click="MaintainButton_Click" />
-                                        <Button x:Name="ScheduleButton" Content="Configurar verificação agendada (gerar comando)"
-                                                Style="{StaticResource SecondaryButton}" Height="40" Margin="0,6,0,0"
-                                                Click="ScheduleButton_Click" />
-
-                                        <TextBlock Text="Recuperar de exclusão acidental: lista DELETE/DROP/TRUNCATE recentes no log. Prefira devolver só as linhas excluídas (o que foi feito depois é preservado); restaurar o banco inteiro até antes descarta tudo o que veio depois."
-                                                   Foreground="{DynamicResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,10,0,0" />
-                                        <Button x:Name="ForensicButton" Content="Procurar exclusões recentes no log"
-                                                Style="{StaticResource SecondaryButton}" Height="40" Margin="0,6,0,0"
-                                                Click="ForensicButton_Click" />
-                                        <ListBox x:Name="ForensicList" Height="92" Margin="0,6,0,0" Visibility="Collapsed"
-                                                 Background="{DynamicResource CardBrush}" DisplayMemberPath="Display"
-                                                 BorderBrush="{DynamicResource LineBrush}" BorderThickness="1" />
-                                        <Button x:Name="ForensicRecoverRowsButton" Content="Devolver só as linhas excluídas (não sobrescreve o banco)"
-                                                Style="{StaticResource FlatButton}" Height="38" Margin="0,6,0,0" Visibility="Collapsed"
-                                                Click="ForensicRecoverRowsButton_Click" />
-                                        <Button x:Name="ForensicRestoreButton" Content="Restaurar o banco inteiro até ANTES da transação"
-                                                Style="{StaticResource DangerButton}" Height="38" Margin="0,6,0,0" Visibility="Collapsed"
-                                                Click="ForensicRestoreButton_Click" />
-                                    </StackPanel>
-                                </Expander>
-                            </StackPanel>
-
-                            <!-- Resultado do diagnóstico (= ação recomendada destacada) -->
-                            <Border x:Name="DiagnosisResultPanel" Visibility="Collapsed" Margin="0,12,0,0"
-                                    BorderThickness="1" CornerRadius="6" Padding="12">
-                                <StackPanel>
-                                    <TextBlock Text="RESULTADO DO DIAGNÓSTICO" Style="{StaticResource FieldLabel}" />
-                                    <TextBlock x:Name="DiagnosisSummaryText" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,2,0,0" />
-                                    <TextBlock x:Name="RecoActionNameText" FontWeight="Bold" TextWrapping="Wrap" Margin="0,8,0,0" />
-                                    <TextBlock x:Name="DiagnosisRecoText" TextWrapping="Wrap" Margin="0,6,0,0" />
-
-                                    <!-- Novidades desde a última verificação (B5) -->
-                                    <Border x:Name="NoveltyPanel" Visibility="Collapsed" Margin="0,10,0,0"
-                                            Background="{DynamicResource WarnBackBrush}" BorderBrush="{DynamicResource WarnLineBrush}"
-                                            BorderThickness="1" CornerRadius="4" Padding="8">
+                                    <!-- Resultado do diagnóstico (cor = gravidade) -->
+                                    <Border x:Name="DiagnosisResultPanel" Visibility="Collapsed" Margin="0,14,0,0"
+                                            BorderThickness="1" CornerRadius="6" Padding="12">
                                         <StackPanel>
-                                            <TextBlock Text="⚠ NOVO desde a última verificação" FontWeight="Bold"
-                                                       Foreground="{DynamicResource WarnForeBrush}" FontSize="11" />
-                                            <ItemsControl x:Name="NoveltyList" Margin="0,4,0,0">
+                                            <TextBlock Text="RESULTADO DO DIAGNÓSTICO" Style="{StaticResource FieldLabel}" />
+                                            <TextBlock x:Name="DiagnosisSummaryText" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,2,0,0" />
+                                            <TextBlock x:Name="RecoActionNameText" FontWeight="Bold" TextWrapping="Wrap" Margin="0,8,0,0" />
+                                            <TextBlock x:Name="DiagnosisRecoText" TextWrapping="Wrap" Margin="0,6,0,0" />
+
+                                            <!-- Novidades desde a última verificação -->
+                                            <Border x:Name="NoveltyPanel" Visibility="Collapsed" Margin="0,10,0,0"
+                                                    Background="{DynamicResource WarnBackBrush}" BorderBrush="{DynamicResource WarnLineBrush}"
+                                                    BorderThickness="1" CornerRadius="4" Padding="8">
+                                                <StackPanel>
+                                                    <TextBlock Text="⚠ NOVO desde a última verificação" FontWeight="Bold"
+                                                               Foreground="{DynamicResource WarnForeBrush}" FontSize="11" />
+                                                    <ItemsControl x:Name="NoveltyList" Margin="0,4,0,0">
+                                                        <ItemsControl.ItemTemplate>
+                                                            <DataTemplate>
+                                                                <TextBlock Text="{Binding}" TextWrapping="Wrap" FontSize="11"
+                                                                           Foreground="{DynamicResource WarnForeBrush}" Margin="0,1,0,0" />
+                                                            </DataTemplate>
+                                                        </ItemsControl.ItemTemplate>
+                                                    </ItemsControl>
+                                                </StackPanel>
+                                            </Border>
+
+                                            <!-- Política de backup e saúde lógica -->
+                                            <TextBlock x:Name="PolicyHeader" Text="POLÍTICA DE BACKUP / SAÚDE LÓGICA" Style="{StaticResource FieldLabel}"
+                                                       Margin="0,12,0,0" Visibility="Collapsed" />
+                                            <ItemsControl x:Name="FindingsList" Margin="0,4,0,0">
                                                 <ItemsControl.ItemTemplate>
                                                     <DataTemplate>
-                                                        <TextBlock Text="{Binding}" TextWrapping="Wrap" FontSize="11"
-                                                                   Foreground="{DynamicResource WarnForeBrush}" Margin="0,1,0,0" />
+                                                        <TextBlock Text="{Binding Display}" TextWrapping="Wrap" FontSize="11" Margin="0,1,0,0"
+                                                                   Foreground="{DynamicResource MutedTextBrush}" />
                                                     </DataTemplate>
                                                 </ItemsControl.ItemTemplate>
                                             </ItemsControl>
                                         </StackPanel>
                                     </Border>
 
-                                    <!-- Política de backup (B3) e saúde lógica (B4) -->
-                                    <TextBlock x:Name="PolicyHeader" Text="POLÍTICA DE BACKUP / SAÚDE LÓGICA" Style="{StaticResource FieldLabel}"
-                                               Margin="0,12,0,0" Visibility="Collapsed" />
-                                    <ItemsControl x:Name="FindingsList" Margin="0,4,0,0">
-                                        <ItemsControl.ItemTemplate>
-                                            <DataTemplate>
-                                                <TextBlock Text="{Binding Display}" TextWrapping="Wrap" FontSize="11" Margin="0,1,0,0"
-                                                           Foreground="{DynamicResource MutedTextBrush}" />
-                                            </DataTemplate>
-                                        </ItemsControl.ItemTemplate>
-                                    </ItemsControl>
-                                </StackPanel>
-                            </Border>
-
-                            <!-- Aviso de topologia (espelhamento/AG/log shipping/replicação) -->
-                            <Border x:Name="TopologyWarnPanel" Visibility="Collapsed" Margin="0,12,0,0"
-                                    Background="{DynamicResource WarnBackBrush}" BorderBrush="{DynamicResource WarnLineBrush}"
-                                    BorderThickness="1" CornerRadius="6" Padding="12">
-                                <StackPanel>
-                                    <TextBlock Text="⚠ TOPOLOGIA DE ALTA DISPONIBILIDADE / REPLICAÇÃO"
-                                               FontWeight="Bold" Foreground="{DynamicResource WarnForeBrush}" TextWrapping="Wrap" />
-                                    <TextBlock x:Name="TopologyWarnText" Foreground="{DynamicResource WarnForeBrush}" TextWrapping="Wrap" Margin="0,6,0,0" />
-                                </StackPanel>
-                            </Border>
-
-                            </StackPanel>
-
-                            <!-- Coluna direita: como resolver (Passo 2) — reparo / restauração -->
-                            <StackPanel Grid.Column="1" VerticalAlignment="Top" Margin="24,0,0,0">
-                            <!-- Cabeçalho das opções de reparo (aparece só após o diagnóstico) -->
-                            <TextBlock x:Name="RepairOptionsTitle" Visibility="Collapsed" Text="PASSO 2 — COMO RESOLVER"
-                                       Style="{StaticResource FieldLabel}" Margin="0,0,0,0" />
-
-                            <!-- [PRIMÁRIO p/ corrupção só de índice] Reparo SEM perda: reconstrução de índices -->
-                            <Border x:Name="IndexRepairPanel" Visibility="Collapsed" Margin="0,8,0,0"
-                                    Background="{DynamicResource OkBackBrush}" BorderBrush="{DynamicResource OkForeBrush}"
-                                    BorderThickness="1" CornerRadius="6" Padding="12">
-                                <StackPanel>
-                                    <TextBlock Text="✔ REPARO SEM PERDA DE DADOS DISPONÍVEL" FontWeight="Bold"
-                                               Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" />
-                                    <TextBlock Text="A corrupção está restrita a índices não-clusterizados, que podem ser reconstruídos sem perder dados."
-                                               Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" Margin="0,6,0,0" />
-                                    <Button x:Name="RepairIndexesButton" Content="Reparar índices (sem perda de dados)"
-                                            Style="{StaticResource FlatButton}" Height="42" Margin="0,10,0,0"
-                                            Click="RepairIndexesButton_Click" />
-                                </StackPanel>
-                            </Border>
-
-                            <!-- [PRIMÁRIO p/ log cheio (9002)] Resolver sem perda de dados -->
-                            <Border x:Name="LogFullPanel" Visibility="Collapsed" Margin="0,8,0,0"
-                                    Background="{DynamicResource OkBackBrush}" BorderBrush="{DynamicResource OkForeBrush}"
-                                    BorderThickness="1" CornerRadius="6" Padding="12">
-                                <StackPanel>
-                                    <TextBlock Text="✔ LOG DE TRANSAÇÕES CHEIO — RESOLVÍVEL SEM PERDA DE DADOS" FontWeight="Bold"
-                                               Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" />
-                                    <TextBlock x:Name="LogFullText" Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" Margin="0,6,0,0"
-                                               Text="Não é corrupção. A ferramenta identifica o que segura o log e libera espaço: backup de log, crescimento do arquivo ou um arquivo de log extra em outro disco — e religa o banco." />
-                                    <Button x:Name="ResolveLogFullButton" Content="Resolver log cheio (sem perda de dados)"
-                                            Style="{StaticResource FlatButton}" Height="42" Margin="0,10,0,0"
-                                            Click="ResolveLogFullButton_Click" />
-                                </StackPanel>
-                            </Border>
-
-                            <!-- [PRIMÁRIO p/ arquivo ausente/sem permissão/preso] Corrigir acesso e religar -->
-                            <Border x:Name="FileAccessPanel" Visibility="Collapsed" Margin="0,8,0,0"
-                                    Background="{DynamicResource OkBackBrush}" BorderBrush="{DynamicResource OkForeBrush}"
-                                    BorderThickness="1" CornerRadius="6" Padding="12">
-                                <StackPanel>
-                                    <TextBlock Text="✔ ARQUIVOS INACESSÍVEIS — RESOLVÍVEL SEM PERDA DE DADOS" FontWeight="Bold"
-                                               Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" />
-                                    <TextBlock x:Name="FileAccessText" Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" Margin="0,6,0,0" />
-                                    <Button x:Name="LocateFileButton" Content="📁  Localizar arquivo ausente…"
-                                            Style="{StaticResource SecondaryButton}" Height="38" Margin="0,10,0,0"
-                                            Click="LocateFileButton_Click" />
-                                    <Button x:Name="FixFileAccessButton" Content="Corrigir acesso aos arquivos e religar"
-                                            Style="{StaticResource FlatButton}" Height="42" Margin="0,8,0,0"
-                                            Click="FixFileAccessButton_Click" />
-                                    <TextBlock Text="Conceder permissão exige executar a ferramenta como Administrador no próprio servidor; sem isso, os comandos para o suporte aparecem no registro."
-                                               Foreground="{DynamicResource OkForeBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,6,0,0" />
-                                </StackPanel>
-                            </Border>
-
-                            <!-- [PRIMÁRIO p/ corrupção LÓGICA] Corrigir integridade (remover registros órfãos) -->
-                            <Border x:Name="ConstraintFixPanel" Visibility="Collapsed" Margin="0,8,0,0"
-                                    Background="{DynamicResource WarnBackBrush}" BorderBrush="{DynamicResource WarnLineBrush}"
-                                    BorderThickness="1" CornerRadius="6" Padding="14">
-                                <StackPanel>
-                                    <TextBlock Text="⚠ INTEGRIDADE LÓGICA: REGISTROS ÓRFÃOS"
-                                               FontWeight="Bold" Foreground="{DynamicResource WarnForeBrush}" TextWrapping="Wrap" />
-                                    <TextBlock x:Name="ConstraintFixText" Margin="0,8,0,0" Foreground="{DynamicResource WarnForeBrush}" TextWrapping="Wrap"
-                                               Text="Há linhas cuja chave estrangeira aponta para um registro inexistente (o DBCC CHECKDB não detecta isso). A correção primeiro tenta recuperar o registro-pai do backup; o que sobrar é retirado da tabela e guardado na QUARENTENA (banco RestoreDB_Quarentena), de onde pode ser devolvido depois. Há backup de segurança antes." />
-                                    <StackPanel Margin="0,12,0,0">
-                                        <TextBlock Text="RECUPERAÇÃO DE REGISTROS-PAI (OPCIONAL)" Style="{StaticResource FieldLabel}" Foreground="{DynamicResource WarnForeBrush}" />
-                                        <StackPanel Orientation="Horizontal">
-                                            <Button x:Name="ChooseRecoveryBakFixButton" Content="📁 Escolher .bak…"
-                                                    Style="{StaticResource SecondaryButton}" Height="34" Click="ChooseRecoveryBackupButton_Click" />
-                                            <Button x:Name="ClearRecoveryBakFixButton" Content="↺ Automático"
-                                                    Style="{StaticResource SecondaryButton}" Height="34" Margin="8,0,0,0" Click="ClearRecoveryBackupButton_Click" />
+                                    <!-- Aviso de topologia (espelhamento/AG/log shipping/replicação) -->
+                                    <Border x:Name="TopologyWarnPanel" Visibility="Collapsed" Margin="0,12,0,0"
+                                            Background="{DynamicResource WarnBackBrush}" BorderBrush="{DynamicResource WarnLineBrush}"
+                                            BorderThickness="1" CornerRadius="6" Padding="12">
+                                        <StackPanel>
+                                            <TextBlock Text="⚠ TOPOLOGIA DE ALTA DISPONIBILIDADE / REPLICAÇÃO"
+                                                       FontWeight="Bold" Foreground="{DynamicResource WarnForeBrush}" TextWrapping="Wrap" />
+                                            <TextBlock x:Name="TopologyWarnText" Foreground="{DynamicResource WarnForeBrush}" TextWrapping="Wrap" Margin="0,6,0,0" />
                                         </StackPanel>
-                                        <TextBlock x:Name="RecoveryBakFixText" FontSize="11" TextWrapping="Wrap" Margin="0,6,0,0"
-                                                   Foreground="{DynamicResource WarnForeBrush}"
-                                                   Text="Automático: usa o backup FULL mais recente do histórico. Escolha um .bak se o backup estiver em outra mídia (o SQL Server precisa conseguir lê-lo)." />
-                                    </StackPanel>
-                                    <CheckBox x:Name="ConstraintFixConfirmCheck" Margin="0,12,0,0" Foreground="{DynamicResource WarnForeBrush}"
-                                              Content="Entendo e autorizo a remoção dos registros órfãos."
-                                              Checked="ConstraintFixConfirmCheck_Changed" Unchecked="ConstraintFixConfirmCheck_Changed" />
-                                    <Button x:Name="ConstraintFixButton" Content="Corrigir integridade (remover registros órfãos)"
-                                            Style="{StaticResource DangerButton}" Height="40" Margin="0,12,0,0"
-                                            IsEnabled="False" Click="ConstraintFixButton_Click" />
+                                    </Border>
                                 </StackPanel>
                             </Border>
 
-                            <!-- [PRIMÁRIO p/ OFFLINE/RESTORING/etc.] Reparo seguro -->
-                            <StackPanel x:Name="SafeRepairPanel" Visibility="Collapsed" Margin="0,8,0,0">
-                                <Button x:Name="SafeRepairButton" Content="Reparar (modo seguro, sem perda de dados)"
-                                        Style="{StaticResource FlatButton}" Height="40" Click="SafeRepairButton_Click" />
-                                <TextBlock Text="Tentaremos primeiro a abordagem mais segura: religar / recuperar e, se necessário, DBCC CHECKDB com REPAIR_REBUILD."
-                                           Foreground="{DynamicResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,8,0,0" />
-                            </StackPanel>
-
-                            <!-- Ver script planejado (dry-run) -->
-                            <Button x:Name="ViewScriptButton" Visibility="Collapsed" Content="Ver script planejado (não executa nada)"
-                                    Style="{StaticResource SecondaryButton}" Height="40" Margin="0,10,0,0"
-                                    Click="ViewScriptButton_Click" />
-
-                            <!-- [PRIMÁRIO p/ corrupção de DADOS] Restaurar de backup -->
-                            <StackPanel x:Name="RestorePanel" Visibility="Collapsed" Margin="0,18,0,0">
-                                <TextBlock Text="RESTAURAR DE BACKUP" Style="{StaticResource FieldLabel}" />
-                                <TextBlock Text="Caminho correto quando os arquivos de DADOS estão corrompidos: substitui o banco pelos dados íntegros de um backup."
-                                           Foreground="{DynamicResource MutedTextBrush}" FontSize="12" TextWrapping="Wrap" Margin="0,0,0,8" />
-                                <Button x:Name="ChooseBackupButton" Content="Escolher arquivo .bak..."
-                                        Style="{StaticResource SecondaryButton}" Height="42" Click="ChooseBackupButton_Click" />
-                                <TextBlock x:Name="BackupSourceText" Foreground="{DynamicResource MutedTextBrush}" FontSize="11"
-                                           TextWrapping="Wrap" Margin="0,6,0,0" />
-                                <ListBox x:Name="BackupSetsList" Height="120" Margin="0,8,0,0"
-                                         Background="{DynamicResource CardBrush}"
-                                         DisplayMemberPath="Display" BorderBrush="{DynamicResource LineBrush}" BorderThickness="1" />
-                                <CheckBox x:Name="RestoreReplaceCheck" Content="Substituir o banco existente (REPLACE)"
-                                          IsChecked="True" Margin="0,10,0,0" />
-                                <Button x:Name="RestoreButton" Content="Restaurar o backup selecionado"
-                                        Style="{StaticResource FlatButton}" Height="46" Margin="0,12,0,0"
-                                        Click="RestoreButton_Click" />
-                                <Button x:Name="RestoreChainButton" Content="Restaurar cadeia completa (mais recente)"
-                                        Style="{StaticResource FlatButton}" Height="46" Margin="0,8,0,0"
-                                        Click="RestoreChainButton_Click" />
-                                <TextBlock Text="A cadeia completa monta automaticamente FULL → diferencial → logs (com tail-log), validando a continuidade antes de executar."
-                                           Foreground="{DynamicResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,6,0,0" />
-
-                                <!-- Opções avançadas de restauração (progressive disclosure) -->
-                                <Expander Header="Mais opções de restauração (avançado)" Margin="0,14,0,0"
-                                          Foreground="{DynamicResource PrimaryDarkBrush}" FontWeight="SemiBold">
-                                    <StackPanel Margin="0,10,0,0">
-                                        <!-- Ponto-no-tempo (STOPAT) opcional para a cadeia e o STANDBY -->
-                                        <CheckBox x:Name="PointInTimeCheck" Content="Restaurar até um ponto no tempo (STOPAT)"
-                                                  Margin="0,0,0,2" Checked="PointInTimeCheck_Changed" Unchecked="PointInTimeCheck_Changed" />
-                                        <StackPanel x:Name="PointInTimeRow" Orientation="Horizontal" Visibility="Collapsed" Margin="0,4,0,8">
-                                            <DatePicker x:Name="StopAtDate" Width="150" />
-                                            <TextBox x:Name="StopAtTime" Width="96" Margin="6,0,0,0" Height="28" VerticalContentAlignment="Center"
-                                                     Text="23:59:59" ToolTip="Hora no formato HH:mm:ss"
-                                                     Background="{DynamicResource CardBrush}" Foreground="{DynamicResource TextBrush}"
-                                                     BorderBrush="{DynamicResource LineBrush}" />
+                            <!-- ========== PASSO 2 — RESOLVER ========== -->
+                            <Border x:Name="ResolveCard" Grid.Column="2" Style="{StaticResource Card}" VerticalAlignment="Top">
+                                <StackPanel>
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <Border Style="{StaticResource StepCircle}" Background="{DynamicResource PrimaryBrush}">
+                                            <TextBlock Text="2" Style="{StaticResource StepNumber}" Foreground="{DynamicResource CardBrush}" />
+                                        </Border>
+                                        <StackPanel Grid.Column="1" Margin="10,0,0,0">
+                                            <TextBlock Text="Resolver" Style="{StaticResource SectionTitle}" />
+                                            <TextBlock Text="Só as opções que se aplicam, da menos para a mais arriscada." Style="{StaticResource HintText}" />
                                         </StackPanel>
+                                    </Grid>
 
-                                        <Button x:Name="TestRestoreButton" Content="Testar backup (restauração de teste, não altera o banco)"
-                                                Style="{StaticResource SecondaryButton}" Height="40" Margin="0,2,0,0"
-                                                Click="TestRestoreButton_Click" />
-                                        <Button x:Name="VerifyBackupsButton" Content="Verificar saúde dos backups (VERIFYONLY)"
-                                                Style="{StaticResource SecondaryButton}" Height="40" Margin="0,6,0,0"
-                                                Click="VerifyBackupsButton_Click" />
-                                        <Button x:Name="RestoreCopyButton" Content="Recuperar para cópia (salvamento, não altera o original)"
-                                                Style="{StaticResource SecondaryButton}" Height="40" Margin="0,6,0,0"
-                                                Click="RestoreCopyButton_Click" />
-                                        <Button x:Name="RestoreStandbyButton" Content="Restaurar em STANDBY (somente leitura, para inspecionar)"
-                                                Style="{StaticResource SecondaryButton}" Height="40" Margin="0,6,0,0"
-                                                Click="RestoreStandbyButton_Click" />
-                                        <Button x:Name="FinalizeRecoveryButton" Content="Finalizar recuperação (sair do STANDBY)"
-                                                Style="{StaticResource SecondaryButton}" Height="40" Margin="0,6,0,0"
-                                                Click="FinalizeRecoveryButton_Click" />
+                                    <!-- Antes do diagnóstico (ou quando não há nada a fazer) -->
+                                    <Border x:Name="Step2LockedPanel" Margin="0,14,0,0" Background="{DynamicResource WindowBackBrush}"
+                                            BorderBrush="{DynamicResource LineBrush}" BorderThickness="1" CornerRadius="6" Padding="14,12">
+                                        <TextBlock x:Name="Step2LockedText" TextWrapping="Wrap" Foreground="{DynamicResource MutedTextBrush}"
+                                                   Text="🔒  As opções de correção aparecem aqui depois do diagnóstico." />
+                                    </Border>
 
-                                        <!-- Restauração apenas das páginas afetadas -->
-                                        <TextBlock Text="RESTAURAR APENAS AS PÁGINAS AFETADAS" Style="{StaticResource FieldLabel}" Margin="0,14,0,4" />
-                                        <TextBlock Text="Quando poucas páginas estão corrompidas, recupere só elas (preserva o resto). Exige modelo FULL/BULK e a cadeia de backups. Formato fileId:pageId separadas por vírgula."
-                                                   Foreground="{DynamicResource MutedTextBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,6" />
-                                        <TextBox x:Name="PagesBox" Height="30" VerticalContentAlignment="Center"
-                                                 Background="{DynamicResource CardBrush}" Foreground="{DynamicResource TextBrush}"
-                                                 BorderBrush="{DynamicResource LineBrush}" />
-                                        <Button x:Name="RestorePagesButton" Content="Restaurar apenas estas páginas"
-                                                Style="{StaticResource SecondaryButton}" Height="40" Margin="0,8,0,0"
-                                                Click="RestorePagesButton_Click" />
-                                    </StackPanel>
-                                </Expander>
-                            </StackPanel>
+                                    <!-- Legenda de risco (aparece junto com as opções) -->
+                                    <WrapPanel x:Name="RepairOptionsTitle" Visibility="Collapsed" Margin="0,12,0,0">
+                                        <TextBlock Text="Risco:" Style="{StaticResource HintText}" VerticalAlignment="Center" Margin="0,0,6,4" />
+                                        <Border Style="{StaticResource Chip}" Background="{DynamicResource OkForeBrush}" Margin="0,0,4,4">
+                                            <TextBlock Text="SEM PERDA" Style="{StaticResource ChipText}" />
+                                        </Border>
+                                        <TextBlock Text="→" Style="{StaticResource HintText}" VerticalAlignment="Center" Margin="0,0,4,4" />
+                                        <Border Style="{StaticResource Chip}" Background="{DynamicResource WarnLineBrush}" Margin="0,0,4,4">
+                                            <TextBlock Text="QUARENTENA" Style="{StaticResource ChipText}" />
+                                        </Border>
+                                        <TextBlock Text="→" Style="{StaticResource HintText}" VerticalAlignment="Center" Margin="0,0,4,4" />
+                                        <Border Style="{StaticResource Chip}" Background="{DynamicResource PrimaryBrush}" Margin="0,0,4,4">
+                                            <TextBlock Text="RESTAURA BACKUP" Style="{StaticResource ChipText}" />
+                                        </Border>
+                                        <TextBlock Text="→" Style="{StaticResource HintText}" VerticalAlignment="Center" Margin="0,0,4,4" />
+                                        <Border Style="{StaticResource Chip}" Background="{DynamicResource DangerBrush}" Margin="0,0,0,4">
+                                            <TextBlock Text="PODE PERDER DADOS" Style="{StaticResource ChipText}" />
+                                        </Border>
+                                    </WrapPanel>
 
-                            <!-- Assistente de salvamento: copiar dados da cópia recuperada de volta ao banco vivo -->
-                            <Border x:Name="SalvagePanel" Visibility="Collapsed" Margin="0,16,0,0"
-                                    Background="{DynamicResource OkBackBrush}" BorderBrush="{DynamicResource OkForeBrush}"
-                                    BorderThickness="1" CornerRadius="6" Padding="12">
-                                <StackPanel>
-                                    <TextBlock Text="ASSISTENTE DE SALVAMENTO" Style="{StaticResource FieldLabel}" />
-                                    <TextBlock x:Name="SalvageHintText" TextWrapping="Wrap" FontSize="11" Margin="0,2,0,8"
-                                               Foreground="{DynamicResource OkForeBrush}"
-                                               Text="Cópia recuperada disponível. Selecione uma tabela e traga de volta ao banco vivo as linhas que faltam (por chave primária, sem duplicar)." />
-                                    <ComboBox x:Name="SalvageTableCombo" Height="28" />
-                                    <Button x:Name="SalvageButton" Content="Copiar linhas faltantes desta tabela"
-                                            Style="{StaticResource FlatButton}" Height="40" Margin="0,8,0,0"
-                                            Click="SalvageButton_Click" />
-                                </StackPanel>
-                            </Border>
-
-                            <!-- Reparo com perda de dados (confirmação) -->
-                            <Border x:Name="DataLossPanel" Visibility="Collapsed" Margin="0,18,0,0"
-                                    Background="{DynamicResource ProblemBackBrush}" BorderBrush="{DynamicResource DangerBrush}"
-                                    BorderThickness="1" CornerRadius="6" Padding="14">
-                                <StackPanel>
-                                    <TextBlock Text="⚠ ATENÇÃO: REPARO COM POSSÍVEL PERDA DE DADOS"
-                                               FontWeight="Bold" Foreground="{DynamicResource DangerDarkBrush}" TextWrapping="Wrap" />
-                                    <TextBlock Margin="0,8,0,0" Foreground="{DynamicResource DangerDarkBrush}" TextWrapping="Wrap"
-                                               Text="O reparo seguro não foi suficiente. A próxima etapa usa DBCC CHECKDB com REPAIR_ALLOW_DATA_LOSS, que pode DESCARTAR dados corrompidos para tornar o banco consistente. Antes de executar, a ferramenta preserva automaticamente o que for possível: as transações mais recentes (tail-log) e um backup de segurança — se houver cadeia de backups, os dados descartados podem ser recuperados depois. Ao final, um backup FULL novo é criado (a cadeia antiga deixa de valer). Se existir backup íntegro, RESTAURAR (abaixo) preserva 100% dos dados." />
-                                    <Button x:Name="SimulateRepairButton" Content="🔬  Simular antes (pré-visualizar a perda, sem tocar no banco)"
-                                            Style="{StaticResource SecondaryButton}" Height="42" Margin="0,12,0,0"
-                                            Click="SimulateRepairButton_Click" />
-                                    <TextBlock x:Name="SimulateResultText" Visibility="Collapsed" Margin="0,8,0,0" FontWeight="SemiBold"
-                                               Foreground="{DynamicResource DangerDarkBrush}" TextWrapping="Wrap" />
-                                    <StackPanel Margin="0,12,0,0">
-                                        <TextBlock Text="RECUPERAÇÃO DE REGISTROS-PAI (OPCIONAL)" Style="{StaticResource FieldLabel}" Foreground="{DynamicResource DangerDarkBrush}" />
-                                        <StackPanel Orientation="Horizontal">
-                                            <Button x:Name="ChooseRecoveryBakLossButton" Content="📁 Escolher .bak…"
-                                                    Style="{StaticResource SecondaryButton}" Height="34" Click="ChooseRecoveryBackupButton_Click" />
-                                            <Button x:Name="ClearRecoveryBakLossButton" Content="↺ Automático"
-                                                    Style="{StaticResource SecondaryButton}" Height="34" Margin="8,0,0,0" Click="ClearRecoveryBackupButton_Click" />
+                                    <!-- [SEM PERDA] Acesso travado (SINGLE_USER/RESTRICTED_USER) -->
+                                    <Border x:Name="AccessPanel" Visibility="Collapsed" Style="{StaticResource OptionCard}"
+                                            Background="{DynamicResource OkBackBrush}" BorderBrush="{DynamicResource OkForeBrush}">
+                                        <StackPanel>
+                                            <Border Style="{StaticResource Chip}" Background="{DynamicResource OkForeBrush}">
+                                                <TextBlock Text="SEM PERDA DE DADOS" Style="{StaticResource ChipText}" />
+                                            </Border>
+                                            <TextBlock Text="Acesso ao banco travado" Style="{StaticResource OptionTitle}" Foreground="{DynamicResource OkForeBrush}" />
+                                            <TextBlock x:Name="AccessText" Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" Margin="0,4,0,0" />
+                                            <CheckBox x:Name="AccessDisconnectCheck" IsChecked="True" Margin="0,10,0,0" Foreground="{DynamicResource OkForeBrush}">
+                                                <TextBlock TextWrapping="Wrap" Foreground="{DynamicResource OkForeBrush}"
+                                                           Text="Desconectar as sessões presas, se preciso (o que elas não tinham gravado é desfeito pelo SQL Server; dados já gravados ficam)." />
+                                            </CheckBox>
+                                            <Button x:Name="ReleaseAccessButton" Content="Liberar acesso (voltar ao modo normal)"
+                                                    Style="{StaticResource FlatButton}" MinHeight="42" Margin="0,10,0,0"
+                                                    Click="ReleaseAccessButton_Click" />
                                         </StackPanel>
-                                        <TextBlock x:Name="RecoveryBakLossText" FontSize="11" TextWrapping="Wrap" Margin="0,6,0,0"
-                                                   Foreground="{DynamicResource DangerDarkBrush}"
-                                                   Text="Automático: usa o backup FULL mais recente do histórico. Escolha um .bak se o backup estiver em outra mídia (o SQL Server precisa conseguir lê-lo)." />
-                                    </StackPanel>
-                                    <CheckBox x:Name="RecoverLostRowsCheck" Margin="0,12,0,0" IsChecked="True" Foreground="{DynamicResource DangerDarkBrush}">
-                                        <TextBlock TextWrapping="Wrap" Foreground="{DynamicResource DangerDarkBrush}"
-                                                   Text="Devolver automaticamente, a partir dos backups, as linhas que o reparo descartar (recomendado — só age quando a cadeia de backups chega até o instante do reparo)." />
-                                    </CheckBox>
-                                    <CheckBox x:Name="DataLossConfirmCheck" Margin="0,12,0,0" Foreground="{DynamicResource DangerDarkBrush}"
-                                              Content="Estou ciente e autorizo o reparo com possível perda de dados."
-                                              Checked="DataLossConfirmCheck_Changed" Unchecked="DataLossConfirmCheck_Changed" />
-                                    <Button x:Name="DataLossRepairButton" Content="Executar reparo COM perda de dados"
-                                            Style="{StaticResource DangerButton}" Height="42" Margin="0,12,0,0"
-                                            IsEnabled="False" Click="DataLossRepairButton_Click" />
+                                    </Border>
+
+                                    <!-- [SEM PERDA] Corrupção só em índices não-clusterizados -->
+                                    <Border x:Name="IndexRepairPanel" Visibility="Collapsed" Style="{StaticResource OptionCard}"
+                                            Background="{DynamicResource OkBackBrush}" BorderBrush="{DynamicResource OkForeBrush}">
+                                        <StackPanel>
+                                            <Border Style="{StaticResource Chip}" Background="{DynamicResource OkForeBrush}">
+                                                <TextBlock Text="SEM PERDA DE DADOS" Style="{StaticResource ChipText}" />
+                                            </Border>
+                                            <TextBlock Text="Reconstruir índices" Style="{StaticResource OptionTitle}" Foreground="{DynamicResource OkForeBrush}" />
+                                            <TextBlock Text="A corrupção está restrita a índices não-clusterizados, que podem ser reconstruídos sem perder dados."
+                                                       Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" Margin="0,4,0,0" />
+                                            <Button x:Name="RepairIndexesButton" Content="Reparar índices (sem perda de dados)"
+                                                    Style="{StaticResource FlatButton}" MinHeight="42" Margin="0,10,0,0"
+                                                    Click="RepairIndexesButton_Click" />
+                                        </StackPanel>
+                                    </Border>
+
+                                    <!-- [SEM PERDA] Log de transações cheio (9002) -->
+                                    <Border x:Name="LogFullPanel" Visibility="Collapsed" Style="{StaticResource OptionCard}"
+                                            Background="{DynamicResource OkBackBrush}" BorderBrush="{DynamicResource OkForeBrush}">
+                                        <StackPanel>
+                                            <Border Style="{StaticResource Chip}" Background="{DynamicResource OkForeBrush}">
+                                                <TextBlock Text="SEM PERDA DE DADOS" Style="{StaticResource ChipText}" />
+                                            </Border>
+                                            <TextBlock Text="Log de transações cheio" Style="{StaticResource OptionTitle}" Foreground="{DynamicResource OkForeBrush}" />
+                                            <TextBlock x:Name="LogFullText" Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" Margin="0,4,0,0"
+                                                       Text="Não é corrupção. A ferramenta identifica o que segura o log e libera espaço: backup de log, crescimento do arquivo ou um arquivo de log extra em outro disco — e religa o banco." />
+                                            <Button x:Name="ResolveLogFullButton" Content="Resolver log cheio (sem perda de dados)"
+                                                    Style="{StaticResource FlatButton}" MinHeight="42" Margin="0,10,0,0"
+                                                    Click="ResolveLogFullButton_Click" />
+                                        </StackPanel>
+                                    </Border>
+
+                                    <!-- [SEM PERDA] Arquivo ausente / sem permissão / preso -->
+                                    <Border x:Name="FileAccessPanel" Visibility="Collapsed" Style="{StaticResource OptionCard}"
+                                            Background="{DynamicResource OkBackBrush}" BorderBrush="{DynamicResource OkForeBrush}">
+                                        <StackPanel>
+                                            <Border Style="{StaticResource Chip}" Background="{DynamicResource OkForeBrush}">
+                                                <TextBlock Text="SEM PERDA DE DADOS" Style="{StaticResource ChipText}" />
+                                            </Border>
+                                            <TextBlock Text="Arquivos do banco inacessíveis" Style="{StaticResource OptionTitle}" Foreground="{DynamicResource OkForeBrush}" />
+                                            <TextBlock x:Name="FileAccessText" Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" Margin="0,4,0,0" />
+                                            <Button x:Name="LocateFileButton" Content="📁  Localizar arquivo ausente…"
+                                                    Style="{StaticResource SecondaryButton}" MinHeight="38" Margin="0,10,0,0"
+                                                    Click="LocateFileButton_Click" />
+                                            <Button x:Name="FixFileAccessButton" Content="Corrigir acesso aos arquivos e religar"
+                                                    Style="{StaticResource FlatButton}" MinHeight="42" Margin="0,8,0,0"
+                                                    Click="FixFileAccessButton_Click" />
+                                            <TextBlock Text="Conceder permissão exige executar a ferramenta como Administrador no próprio servidor; sem isso, os comandos para o suporte aparecem no registro."
+                                                       Foreground="{DynamicResource OkForeBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,6,0,0" />
+                                        </StackPanel>
+                                    </Border>
+
+                                    <!-- [SEM PERDA] Reparo no modo seguro (religar / REPAIR_REBUILD) -->
+                                    <Border x:Name="SafeRepairPanel" Visibility="Collapsed" Style="{StaticResource OptionCard}"
+                                            Background="{DynamicResource OkBackBrush}" BorderBrush="{DynamicResource OkForeBrush}">
+                                        <StackPanel>
+                                            <Border Style="{StaticResource Chip}" Background="{DynamicResource OkForeBrush}">
+                                                <TextBlock Text="SEM PERDA DE DADOS" Style="{StaticResource ChipText}" />
+                                            </Border>
+                                            <TextBlock Text="Reparo no modo seguro" Style="{StaticResource OptionTitle}" Foreground="{DynamicResource OkForeBrush}" />
+                                            <TextBlock Text="Tenta primeiro a abordagem mais segura: religar / recuperar e, se necessário, DBCC CHECKDB com REPAIR_REBUILD. Se não for suficiente, a ferramenta avisa antes de qualquer passo com perda."
+                                                       Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" Margin="0,4,0,0" />
+                                            <Button x:Name="SafeRepairButton" Content="Reparar (modo seguro, sem perda de dados)"
+                                                    Style="{StaticResource FlatButton}" MinHeight="42" Margin="0,10,0,0" Click="SafeRepairButton_Click" />
+                                            <Button x:Name="ViewScriptButton" Visibility="Collapsed" Content="Ver script planejado (não executa nada)"
+                                                    Style="{StaticResource SecondaryButton}" MinHeight="36" Margin="0,8,0,0"
+                                                    Click="ViewScriptButton_Click" />
+                                        </StackPanel>
+                                    </Border>
+
+                                    <!-- [SEM PERDA] Ajustes recomendados (configuração / metadados) -->
+                                    <Border x:Name="AdjustmentsPanel" Visibility="Collapsed" Style="{StaticResource OptionCard}"
+                                            Background="{DynamicResource CardBrush}" BorderBrush="{DynamicResource OkForeBrush}">
+                                        <StackPanel>
+                                            <Border Style="{StaticResource Chip}" Background="{DynamicResource OkForeBrush}">
+                                                <TextBlock Text="SEM PERDA DE DADOS · AJUSTES" Style="{StaticResource ChipText}" />
+                                            </Border>
+                                            <TextBlock Text="Ajustes recomendados" Style="{StaticResource OptionTitle}" Foreground="{DynamicResource PrimaryDarkBrush}" />
+                                            <TextBlock Style="{StaticResource HintText}" FontSize="12" Margin="0,4,0,8"
+                                                       Text="Configurações que causam lentidão, travamentos ou escondem corrupção. Nenhum ajuste altera os dados; marque os que deseja aplicar." />
+                                            <ItemsControl x:Name="AdjustmentsList">
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate>
+                                                        <Border BorderBrush="{DynamicResource LineBrush}" BorderThickness="0,1,0,0" Padding="0,8,0,6">
+                                                            <Grid>
+                                                                <Grid.ColumnDefinitions>
+                                                                    <ColumnDefinition Width="Auto" />
+                                                                    <ColumnDefinition Width="*" />
+                                                                </Grid.ColumnDefinitions>
+                                                                <CheckBox IsChecked="{Binding IsSelected, Mode=TwoWay}" IsEnabled="{Binding CanFix}"
+                                                                          Visibility="{Binding CanFix, Converter={StaticResource BoolToVis}}"
+                                                                          VerticalAlignment="Top" Margin="0,2,8,0" />
+                                                                <TextBlock Text="ℹ" Foreground="{DynamicResource MutedTextBrush}" Margin="2,0,10,0"
+                                                                           Visibility="{Binding IsInfoOnly, Converter={StaticResource BoolToVis}}" />
+                                                                <StackPanel Grid.Column="1">
+                                                                    <TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextWrapping="Wrap"
+                                                                               Foreground="{DynamicResource TextBrush}" />
+                                                                    <TextBlock Text="{Binding Detail}" Style="{StaticResource HintText}" Margin="0,2,0,0" />
+                                                                    <TextBlock Text="{Binding ItemsText}" Style="{StaticResource HintText}" FontFamily="Consolas" FontSize="11"
+                                                                               Margin="0,3,0,0" Visibility="{Binding HasItems, Converter={StaticResource BoolToVis}}" />
+                                                                    <TextBlock Text="{Binding FixText}" FontSize="11.5" Margin="0,3,0,0"
+                                                                               Foreground="{DynamicResource OkForeBrush}" />
+                                                                </StackPanel>
+                                                            </Grid>
+                                                        </Border>
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+                                            <Button x:Name="ApplyAdjustmentsButton" Content="Aplicar os ajustes selecionados"
+                                                    Style="{StaticResource FlatButton}" MinHeight="40" Margin="0,10,0,0"
+                                                    Click="ApplyAdjustmentsButton_Click" />
+                                        </StackPanel>
+                                    </Border>
+
+                                    <!-- [QUARENTENA] Integridade lógica: registros órfãos -->
+                                    <Border x:Name="ConstraintFixPanel" Visibility="Collapsed" Style="{StaticResource OptionCard}"
+                                            Background="{DynamicResource WarnBackBrush}" BorderBrush="{DynamicResource WarnLineBrush}">
+                                        <StackPanel>
+                                            <Border Style="{StaticResource Chip}" Background="{DynamicResource WarnLineBrush}">
+                                                <TextBlock Text="MOVE REGISTROS PARA A QUARENTENA" Style="{StaticResource ChipText}" />
+                                            </Border>
+                                            <TextBlock Text="Integridade lógica: registros órfãos" Style="{StaticResource OptionTitle}" Foreground="{DynamicResource WarnForeBrush}" />
+                                            <TextBlock x:Name="ConstraintFixText" Margin="0,4,0,0" Foreground="{DynamicResource WarnForeBrush}" TextWrapping="Wrap"
+                                                       Text="Há linhas cuja chave estrangeira aponta para um registro inexistente (o DBCC CHECKDB não detecta isso). A correção primeiro tenta recuperar o registro-pai do backup; o que sobrar é retirado da tabela e guardado na QUARENTENA (banco RestoreDB_Quarentena), de onde pode ser devolvido depois. Há backup de segurança antes." />
+                                            <TextBlock Text="BACKUP PARA RECUPERAR REGISTROS-PAI (OPCIONAL)" Style="{StaticResource FieldLabel}"
+                                                       Foreground="{DynamicResource WarnForeBrush}" Margin="0,12,0,4" />
+                                            <StackPanel Orientation="Horizontal">
+                                                <Button x:Name="ChooseRecoveryBakFixButton" Content="📁 Escolher .bak…"
+                                                        Style="{StaticResource SecondaryButton}" Padding="12,6" FontSize="13" Click="ChooseRecoveryBackupButton_Click" />
+                                                <Button x:Name="ClearRecoveryBakFixButton" Content="↺ Automático"
+                                                        Style="{StaticResource SecondaryButton}" Padding="12,6" FontSize="13" Margin="8,0,0,0" Click="ClearRecoveryBackupButton_Click" />
+                                            </StackPanel>
+                                            <TextBlock x:Name="RecoveryBakFixText" FontSize="11" TextWrapping="Wrap" Margin="0,6,0,0"
+                                                       Foreground="{DynamicResource WarnForeBrush}"
+                                                       Text="Automático: usa o backup FULL mais recente do histórico. Escolha um .bak se o backup estiver em outra mídia (o SQL Server precisa conseguir lê-lo)." />
+                                            <CheckBox x:Name="ConstraintFixConfirmCheck" Margin="0,12,0,0" Foreground="{DynamicResource WarnForeBrush}"
+                                                      Content="Entendo e autorizo a remoção dos registros órfãos."
+                                                      Checked="ConstraintFixConfirmCheck_Changed" Unchecked="ConstraintFixConfirmCheck_Changed" />
+                                            <Button x:Name="ConstraintFixButton" Content="Corrigir integridade (remover registros órfãos)"
+                                                    Style="{StaticResource DangerButton}" MinHeight="40" Margin="0,10,0,0"
+                                                    IsEnabled="False" Click="ConstraintFixButton_Click" />
+                                        </StackPanel>
+                                    </Border>
+
+                                    <!-- [RESTAURA BACKUP] Restaurar de backup -->
+                                    <Border x:Name="RestorePanel" Visibility="Collapsed" Style="{StaticResource OptionCard}"
+                                            Background="{DynamicResource CardBrush}" BorderBrush="{DynamicResource PrimaryBrush}">
+                                        <StackPanel>
+                                            <Border Style="{StaticResource Chip}" Background="{DynamicResource PrimaryBrush}">
+                                                <TextBlock Text="RESTAURA DO BACKUP — SUBSTITUI O BANCO" Style="{StaticResource ChipText}" />
+                                            </Border>
+                                            <TextBlock Text="Restaurar de backup" Style="{StaticResource OptionTitle}" Foreground="{DynamicResource PrimaryDarkBrush}" />
+                                            <TextBlock Text="Caminho correto quando os arquivos de DADOS estão corrompidos: substitui o banco pelos dados íntegros de um backup."
+                                                       Style="{StaticResource HintText}" FontSize="12" Margin="0,4,0,0" />
+
+                                            <!-- Caminho recomendado: cadeia automática -->
+                                            <Button x:Name="RestoreChainButton" Content="Restaurar cadeia completa (mais recente)"
+                                                    Style="{StaticResource FlatButton}" MinHeight="44" Margin="0,12,0,0"
+                                                    Click="RestoreChainButton_Click" />
+                                            <TextBlock Text="Recomendado: monta FULL → diferencial → logs (com tail-log) e valida a continuidade antes de executar."
+                                                       Style="{StaticResource HintText}" Margin="0,6,0,0" />
+
+                                            <!-- Alternativa: escolher um backup específico -->
+                                            <TextBlock Text="OU ESCOLHA UM BACKUP ESPECÍFICO" Style="{StaticResource FieldLabel}" Margin="0,16,0,6" />
+                                            <Button x:Name="ChooseBackupButton" Content="📁  Escolher arquivo .bak..."
+                                                    Style="{StaticResource SecondaryButton}" MinHeight="38" Click="ChooseBackupButton_Click" />
+                                            <TextBlock x:Name="BackupSourceText" Style="{StaticResource HintText}" Margin="0,6,0,0" />
+                                            <ListBox x:Name="BackupSetsList" Height="110" Margin="0,6,0,0"
+                                                     Background="{DynamicResource CardBrush}"
+                                                     DisplayMemberPath="Display" BorderBrush="{DynamicResource LineBrush}" BorderThickness="1" />
+                                            <CheckBox x:Name="RestoreReplaceCheck" Content="Substituir o banco existente (REPLACE)"
+                                                      Foreground="{DynamicResource TextBrush}" IsChecked="True" Margin="0,8,0,0" />
+                                            <Button x:Name="RestoreButton" Content="Restaurar o backup selecionado"
+                                                    Style="{StaticResource SecondaryButton}" MinHeight="40" Margin="0,8,0,0"
+                                                    Click="RestoreButton_Click" />
+
+                                            <!-- Opções avançadas de restauração -->
+                                            <Expander Header="Mais opções de restauração (avançado)" Margin="0,14,0,0"
+                                                      Foreground="{DynamicResource PrimaryDarkBrush}" FontWeight="SemiBold">
+                                                <StackPanel Margin="0,8,0,0" TextElement.FontWeight="Normal">
+                                                    <TextBlock Text="SEM ALTERAR O BANCO" Style="{StaticResource FieldLabel}" Margin="0,0,0,4" />
+                                                    <Button x:Name="TestRestoreButton" Content="Testar backup selecionado (restauração de teste)"
+                                                            Style="{StaticResource SecondaryButton}" MinHeight="38"
+                                                            Click="TestRestoreButton_Click" />
+                                                    <Button x:Name="VerifyBackupsButton" Content="Verificar saúde dos backups (VERIFYONLY)"
+                                                            Style="{StaticResource SecondaryButton}" MinHeight="38" Margin="0,6,0,0"
+                                                            Click="VerifyBackupsButton_Click" />
+                                                    <Button x:Name="RestoreCopyButton" Content="Recuperar para cópia (salvamento, não altera o original)"
+                                                            Style="{StaticResource SecondaryButton}" MinHeight="38" Margin="0,6,0,0"
+                                                            Click="RestoreCopyButton_Click" />
+
+                                                    <TextBlock Text="PONTO NO TEMPO / INSPEÇÃO" Style="{StaticResource FieldLabel}" Margin="0,14,0,4" />
+                                                    <CheckBox x:Name="PointInTimeCheck" Content="Restaurar até um ponto no tempo (STOPAT)"
+                                                              Foreground="{DynamicResource TextBrush}"
+                                                              Checked="PointInTimeCheck_Changed" Unchecked="PointInTimeCheck_Changed" />
+                                                    <StackPanel x:Name="PointInTimeRow" Orientation="Horizontal" Visibility="Collapsed" Margin="0,6,0,0">
+                                                        <DatePicker x:Name="StopAtDate" Width="150" />
+                                                        <TextBox x:Name="StopAtTime" Width="96" Margin="6,0,0,0" Height="28" Padding="6,2" FontSize="13"
+                                                                 VerticalContentAlignment="Center" Text="23:59:59" ToolTip="Hora no formato HH:mm:ss" />
+                                                    </StackPanel>
+                                                    <TextBlock Text="Vale para a cadeia completa e para o STANDBY." Style="{StaticResource HintText}" Margin="0,4,0,0" />
+                                                    <Button x:Name="RestoreStandbyButton" Content="Restaurar em STANDBY (somente leitura, para inspecionar)"
+                                                            Style="{StaticResource SecondaryButton}" MinHeight="38" Margin="0,8,0,0"
+                                                            Click="RestoreStandbyButton_Click" />
+                                                    <Button x:Name="FinalizeRecoveryButton" Content="Finalizar recuperação (sair do STANDBY)"
+                                                            Style="{StaticResource SecondaryButton}" MinHeight="38" Margin="0,6,0,0"
+                                                            Click="FinalizeRecoveryButton_Click" />
+
+                                                    <TextBlock Text="SÓ AS PÁGINAS AFETADAS" Style="{StaticResource FieldLabel}" Margin="0,14,0,4" />
+                                                    <TextBlock Text="Quando poucas páginas estão corrompidas, recupere só elas (preserva o resto). Exige modelo FULL/BULK e a cadeia de backups. Formato fileId:pageId separadas por vírgula."
+                                                               Style="{StaticResource HintText}" Margin="0,0,0,6" />
+                                                    <TextBox x:Name="PagesBox" Height="30" FontSize="13" Padding="6,2" VerticalContentAlignment="Center" />
+                                                    <Button x:Name="RestorePagesButton" Content="Restaurar apenas estas páginas"
+                                                            Style="{StaticResource SecondaryButton}" MinHeight="38" Margin="0,8,0,0"
+                                                            Click="RestorePagesButton_Click" />
+                                                </StackPanel>
+                                            </Expander>
+                                        </StackPanel>
+                                    </Border>
+
+                                    <!-- Assistente de salvamento: cópia recuperada → banco vivo -->
+                                    <Border x:Name="SalvagePanel" Visibility="Collapsed" Style="{StaticResource OptionCard}"
+                                            Background="{DynamicResource OkBackBrush}" BorderBrush="{DynamicResource OkForeBrush}">
+                                        <StackPanel>
+                                            <Border Style="{StaticResource Chip}" Background="{DynamicResource OkForeBrush}">
+                                                <TextBlock Text="SEM PERDA DE DADOS" Style="{StaticResource ChipText}" />
+                                            </Border>
+                                            <TextBlock Text="Assistente de salvamento" Style="{StaticResource OptionTitle}" Foreground="{DynamicResource OkForeBrush}" />
+                                            <TextBlock x:Name="SalvageHintText" TextWrapping="Wrap" FontSize="11.5" Margin="0,4,0,8"
+                                                       Foreground="{DynamicResource OkForeBrush}"
+                                                       Text="Cópia recuperada disponível. Selecione uma tabela e traga de volta ao banco vivo as linhas que faltam (por chave primária, sem duplicar)." />
+                                            <ComboBox x:Name="SalvageTableCombo" Height="32" />
+                                            <Button x:Name="SalvageButton" Content="Copiar linhas faltantes desta tabela"
+                                                    Style="{StaticResource FlatButton}" MinHeight="40" Margin="0,8,0,0"
+                                                    Click="SalvageButton_Click" />
+                                        </StackPanel>
+                                    </Border>
+
+                                    <!-- [PODE PERDER DADOS] Reparo com perda (exige confirmação) -->
+                                    <Border x:Name="DataLossPanel" Visibility="Collapsed" Style="{StaticResource OptionCard}"
+                                            Background="{DynamicResource ProblemBackBrush}" BorderBrush="{DynamicResource DangerBrush}">
+                                        <StackPanel>
+                                            <Border Style="{StaticResource Chip}" Background="{DynamicResource DangerBrush}">
+                                                <TextBlock Text="PODE PERDER DADOS" Style="{StaticResource ChipText}" />
+                                            </Border>
+                                            <TextBlock Text="Reparo com possível perda de dados" Style="{StaticResource OptionTitle}" Foreground="{DynamicResource DangerDarkBrush}" />
+                                            <TextBlock Margin="0,4,0,0" Foreground="{DynamicResource DangerDarkBrush}" TextWrapping="Wrap"
+                                                       Text="O reparo seguro não foi suficiente. A próxima etapa usa DBCC CHECKDB com REPAIR_ALLOW_DATA_LOSS, que pode DESCARTAR dados corrompidos para tornar o banco consistente. Antes, a ferramenta preserva automaticamente o que for possível (tail-log + backup de segurança); ao final, cria um backup FULL novo. Se existir backup íntegro, RESTAURAR (acima) preserva 100% dos dados." />
+                                            <Button x:Name="SimulateRepairButton" Content="🔬  Simular antes (pré-visualizar a perda, sem tocar no banco)"
+                                                    Style="{StaticResource SecondaryButton}" MinHeight="40" Margin="0,12,0,0"
+                                                    Click="SimulateRepairButton_Click" />
+                                            <TextBlock x:Name="SimulateResultText" Visibility="Collapsed" Margin="0,8,0,0" FontWeight="SemiBold"
+                                                       Foreground="{DynamicResource DangerDarkBrush}" TextWrapping="Wrap" />
+                                            <TextBlock Text="BACKUP PARA RECUPERAR REGISTROS-PAI (OPCIONAL)" Style="{StaticResource FieldLabel}"
+                                                       Foreground="{DynamicResource DangerDarkBrush}" Margin="0,12,0,4" />
+                                            <StackPanel Orientation="Horizontal">
+                                                <Button x:Name="ChooseRecoveryBakLossButton" Content="📁 Escolher .bak…"
+                                                        Style="{StaticResource SecondaryButton}" Padding="12,6" FontSize="13" Click="ChooseRecoveryBackupButton_Click" />
+                                                <Button x:Name="ClearRecoveryBakLossButton" Content="↺ Automático"
+                                                        Style="{StaticResource SecondaryButton}" Padding="12,6" FontSize="13" Margin="8,0,0,0" Click="ClearRecoveryBackupButton_Click" />
+                                            </StackPanel>
+                                            <TextBlock x:Name="RecoveryBakLossText" FontSize="11" TextWrapping="Wrap" Margin="0,6,0,0"
+                                                       Foreground="{DynamicResource DangerDarkBrush}"
+                                                       Text="Automático: usa o backup FULL mais recente do histórico. Escolha um .bak se o backup estiver em outra mídia (o SQL Server precisa conseguir lê-lo)." />
+                                            <CheckBox x:Name="RecoverLostRowsCheck" Margin="0,12,0,0" IsChecked="True" Foreground="{DynamicResource DangerDarkBrush}">
+                                                <TextBlock TextWrapping="Wrap" Foreground="{DynamicResource DangerDarkBrush}"
+                                                           Text="Salvar e devolver automaticamente as linhas que o reparo descartar (recomendado): antes do reparo, as linhas ainda legíveis das tabelas danificadas são copiadas para um banco de salvamento — funciona mesmo SEM backup; quando a cadeia de backups chega até o instante do reparo, ela também é usada." />
+                                            </CheckBox>
+                                            <CheckBox x:Name="DataLossConfirmCheck" Margin="0,10,0,0" Foreground="{DynamicResource DangerDarkBrush}"
+                                                      Content="Estou ciente e autorizo o reparo com possível perda de dados."
+                                                      Checked="DataLossConfirmCheck_Changed" Unchecked="DataLossConfirmCheck_Changed" />
+                                            <Button x:Name="DataLossRepairButton" Content="Executar reparo COM perda de dados"
+                                                    Style="{StaticResource DangerButton}" MinHeight="42" Margin="0,10,0,0"
+                                                    IsEnabled="False" Click="DataLossRepairButton_Click" />
+                                        </StackPanel>
+                                    </Border>
+
+                                    <!-- [ÚLTIMO RECURSO] Reconstruir o log de transações -->
+                                    <Border x:Name="LogRebuildPanel" Visibility="Collapsed" Style="{StaticResource OptionCard}"
+                                            Background="{DynamicResource DangerPanelBackBrush}" BorderBrush="{DynamicResource DangerBrush}"
+                                            BorderThickness="2">
+                                        <StackPanel>
+                                            <Border Style="{StaticResource Chip}" Background="{DynamicResource DangerBrush}">
+                                                <TextBlock Text="⛔ ÚLTIMO RECURSO" Style="{StaticResource ChipText}" />
+                                            </Border>
+                                            <TextBlock Text="Reconstruir o log de transações" Style="{StaticResource OptionTitle}" Foreground="{DynamicResource DangerDarkBrush}" />
+                                            <TextBlock Margin="0,4,0,0" Foreground="{DynamicResource DangerDarkBrush}" TextWrapping="Wrap"
+                                                       Text="Indicado quando o problema está no LOG de transações (ex.: RECOVERY_PENDING ou SUSPECT por log corrompido/ausente) e o reparo não resolveu. Desanexa o banco, REMOVE o arquivo de log (.ldf) e o recria (FOR ATTACH_REBUILD_LOG) para forçar o retorno a ONLINE. Pode haver PERDA DE DADOS e inconsistências lógicas." />
+                                            <TextBlock Margin="0,6,0,0" Foreground="{DynamicResource DangerDarkBrush}" TextWrapping="Wrap" FontSize="11"
+                                                       Text="Requer que os arquivos do banco estejam acessíveis nesta máquina (servidor local) e permissão na pasta de dados. O log antigo é preservado com a extensão .corrupt_AAAAMMDDHHMMSS." />
+                                            <CheckBox x:Name="LogRebuildConfirmCheck" Margin="0,12,0,0" Foreground="{DynamicResource DangerDarkBrush}"
+                                                      Content="Entendo os riscos e autorizo reconstruir o log."
+                                                      Checked="LogRebuildConfirmCheck_Changed" Unchecked="LogRebuildConfirmCheck_Changed" />
+                                            <Button x:Name="LogRebuildButton" Content="Reconstruir log (recriar .ldf)"
+                                                    Style="{StaticResource DangerButton}" MinHeight="42" Margin="0,10,0,0"
+                                                    IsEnabled="False" Click="LogRebuildButton_Click" />
+                                        </StackPanel>
+                                    </Border>
                                 </StackPanel>
                             </Border>
-
-                            <!-- Resultado -->
-                            <Border x:Name="ResultPanel" Visibility="Collapsed" Margin="0,18,0,0"
-                                    BorderThickness="1" CornerRadius="6" Padding="12">
-                                <TextBlock x:Name="ResultText" TextWrapping="Wrap" />
-                            </Border>
-
-                            <!-- Último recurso: reconstruir o log de transações -->
-                            <Border x:Name="LogRebuildPanel" Visibility="Collapsed" Margin="0,18,0,0"
-                                    Background="{DynamicResource DangerPanelBackBrush}" BorderBrush="{DynamicResource DangerBrush}"
-                                    BorderThickness="2" CornerRadius="6" Padding="14">
-                                <StackPanel>
-                                    <TextBlock Text="⛔ ÚLTIMO RECURSO: RECONSTRUIR O LOG DE TRANSAÇÕES"
-                                               FontWeight="Bold" Foreground="{DynamicResource DangerDarkBrush}" TextWrapping="Wrap" />
-                                    <TextBlock Margin="0,8,0,0" Foreground="{DynamicResource DangerDarkBrush}" TextWrapping="Wrap"
-                                               Text="Indicado quando o problema está no LOG de transações (ex.: RECOVERY_PENDING ou SUSPECT por log corrompido/ausente) e o reparo não resolveu. Esta operação desanexa o banco, REMOVE o arquivo de log (.ldf) e o recria (FOR ATTACH_REBUILD_LOG) para forçar o retorno a ONLINE. Pode haver PERDA DE DADOS e inconsistências lógicas." />
-                                    <TextBlock Margin="0,6,0,0" Foreground="{DynamicResource DangerDarkBrush}" TextWrapping="Wrap" FontSize="11"
-                                               Text="Requer que os arquivos do banco estejam acessíveis nesta máquina (servidor local) e que a aplicação tenha permissão na pasta de dados. O log antigo é preservado com a extensão .corrupt_AAAAMMDDHHMMSS." />
-                                    <CheckBox x:Name="LogRebuildConfirmCheck" Margin="0,12,0,0" Foreground="{DynamicResource DangerDarkBrush}"
-                                              Content="Entendo os riscos e autorizo reconstruir o log."
-                                              Checked="LogRebuildConfirmCheck_Changed" Unchecked="LogRebuildConfirmCheck_Changed" />
-                                    <Button x:Name="LogRebuildButton" Content="Reconstruir log (recriar .ldf)"
-                                            Style="{StaticResource DangerButton}" Height="42" Margin="0,12,0,0"
-                                            IsEnabled="False" Click="LogRebuildButton_Click" />
-                                </StackPanel>
-                            </Border>
-                            </StackPanel>
                         </Grid>
 
-                        <ProgressBar x:Name="RepairBusyBar" IsIndeterminate="True" Height="5" Margin="0,16,0,0"
-                                     Visibility="Collapsed" Foreground="{DynamicResource PrimaryBrush}" />
+                        <!-- ===== Ferramentas adicionais (fora do fluxo de reparo) =====
+                             Lista à esquerda, ferramenta selecionada à direita. Em largura estreita o
+                             detalhe desce para baixo da lista (ToolsGrid_SizeChanged). -->
+                        <Border Style="{StaticResource Card}" Margin="0,12,0,0">
+                            <StackPanel>
+                                <TextBlock Text="Ferramentas adicionais" Style="{StaticResource SectionTitle}" />
+                                <TextBlock Text="Opcionais e independentes do fluxo acima. Escolha uma ferramenta à esquerda."
+                                           Style="{StaticResource HintText}" Margin="0,2,0,0" />
+
+                                <Grid x:Name="ToolsGrid" Margin="0,12,0,0" SizeChanged="ToolsGrid_SizeChanged">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="260" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                    </Grid.RowDefinitions>
+
+                                    <!-- Lista de ferramentas -->
+                                    <StackPanel x:Name="ToolsList">
+                                        <RadioButton x:Name="ToolCheckTab" GroupName="Tools" Style="{StaticResource ToolTab}" IsChecked="True">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="26" />
+                                                    <ColumnDefinition Width="*" />
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Text="🔎" FontSize="14" Margin="0,1,0,0" />
+                                                <StackPanel Grid.Column="1">
+                                                    <TextBlock Text="Verificar uma tabela" FontWeight="SemiBold" TextWrapping="Wrap" />
+                                                    <TextBlock Text="Checagem rápida e reajuste de identidades" Style="{StaticResource HintText}" />
+                                                </StackPanel>
+                                            </Grid>
+                                        </RadioButton>
+                                        <RadioButton x:Name="ToolMaintenanceTab" GroupName="Tools" Style="{StaticResource ToolTab}">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="26" />
+                                                    <ColumnDefinition Width="*" />
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Text="🛠" FontSize="14" Margin="0,1,0,0" />
+                                                <StackPanel Grid.Column="1">
+                                                    <TextBlock Text="Manutenção preventiva" FontWeight="SemiBold" TextWrapping="Wrap" />
+                                                    <TextBlock Text="Índices, contadores e verificação agendada" Style="{StaticResource HintText}" />
+                                                </StackPanel>
+                                            </Grid>
+                                        </RadioButton>
+                                        <RadioButton x:Name="ToolIncrementalTab" GroupName="Tools" Style="{StaticResource ToolTab}">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="26" />
+                                                    <ColumnDefinition Width="*" />
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Text="🧩" FontSize="14" Margin="0,1,0,0" />
+                                                <StackPanel Grid.Column="1">
+                                                    <TextBlock Text="Verificação em partes" FontWeight="SemiBold" TextWrapping="Wrap" />
+                                                    <TextBlock Text="Para bancos muito grandes" Style="{StaticResource HintText}" />
+                                                </StackPanel>
+                                            </Grid>
+                                        </RadioButton>
+                                        <RadioButton x:Name="ToolForensicTab" GroupName="Tools" Style="{StaticResource ToolTab}" Margin="0">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="26" />
+                                                    <ColumnDefinition Width="*" />
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Text="↩" FontSize="14" Margin="0,1,0,0" />
+                                                <StackPanel Grid.Column="1">
+                                                    <TextBlock Text="Recuperar exclusão acidental" FontWeight="SemiBold" TextWrapping="Wrap" />
+                                                    <TextBlock Text="DELETE, DROP ou TRUNCATE recentes" Style="{StaticResource HintText}" />
+                                                </StackPanel>
+                                            </Grid>
+                                        </RadioButton>
+                                    </StackPanel>
+
+                                    <!-- Divisória entre a lista e o detalhe -->
+                                    <Border x:Name="ToolsSeparator" Grid.Column="1" Width="1" Margin="18,0"
+                                            Background="{DynamicResource LineBrush}" />
+
+                                    <!-- Detalhe da ferramenta selecionada (só um painel visível por vez) -->
+                                    <Grid x:Name="ToolDetailHost" Grid.Column="2">
+
+                                        <!-- Verificar uma tabela / reajustar identidades -->
+                                        <StackPanel Visibility="{Binding IsChecked, ElementName=ToolCheckTab, Converter={StaticResource BoolToVis}}">
+                                            <TextBlock Text="Verificar uma tabela" Style="{StaticResource ToolTitle}" />
+                                            <TextBlock Style="{StaticResource HintText}" Margin="0,2,0,0"
+                                                       Text="Verificação dirigida de UMA tabela (DBCC CHECKTABLE) — bem mais rápida que o diagnóstico completo. Use quando o problema aparece sempre na mesma tabela." />
+                                            <Grid Margin="0,10,0,0">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*" />
+                                                    <ColumnDefinition Width="Auto" />
+                                                </Grid.ColumnDefinitions>
+                                                <ComboBox x:Name="CheckTableCombo" Height="32" IsEditable="True" VerticalContentAlignment="Center"
+                                                          ToolTip="Escolha ou digite a tabela (ex.: dbo.Pedido)"
+                                                          DropDownOpened="CheckTableCombo_DropDownOpened" />
+                                                <Button x:Name="CheckTableButton" Grid.Column="1" Content="Verificar tabela"
+                                                        Style="{StaticResource SecondaryButton}" Width="210" MinHeight="34" Margin="12,0,0,0"
+                                                        Click="CheckTableButton_Click" />
+                                            </Grid>
+
+                                            <Border Style="{StaticResource ActionRow}">
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*" />
+                                                        <ColumnDefinition Width="Auto" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <StackPanel Margin="0,0,12,0" VerticalAlignment="Center">
+                                                        <TextBlock Text="Reajustar identidades (CHECKIDENT RESEED)" Style="{StaticResource ActionTitle}" />
+                                                        <TextBlock Text="Útil após remoção de linhas (reparo com perda ou salvamento), quando o próximo código gerado colide com um existente."
+                                                                   Style="{StaticResource HintText}" />
+                                                    </StackPanel>
+                                                    <Button x:Name="ReseedButton" Grid.Column="1" Content="Reajustar identidades"
+                                                            Style="{StaticResource SecondaryButton}" Width="210" MinHeight="34" VerticalAlignment="Center"
+                                                            Click="ReseedButton_Click" />
+                                                </Grid>
+                                            </Border>
+                                        </StackPanel>
+
+                                        <!-- Manutenção preventiva e verificação agendada -->
+                                        <StackPanel Visibility="{Binding IsChecked, ElementName=ToolMaintenanceTab, Converter={StaticResource BoolToVis}}">
+                                            <TextBlock Text="Manutenção preventiva" Style="{StaticResource ToolTitle}" />
+                                            <TextBlock Text="Nenhuma destas ações altera ou apaga dados." Style="{StaticResource HintText}" Margin="0,2,0,0" />
+
+                                            <Border Style="{StaticResource ActionRow}">
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*" />
+                                                        <ColumnDefinition Width="Auto" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <StackPanel Margin="0,0,12,0" VerticalAlignment="Center">
+                                                        <TextBlock Text="Otimizar índices e estatísticas" Style="{StaticResource ActionTitle}" />
+                                                        <TextBlock Text="Desfragmenta índices (REORGANIZE/REBUILD) e atualiza estatísticas — deixa as consultas mais rápidas."
+                                                                   Style="{StaticResource HintText}" />
+                                                    </StackPanel>
+                                                    <Button x:Name="MaintainButton" Grid.Column="1" Content="Otimizar"
+                                                            Style="{StaticResource SecondaryButton}" Width="210" MinHeight="34" VerticalAlignment="Center"
+                                                            Click="MaintainButton_Click" />
+                                                </Grid>
+                                            </Border>
+
+                                            <Border Style="{StaticResource ActionRow}">
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*" />
+                                                        <ColumnDefinition Width="Auto" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <StackPanel Margin="0,0,12,0" VerticalAlignment="Center">
+                                                        <TextBlock Text="Corrigir contadores de espaço (DBCC UPDATEUSAGE)" Style="{StaticResource ActionTitle}" />
+                                                        <TextBlock Text="Quando tamanhos ou quantidades de linhas aparecem errados (comum em bancos vindos do SQL 2000/2005). Só ajusta o catálogo."
+                                                                   Style="{StaticResource HintText}" />
+                                                    </StackPanel>
+                                                    <Button x:Name="UpdateUsageButton" Grid.Column="1" Content="Corrigir contadores"
+                                                            Style="{StaticResource SecondaryButton}" Width="210" MinHeight="34" VerticalAlignment="Center"
+                                                            Click="UpdateUsageButton_Click" />
+                                                </Grid>
+                                            </Border>
+
+                                            <Border Style="{StaticResource ActionRow}">
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*" />
+                                                        <ColumnDefinition Width="Auto" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <StackPanel Margin="0,0,12,0" VerticalAlignment="Center">
+                                                        <TextBlock Text="Verificação agendada" Style="{StaticResource ActionTitle}" />
+                                                        <TextBlock Text="Gera o comando para o Agendador do Windows verificar o banco todo dia e avisar quando surgir algo novo."
+                                                                   Style="{StaticResource HintText}" />
+                                                    </StackPanel>
+                                                    <Button x:Name="ScheduleButton" Grid.Column="1" Content="Gerar comando"
+                                                            Style="{StaticResource SecondaryButton}" Width="210" MinHeight="34" VerticalAlignment="Center"
+                                                            Click="ScheduleButton_Click" />
+                                                </Grid>
+                                            </Border>
+                                        </StackPanel>
+
+                                        <!-- Verificação em partes -->
+                                        <StackPanel Visibility="{Binding IsChecked, ElementName=ToolIncrementalTab, Converter={StaticResource BoolToVis}}">
+                                            <TextBlock Text="Verificação em partes" Style="{StaticResource ToolTitle}" />
+                                            <TextBlock Style="{StaticResource HintText}" Margin="0,2,0,0"
+                                                       Text="Quando o diagnóstico completo não cabe na janela de manutenção: cada rodada verifica as tabelas pelo tempo escolhido e lembra onde parou. Ao fim do ciclo, o banco inteiro foi verificado. Somente leitura." />
+
+                                            <Border Style="{StaticResource ActionRow}">
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*" />
+                                                        <ColumnDefinition Width="Auto" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <StackPanel Margin="0,0,12,0" VerticalAlignment="Center">
+                                                        <TextBlock Text="Tempo desta rodada" Style="{StaticResource ActionTitle}" />
+                                                        <TextBlock Text="Ao fim do tempo a rodada para e guarda onde parou; a próxima continua dali."
+                                                                   Style="{StaticResource HintText}" />
+                                                    </StackPanel>
+                                                    <ComboBox x:Name="IncrementalBudgetCombo" Grid.Column="1" Width="210" Height="32" SelectedIndex="1"
+                                                              VerticalAlignment="Center" VerticalContentAlignment="Center">
+                                                        <ComboBoxItem Content="15 minutos" Tag="15" />
+                                                        <ComboBoxItem Content="30 minutos" Tag="30" />
+                                                        <ComboBoxItem Content="1 hora" Tag="60" />
+                                                        <ComboBoxItem Content="2 horas" Tag="120" />
+                                                    </ComboBox>
+                                                </Grid>
+                                            </Border>
+
+                                            <Border Style="{StaticResource ActionRow}">
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*" />
+                                                        <ColumnDefinition Width="Auto" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <StackPanel Margin="0,0,12,0" VerticalAlignment="Center">
+                                                        <TextBlock Text="Andamento" Style="{StaticResource ActionTitle}" />
+                                                        <TextBlock x:Name="IncrementalStatusText" Style="{StaticResource HintText}" />
+                                                    </StackPanel>
+                                                    <Button x:Name="IncrementalCheckButton" Grid.Column="1" Content="Verificar próxima parte"
+                                                            Style="{StaticResource SecondaryButton}" Width="210" MinHeight="34" VerticalAlignment="Center"
+                                                            Click="IncrementalCheckButton_Click" />
+                                                </Grid>
+                                            </Border>
+                                        </StackPanel>
+
+                                        <!-- Recuperar exclusão acidental -->
+                                        <StackPanel Visibility="{Binding IsChecked, ElementName=ToolForensicTab, Converter={StaticResource BoolToVis}}">
+                                            <TextBlock Text="Recuperar exclusão acidental" Style="{StaticResource ToolTitle}" />
+                                            <TextBlock Style="{StaticResource HintText}" Margin="0,2,0,0"
+                                                       Text="Prefira devolver só as linhas excluídas: o que foi feito depois é preservado. Restaurar o banco inteiro até antes descarta tudo o que veio depois." />
+
+                                            <Border Style="{StaticResource ActionRow}">
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*" />
+                                                        <ColumnDefinition Width="Auto" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <StackPanel Margin="0,0,12,0" VerticalAlignment="Center">
+                                                        <TextBlock Text="1. Procurar exclusões recentes" Style="{StaticResource ActionTitle}" />
+                                                        <TextBlock Text="Lê o log de transações e lista DELETE, DROP e TRUNCATE recentes. Somente leitura."
+                                                                   Style="{StaticResource HintText}" />
+                                                    </StackPanel>
+                                                    <Button x:Name="ForensicButton" Grid.Column="1" Content="Procurar no log"
+                                                            Style="{StaticResource SecondaryButton}" Width="210" MinHeight="34" VerticalAlignment="Center"
+                                                            Click="ForensicButton_Click" />
+                                                </Grid>
+                                            </Border>
+
+                                            <ListBox x:Name="ForensicList" Height="120" Margin="0,10,0,0" Visibility="Collapsed"
+                                                     Background="{DynamicResource CardBrush}" DisplayMemberPath="Display"
+                                                     BorderBrush="{DynamicResource LineBrush}" BorderThickness="1" />
+                                            <!-- 2. Ações sobre a transação selecionada (aparecem após a busca) -->
+                                            <UniformGrid Rows="1" Margin="0,4,0,0">
+                                                <Button x:Name="ForensicRecoverRowsButton" Content="Devolver só as linhas excluídas (não sobrescreve o banco)"
+                                                        Style="{StaticResource FlatButton}" MinHeight="40" Margin="0,6,6,0" Visibility="Collapsed"
+                                                        Click="ForensicRecoverRowsButton_Click" />
+                                                <Button x:Name="ForensicRestoreButton" Content="Restaurar o banco inteiro até ANTES da transação"
+                                                        Style="{StaticResource DangerButton}" MinHeight="40" Margin="0,6,0,0" Visibility="Collapsed"
+                                                        Click="ForensicRestoreButton_Click" />
+                                            </UniformGrid>
+                                        </StackPanel>
+                                    </Grid>
+                                </Grid>
+                            </StackPanel>
+                        </Border>
                     </StackPanel>
-                </ScrollViewer>
-            </Border>
+                </Grid>
+            </ScrollViewer>
         </Grid>
 
         <!-- ===== Splitter ===== -->
-        <GridSplitter Grid.Row="2" Height="6" HorizontalAlignment="Stretch" VerticalAlignment="Center"
+        <GridSplitter Grid.Row="2" Height="8" HorizontalAlignment="Stretch" VerticalAlignment="Center"
                       Background="Transparent" ResizeBehavior="PreviousAndNext" />
 
-        <!-- ===== Log ===== -->
-        <Border Grid.Row="3" Background="{DynamicResource CardBrush}" BorderBrush="{DynamicResource LineBrush}"
-                BorderThickness="1" CornerRadius="6">
+        <!-- ===== Registro de operações ===== -->
+        <Border Grid.Row="3" Style="{StaticResource Card}" Padding="0">
             <Grid>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="*" />
                 </Grid.RowDefinitions>
-                <Border Grid.Row="0" Background="{DynamicResource LogHeaderBackBrush}" CornerRadius="6,6,0,0" Padding="12,8">
+                <Border Grid.Row="0" Background="{DynamicResource LogHeaderBackBrush}" CornerRadius="8,8,0,0" Padding="14,6">
                     <Grid>
-                        <TextBlock Text="Registro de operações" FontWeight="SemiBold"
-                                   Foreground="{DynamicResource PrimaryDarkBrush}" VerticalAlignment="Center" />
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                            <TextBlock Text="Registro de operações" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryDarkBrush}" />
+                            <TextBlock Text="— cada comando executado, em tempo real" Style="{StaticResource HintText}"
+                                       VerticalAlignment="Center" Margin="8,0,0,0" />
+                        </StackPanel>
                         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                             <Button x:Name="ExportReportButton" Content="Exportar relatório" Style="{StaticResource SecondaryButton}"
                                     Padding="10,3" FontSize="12" Margin="0,0,8,0" Click="ExportReportButton_Click" />
@@ -541,7 +1033,7 @@
                         </StackPanel>
                     </Grid>
                 </Border>
-                <ListBox x:Name="LogList" Grid.Row="1" BorderThickness="0" Background="Transparent"
+                <ListBox x:Name="LogList" Grid.Row="1" BorderThickness="0" Background="Transparent" Padding="8,4"
                          ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                          ScrollViewer.VerticalScrollBarVisibility="Auto"
                          VirtualizingStackPanel.IsVirtualizing="True">
@@ -570,17 +1062,26 @@
             </Grid>
         </Border>
 
-        <!-- ===== Status bar ===== -->
-        <Border Grid.Row="4" Margin="0,10,0,0">
+        <!-- ===== Barra de status: andamento + Cancelar ao lado ===== -->
+        <Border Grid.Row="4" Style="{StaticResource Card}" Padding="12,6" Margin="0,10,0,0">
             <Grid>
                 <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
-                <TextBlock x:Name="StatusText" Grid.Column="0" Foreground="{DynamicResource MutedTextBrush}"
-                           FontSize="12" VerticalAlignment="Center" Text="Pronto." />
-                <TextBlock x:Name="LogPathText" Grid.Column="1" Foreground="{DynamicResource MutedTextBrush}"
-                           FontSize="11" VerticalAlignment="Center" />
+                <ProgressBar x:Name="RepairBusyBar" Grid.Column="0" IsIndeterminate="True" Width="120" Height="6"
+                             Margin="0,0,12,0" VerticalAlignment="Center" Visibility="Collapsed"
+                             Foreground="{DynamicResource PrimaryBrush}" />
+                <TextBlock x:Name="StatusText" Grid.Column="1" Foreground="{DynamicResource TextBrush}"
+                           FontSize="12" VerticalAlignment="Center" Text="Pronto." TextTrimming="CharacterEllipsis"
+                           ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+                <Button x:Name="CancelButton" Grid.Column="2" Content="■  Cancelar operação" Style="{StaticResource DangerButton}"
+                        Padding="12,4" FontSize="12" Margin="12,0,0,0" Visibility="Collapsed" IsEnabled="False"
+                        Click="CancelButton_Click" />
+                <TextBlock x:Name="LogPathText" Grid.Column="3" Foreground="{DynamicResource MutedTextBrush}"
+                           FontSize="11" VerticalAlignment="Center" Margin="16,0,0,0" />
             </Grid>
         </Border>
     </Grid>

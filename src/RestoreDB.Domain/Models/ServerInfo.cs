@@ -2,7 +2,7 @@ namespace RestoreDB.Domain.Models;
 
 /// <summary>
 /// Informações da instância do SQL Server, coletadas logo após a conexão. Servem para
-/// pré-checagens (o login é sysadmin? a edição suporta restore de página online?) e para
+/// pré-checagens (o login é sysadmin? é Azure SQL Database?) e para
 /// adaptar o fluxo de reparo às capacidades do servidor.
 /// </summary>
 public sealed class ServerInfo
@@ -24,9 +24,6 @@ public sealed class ServerInfo
 
     /// <summary>Azure SQL Database — muitos comandos (ALTER DATABASE SET EMERGENCY, attach, etc.) não se aplicam.</summary>
     public bool IsAzureSqlDatabase => EngineEdition == 5;
-
-    /// <summary>Edições "Enterprise-class" (3) suportam restore de página ONLINE; demais só offline.</summary>
-    public bool SupportsOnlinePageRestore => EngineEdition == 3;
 
     public string ShortDescription =>
         $"{Edition} — versão {ProductVersion} ({ProductLevel})";

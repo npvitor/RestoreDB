@@ -10,7 +10,7 @@ namespace RestoreDB.DataAccess;
 /// pela mesma conexão que executa o DBCC CHECKDB, evitando que outro processo "roube"
 /// a vaga de usuário único. Conecta-se sempre em master (nunca no banco quebrado).
 /// </summary>
-public sealed class SqlSession : IAsyncDisposable, IDisposable
+public sealed partial class SqlSession : IAsyncDisposable, IDisposable
 {
     private readonly SqlConnection _connection;
 
@@ -462,21 +462,6 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         catch { return false; }
     }
 
-    /// <summary>Lê a opção PAGE_VERIFY do banco (NONE / TORN_PAGE_DETECTION / CHECKSUM). Best-effort.</summary>
-    public async Task<string> GetPageVerifyOptionAsync(string databaseName, CancellationToken ct = default)
-    {
-        try
-        {
-            await EnsureOpenAsync(ct);
-            await using var cmd = new SqlCommand(
-                "SELECT page_verify_option_desc FROM sys.databases WHERE name = @db;", _connection)
-            { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
-            cmd.Parameters.AddWithValue("@db", databaseName);
-            return (await cmd.ExecuteScalarAsync(ct)) as string ?? string.Empty;
-        }
-        catch { return string.Empty; }
-    }
-
     /// <summary>Lê os arquivos físicos de um banco (sys.master_files). Compatível com 2008 R2.</summary>
     public async Task<List<DatabaseFile>> GetDatabaseFilesAsync(string databaseName, CancellationToken ct = default)
     {
@@ -785,60 +770,6 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         }
         catch (OperationCanceledException) { throw; }
         catch { /* fn_dblog indisponível / sem permissão */ }
-        return list;
-    }
-
-    /// <summary>Lista os índices DESABILITADOS do banco (tabela.índice). Best-effort.</summary>
-    public async Task<List<string>> GetDisabledIndexesAsync(string databaseName, CancellationToken ct = default)
-    {
-        var list = new List<string>();
-        try
-        {
-            const string sql =
-                "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
-                "DECLARE @stmt nvarchar(max) = N'SELECT OBJECT_NAME(i.object_id) + N''.'' + i.name " +
-                "FROM sys.indexes i JOIN sys.tables t ON t.object_id = i.object_id " +
-                "WHERE i.is_disabled = 1 AND t.is_ms_shipped = 0;';\n" +
-                "EXEC @proc @stmt;";
-            await EnsureOpenAsync(ct);
-            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
-            cmd.Parameters.AddWithValue("@db", databaseName);
-            await using var r = await cmd.ExecuteReaderAsync(ct);
-            while (await r.ReadAsync(ct))
-                if (!r.IsDBNull(0)) list.Add(r.GetString(0));
-        }
-        catch (OperationCanceledException) { throw; }
-        catch { /* best-effort */ }
-        return list;
-    }
-
-    /// <summary>
-    /// Lista referências QUEBRADAS de objetos (views/procedures que referenciam um objeto que não
-    /// existe mais), via sys.sql_expression_dependencies. Best-effort (2008+).
-    /// </summary>
-    public async Task<List<string>> GetBrokenDependenciesAsync(string databaseName, CancellationToken ct = default)
-    {
-        var list = new List<string>();
-        try
-        {
-            const string sql =
-                "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
-                "DECLARE @stmt nvarchar(max) = N'SELECT DISTINCT OBJECT_NAME(d.referencing_id) + N'' → '' + " +
-                "ISNULL(d.referenced_schema_name + N''.'', N'''') + d.referenced_entity_name " +
-                "FROM sys.sql_expression_dependencies d " +
-                "WHERE d.referenced_id IS NULL AND d.referenced_entity_name IS NOT NULL " +
-                "AND d.is_ambiguous = 0 AND OBJECT_NAME(d.referencing_id) IS NOT NULL " +
-                "AND OBJECT_ID(ISNULL(d.referenced_schema_name + N''.'', N'''') + d.referenced_entity_name) IS NULL;';\n" +
-                "EXEC @proc @stmt;";
-            await EnsureOpenAsync(ct);
-            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
-            cmd.Parameters.AddWithValue("@db", databaseName);
-            await using var r = await cmd.ExecuteReaderAsync(ct);
-            while (await r.ReadAsync(ct))
-                if (!r.IsDBNull(0)) list.Add(r.GetString(0));
-        }
-        catch (OperationCanceledException) { throw; }
-        catch { /* DMV ausente / sem permissão */ }
         return list;
     }
 
@@ -1319,29 +1250,6 @@ public sealed class SqlSession : IAsyncDisposable, IDisposable
         if (name.Length >= 2 && name[0] == '[' && name[^1] == ']')
             return name[1..^1].Replace("]]", "]");
         return name;
-    }
-
-    /// <summary>Lista os nomes de constraints (FK/CHECK) marcadas como NÃO confiáveis no banco alvo. Best-effort.</summary>
-    public async Task<List<string>> GetUntrustedConstraintsAsync(string databaseName, CancellationToken ct = default)
-    {
-        var list = new List<string>();
-        try
-        {
-            const string sql =
-                "DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';\n" +
-                "DECLARE @stmt nvarchar(max) = N'SELECT name FROM sys.foreign_keys WHERE is_not_trusted = 1 " +
-                "UNION ALL SELECT name FROM sys.check_constraints WHERE is_not_trusted = 1;';\n" +
-                "EXEC @proc @stmt;";
-            await EnsureOpenAsync(ct);
-            await using var cmd = new SqlCommand(sql, _connection) { CommandTimeout = AppConstants.QueryCommandTimeoutSeconds };
-            cmd.Parameters.AddWithValue("@db", databaseName);
-            await using var r = await cmd.ExecuteReaderAsync(ct);
-            while (await r.ReadAsync(ct))
-                if (!r.IsDBNull(0)) list.Add(r.GetString(0));
-        }
-        catch (OperationCanceledException) { throw; }
-        catch { /* best-effort */ }
-        return list;
     }
 
     /// <summary>

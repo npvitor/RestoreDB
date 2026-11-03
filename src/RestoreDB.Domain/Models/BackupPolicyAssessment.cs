@@ -30,7 +30,6 @@ public sealed class BackupPolicyAssessment
     public string RecoveryModel { get; set; } = string.Empty;
 
     public DateTime? LastFull { get; set; }
-    public DateTime? LastDifferential { get; set; }
     public DateTime? LastLog { get; set; }
 
     public List<PolicyFinding> Findings { get; } = new();

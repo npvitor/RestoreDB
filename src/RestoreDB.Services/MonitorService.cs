@@ -1,4 +1,3 @@
-using System.IO;
 using System.Text;
 using RestoreDB.Domain.Constants;
 using RestoreDB.Domain.Models;
@@ -6,7 +5,7 @@ using RestoreDB.Domain.Models;
 namespace RestoreDB.Services;
 
 /// <summary>
-/// Monitoramento agendado (B5 → fecha o loop do histórico): roda um diagnóstico somente-leitura,
+/// Monitoramento agendado (fecha o loop do histórico): roda um diagnóstico somente-leitura,
 /// compara com a última verificação e, havendo NOVIDADE (corrupção nova, mais violações, etc.),
 /// grava um ALERTA em arquivo. Sem dependências externas — o Probe usa o resultado para devolver
 /// um código de saída distinto, que o Agendador de Tarefas do Windows usa para disparar um e-mail.
@@ -43,7 +42,6 @@ public sealed class MonitorService
         if (res.HasNewIssue)
         {
             res.AlertFilePath = WriteAlert(db.Name, diag);
-            res.AlertWritten = res.AlertFilePath is not null;
             Report(progress, db.Name, RepairLogLevel.Warning,
                 $"⚠ ALERTA: {diag.NewSinceLastRun.Count} novidade(s) desde a última verificação. Alerta gravado em {res.AlertFilePath}");
         }

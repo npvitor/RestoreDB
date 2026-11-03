@@ -95,33 +95,50 @@ comandos de reparo locais não se aplicam). Você pode continuar mesmo assim, ma
 
 ## 4. Tela principal — visão geral
 
-Após conectar, abre a tela principal, dividida em quatro áreas. A **lista de bancos** é compacta à
-esquerda e o **painel de ações** ocupa o maior espaço à direita (você pode arrastar o divisor entre
-eles).
+Após conectar, abre a tela principal. A **lista de bancos** fica à esquerda e o **fluxo guiado**
+ocupa o maior espaço à direita (você pode arrastar o divisor entre eles). O fluxo tem três passos —
+**1 Diagnosticar → 2 Resolver → 3 Conferir** — e só libera a próxima ação quando ela faz sentido,
+sempre da **menos** para a **mais** arriscada.
 
 ```
-┌────────────────────────────────────────────────────────────────────────────────────┐
-│ Barra superior:  info do servidor   [Tema] [Cancelar] [Anexar .mdf] [Atualizar] [Trocar]│
-├──────────────────────────┬───────────────────────────────────────────────────────────┤
-│  LISTA DE BANCOS         │  DIAGNÓSTICO, REPARO E RESTAURAÇÃO                          │
-│  Banco | Estado          │  PASSO 1 — Diagnosticar  (+ verificação rápida)            │
-│  (problemáticos em       │  RESULTADO DO DIAGNÓSTICO (resumo, ação, achados, novidades)│
-│   vermelho)              │  PASSO 2 — Como resolver (só as opções aplicáveis)         │
-├──────────────────────────┴───────────────────────────────────────────────────────────┤
-│  REGISTRO DE OPERAÇÕES (log ao vivo)                       [Exportar relatório] [Limpar]│
-├────────────────────────────────────────────────────────────────────────────────────┤
-│  Barra de status                                          caminho do arquivo de log    │
-└────────────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│ RestoreDB · info do servidor           [Atualizar lista] [Anexar .mdf] [Trocar] [Tema] │
+├─────────────────────┬────────────────────────────────────────────────────────────────┤
+│ BANCOS DE DADOS     │ BANCO SELECIONADO  [ESTADO]       ① Diagnosticar ─ ② Resolver ─ ③ │
+│ N no servidor •     │ PRÓXIMO PASSO: o que fazer agora                                │
+│ X precisam atenção  ├────────────────────────────────────────────────────────────────┤
+│ [Filtrar por nome]  │ RESULTADO DA ÚLTIMA OPERAÇÃO                                    │
+│ Banco | Estado      ├───────────────────────────────┬────────────────────────────────┤
+│ (problemáticos em   │ ① DIAGNOSTICAR                │ ② RESOLVER                     │
+│  vermelho)          │ [Diagnosticar] + resultado    │ opções em ordem de risco:      │
+│                     │                               │ SEM PERDA → QUARENTENA →       │
+│                     │                               │ RESTAURA BACKUP → PODE PERDER  │
+│                     ├───────────────────────────────┴────────────────────────────────┤
+│                     │ FERRAMENTAS ADICIONAIS (recolhíveis)                            │
+├─────────────────────┴────────────────────────────────────────────────────────────────┤
+│ REGISTRO DE OPERAÇÕES (log ao vivo)                        [Exportar relatório] [Limpar]│
+├──────────────────────────────────────────────────────────────────────────────────────┤
+│ [andamento] mensagem de status            [■ Cancelar operação]   caminho do log       │
+└──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Barra superior:** `Servidor`, `Catálogo: master`, edição/versão e se o login é `sysadmin`. À
-  direita: **Tema**, **Cancelar**, **Anexar .mdf** (veja [11.4](#114-anexar-um-banco-a-partir-de-um-arquivo-mdf)),
-  **Atualizar lista** e **Trocar conexão**.
-- **Lista de bancos:** todas as bases e seu **Estado**; problemáticos **em vermelho**.
-- **Painel de ações:** segue o fluxo **Passo 1 → Passo 2**. Inclui dois grupos recolhíveis:
-  **“Verificações avançadas”** e **“Manutenção e ferramentas”**.
+- **Cabeçalho:** `Servidor`, `Catálogo: master`, edição/versão e se o login é `sysadmin`. À
+  direita: **Atualizar lista**, **Anexar .mdf** (veja [11.4](#114-anexar-um-banco-a-partir-de-um-arquivo-mdf)),
+  **Trocar conexão** e **Tema**.
+- **Lista de bancos:** todas as bases e seu **Estado**; problemáticos **em vermelho**. O campo
+  **“Filtrar por nome”** ajuda em servidores com muitos bancos.
+- **Banco selecionado:** nome, estado, o **indicador de passos** (✓ = concluído, azul = passo atual)
+  e a faixa **“PRÓXIMO PASSO”**, que diz em linguagem simples o que fazer agora.
+- **Resultado da última operação:** aparece logo abaixo, em verde (sucesso), amarelo (atenção) ou
+  vermelho (falha).
+- **Passo 1 — Diagnosticar** e **Passo 2 — Resolver:** lado a lado em telas largas, um abaixo do
+  outro em telas estreitas. Antes do diagnóstico o Passo 2 fica **bloqueado** (🔒).
+- **Ferramentas adicionais:** grupos recolhíveis fora do fluxo de reparo — **“Verificar uma tabela /
+  reajustar identidades”**, **“Manutenção preventiva e verificação agendada”** e **“Recuperar exclusão
+  acidental”**.
 - **Registro de operações:** cada passo, colorido por tipo (informação, comando, sucesso, aviso, erro).
-- **Barra de status:** mensagem atual e o caminho do arquivo de log do dia.
+- **Barra de status:** mensagem atual e o caminho do arquivo de log do dia; durante uma operação
+  mostra o **andamento** e o botão **“■ Cancelar operação”**.
 
 ---
 
@@ -163,7 +180,7 @@ Aparece o painel **RESULTADO DO DIAGNÓSTICO**, com:
   desabilitados, dependências quebradas e **causa-raiz** (erros de E/S, corrupção recorrente).
 
 ### Passo 4 — Execute a opção recomendada
-Em **“PASSO 2 — COMO RESOLVER”**, a ferramenta exibe **apenas a(s) opção(ões) aplicável(is)**.
+No **Passo 2 — Resolver**, a ferramenta exibe **apenas a(s) opção(ões) aplicável(is)**, em ordem de risco (cada uma traz um selo: **SEM PERDA**, **QUARENTENA**, **RESTAURA BACKUP**, **PODE PERDER DADOS** ou **ÚLTIMO RECURSO**). Comece pela primeira.
 
 | O diagnóstico concluiu… | O que aparece em “Como resolver” | Perde dados? |
 |---|---|---|
@@ -386,7 +403,7 @@ Recolhidas sob **“Mais opções de restauração (avançado)”**:
 
 ## 10. Manutenção e prevenção
 
-No grupo recolhível **“Manutenção e ferramentas”**:
+Em **Ferramentas adicionais**, no grupo recolhível **“Manutenção preventiva e verificação agendada”**:
 
 ### 10.1. Otimizar índices e estatísticas (manutenção preventiva)
 **“Otimizar índices e estatísticas”** desfragmenta os índices conforme a fragmentação
@@ -409,7 +426,7 @@ pode usar para **enviar e-mail** ao suporte. É a **detecção precoce** de prob
 ## 11. Ferramentas e cenários especiais
 
 ### 11.1. Recuperar de exclusão acidental (forense)
-**“Procurar exclusões recentes no log”** lê o log de transações e lista **DELETE/DROP/TRUNCATE**
+Em **Ferramentas adicionais → “Recuperar exclusão acidental”**, **“Procurar exclusões recentes no log”** lê o log de transações e lista **DELETE/DROP/TRUNCATE**
 recentes com horário. Cada item mostra também a **tabela** e a quantidade de linhas. Selecione a transação e escolha:
 - **“Devolver só as linhas excluídas (não sobrescreve o banco)”** — *recomendado para DELETE*: a
   ferramenta restaura uma **cópia temporária** até **logo antes** do DELETE e devolve à tabela **só as
@@ -427,13 +444,13 @@ Antes de qualquer reparo com perda, use **“🔬 Simular antes”** (ver [8.4](
 você vê a **perda exata por tabela** numa cópia, sem risco para a produção.
 
 ### 11.3. Verificações avançadas
-No grupo **“Verificações avançadas”**:
+Em **Ferramentas adicionais**, no grupo **“Verificar uma tabela / reajustar identidades”**:
 - **Verificar tabela (CHECKTABLE):** checagem dirigida a uma tabela (mais rápida que o CHECKDB completo).
 - **Reajustar identidades (CHECKIDENT RESEED):** corrige as sementes de colunas de identidade após
   remoção de linhas (reparo com perda / salvamento).
 
 ### 11.4. Anexar um banco a partir de um arquivo `.mdf`
-Na barra superior, **“Anexar .mdf”** permite recuperar um banco a partir do arquivo de dados solto.
+No cabeçalho, **“Anexar .mdf”** permite recuperar um banco a partir do arquivo de dados solto.
 A ferramenta procura o `.ldf` correspondente pelos padrões comuns; se não encontrar, **pergunta se
 você quer localizá-lo manualmente** — só recria o log (`FOR ATTACH_REBUILD_LOG`) se você optar por
 isso ou se o arquivo realmente não existir (recriar descarta transações não confirmadas). Não
@@ -448,7 +465,7 @@ o **runbook** específico (`master`/`model`/`msdb`/`tempdb`) com os passos a exe
 
 ## 12. Recursos auxiliares
 
-- **Atualizar lista / Trocar conexão / Cancelar:** como antes.
+- **Atualizar lista / Trocar conexão** (cabeçalho) e **Cancelar operação** (barra de status, visível durante uma operação).
 - **Ver script planejado (não executa nada):** mostra o T-SQL que seria executado.
 - **Exportar relatório:** salva o **Registro de operações** em **HTML** (anexe a um chamado).
 - **Limpar:** limpa o registro exibido (não apaga o arquivo de log).
@@ -458,7 +475,7 @@ o **runbook** específico (`master`/`model`/`msdb`/`tempdb`) com os passos a exe
 ## 13. Modo escuro
 
 Ao **iniciar**, a ferramenta adota o **tema do Windows** (claro/escuro). Você pode alternar pelo botão
-**“🌙 Tema escuro” / “☀ Tema claro”** na barra superior; a escolha vale para toda a sessão.
+**“🌙 Tema escuro” / “☀ Tema claro”** no cabeçalho; a escolha vale para toda a sessão.
 
 ---
 
@@ -586,7 +603,7 @@ Registro de operações).
 
 **Posso fechar a ferramenta durante um reparo?**
 Evite. A ferramenta pede confirmação: fechar no meio pode deixar o banco em acesso restrito
-(`SINGLE_USER`). Prefira **Cancelar** e aguardar.
+(`SINGLE_USER`). Prefira **Cancelar operação** (barra de status) e aguardar.
 
 **Selecionei um backup e a restauração diz que não é FULL.**
 Diferenciais e logs não se restauram sozinhos — precisam do FULL antes. Use **“Restaurar cadeia

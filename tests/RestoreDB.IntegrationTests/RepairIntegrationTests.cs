@@ -460,7 +460,7 @@ public sealed class RepairIntegrationTests
 
         var diag = await Repair().DiagnoseAsync(db.AsInfo("ONLINE"), It.Conn, It.NoProgress);
 
-        Assert.Contains(diag.HealthFindings, f => f.Message.Contains("DESABILITADO"));
+        Assert.Contains(diag.Adjustments, a => a.Kind == HealthIssueKind.DisabledIndexes && a.CanFix);
     }
 
     [IntegrationFact]
@@ -667,7 +667,8 @@ public sealed class RepairIntegrationTests
         Assert.NotEmpty(sets);
         Assert.Contains(sets, s => s.DatabaseName == db.Name && s.BackupTypeCode == "D");
 
-        var files = await Restore().GetBackupFilesAsync(path, sets.First().Position, It.Conn);
+        await using var s = await new SqlDataAccess().OpenSessionAsync(It.Conn);
+        var files = await s.RestoreFileListOnlyAsync(path, sets.First().Position);
         Assert.Contains(files, f => f.IsData);
         Assert.Contains(files, f => f.IsLog);
     }
@@ -705,8 +706,8 @@ public sealed class RepairIntegrationTests
         var topo = await s.GetTopologyInfoAsync(db.Name);
         Assert.False(topo.IsRisky);
 
-        var pv = await s.GetPageVerifyOptionAsync(db.Name);
-        Assert.False(string.IsNullOrEmpty(pv));
+        var settings = await s.GetDatabaseSettingsAsync(db.Name);
+        Assert.False(string.IsNullOrEmpty(settings?.PageVerify));
 
         var disks = await s.GetDiskSpaceAsync(db.Name);
         Assert.NotEmpty(disks);

@@ -11,9 +11,6 @@ public sealed class BackupChainPlan
 {
     public string DatabaseName { get; init; } = string.Empty;
 
-    /// <summary>Instante alvo (STOPAT). Nulo = restaurar o mais recente possível.</summary>
-    public DateTime? Target { get; init; }
-
     public BackupSetInfo? BaseFull { get; set; }
     public BackupSetInfo? Differential { get; set; }
     public List<BackupSetInfo> Logs { get; } = new();

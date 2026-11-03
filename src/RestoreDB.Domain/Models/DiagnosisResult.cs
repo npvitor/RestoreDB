@@ -22,7 +22,11 @@ public enum RecommendedActionKind
 
     /// <summary>Integridade LÓGICA comprometida (FK órfã / violação de constraint) com os
     /// arquivos físicos íntegros — corrige-se removendo as linhas violadoras, não com CHECKDB.</summary>
-    FixConstraints
+    FixConstraints,
+
+    /// <summary>Banco ONLINE porém travado em SINGLE_USER/RESTRICTED_USER (geralmente por uma sessão presa
+    /// de uma operação anterior) — ninguém consegue usar. Libera-se o acesso sem perda de dados.</summary>
+    FixAccess
 }
 
 /// <summary>
@@ -79,9 +83,6 @@ public sealed class DiagnosisResult
     /// <summary>Operação demorada em andamento (recuperação/RESTORE) — para não parecer travado.</summary>
     public RecoveryProgress? Recovery { get; set; }
 
-    /// <summary>Achados de SAÚDE LÓGICA adicionais (índices desabilitados, dependências quebradas, etc.).</summary>
-    public List<PolicyFinding> HealthFindings { get; } = new();
-
     /// <summary>Achados de CAUSA-RAIZ (erros de E/S, corrupção recorrente ⇒ suspeita de hardware).</summary>
     public List<PolicyFinding> RootCauseFindings { get; } = new();
 
@@ -96,6 +97,16 @@ public sealed class DiagnosisResult
 
     /// <summary>Linhas que violam constraints DESABILITADAS (informativo — não são corrupção).</summary>
     public int DisabledConstraintHits { get; set; }
+
+    /// <summary>Configurações lidas para os ajustes recomendados (best-effort; null se indisponível).</summary>
+    public DatabaseSettings? Settings { get; set; }
+
+    /// <summary>Ajustes recomendados (configuração/saúde) — corrigíveis sem perda de dados ou só informativos.</summary>
+    public List<HealthIssue> Adjustments { get; } = new();
+
+    /// <summary>Acesso restrito (SINGLE_USER/RESTRICTED_USER) e as sessões que o seguram.</summary>
+    public bool AccessRestricted { get; set; }
+    public List<DbSessionInfo> AccessHolders { get; } = new();
 
     /// <summary>Linhas violadoras de FK que podem ser removidas para restaurar a integridade.</summary>
     public IReadOnlyList<ConstraintViolation> ForeignKeyViolations =>

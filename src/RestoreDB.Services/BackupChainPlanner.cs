@@ -16,7 +16,7 @@ public static class BackupChainPlanner
 {
     public static BackupChainPlan Plan(string databaseName, IReadOnlyList<BackupSetInfo> history, DateTime? target)
     {
-        var plan = new BackupChainPlan { DatabaseName = databaseName, Target = target };
+        var plan = new BackupChainPlan { DatabaseName = databaseName };
 
         bool AtOrBeforeTarget(BackupSetInfo b) =>
             target is null || (b.BackupFinishDate ?? DateTime.MinValue) <= target.Value;

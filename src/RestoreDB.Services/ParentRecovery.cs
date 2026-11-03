@@ -17,9 +17,6 @@ public sealed class ParentRecoveryPrompt
 
     /// <summary>Motivo legível da recuperação incompleta (ex.: "arquivo ilegível", "recuperação parcial").</summary>
     public string Reason { get; init; } = string.Empty;
-
-    /// <summary>Último caminho de backup tentado (null = tentativa automática via histórico do msdb).</summary>
-    public string? LastTriedPath { get; init; }
 }
 
 /// <summary>

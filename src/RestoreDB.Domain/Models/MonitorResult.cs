@@ -15,9 +15,6 @@ public sealed class MonitorResult
     /// <summary>Há corrupção presente AGORA (mesmo que já conhecida).</summary>
     public bool CorruptionPresent { get; set; }
 
-    /// <summary>Um arquivo de alerta foi gravado.</summary>
-    public bool AlertWritten { get; set; }
-
     public string RecommendedAction { get; set; } = string.Empty;
     public string? AlertFilePath { get; set; }
 

@@ -74,6 +74,36 @@ public sealed class MaintenanceService
         return result;
     }
 
+    /// <summary>
+    /// Corrige os CONTADORES de espaço/linhas do catálogo (DBCC UPDATEUSAGE) — relatórios de tamanho e
+    /// sp_spaceused errados, típico de bancos vindos do SQL 2000/2005. Só ajusta metadados; não toca em dados.
+    /// </summary>
+    public async Task<RepairResult> UpdateUsageAsync(
+        DatabaseInfo db, string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default)
+    {
+        Report(progress, db.Name, RepairLogLevel.Info, $"Corrigindo os contadores de espaço de [{db.Name}] (DBCC UPDATEUSAGE)...");
+        await using var session = await _data.OpenSessionAsync(connectionString, ct);
+        var sql =
+            "DECLARE @c nvarchar(max) = N'DBCC UPDATEUSAGE (' + QUOTENAME(@db) + N') WITH COUNT_ROWS;';\n" +
+            "EXEC sys.sp_executesql @c;";
+        var r = await session.ExecuteAsync("DBCC UPDATEUSAGE", sql,
+            new Dictionary<string, object?> { ["@db"] = db.Name }, AppConstants.RepairCommandTimeoutSeconds, ct);
+        var fixedCount = r.InfoMessages.Count(m => m.Contains("UPDATEUSAGE", StringComparison.OrdinalIgnoreCase)
+                                                 || m.Contains("Usage counts", StringComparison.OrdinalIgnoreCase)
+                                                 || m.Contains("contagens", StringComparison.OrdinalIgnoreCase));
+        foreach (var m in r.ErrorMessages) Report(progress, db.Name, RepairLogLevel.Warning, "    " + m);
+        var result = new RepairResult
+        {
+            Status = r.Success ? RepairStatus.Success : RepairStatus.Failed,
+            FinalStateDesc = db.StateDesc,
+            Message = r.Success
+                ? (fixedCount > 0 ? $"Contadores de espaço corrigidos ({fixedCount} ajuste(s) no catálogo)." : "Contadores de espaço conferidos: já estavam corretos.")
+                : "Não foi possível corrigir os contadores de espaço (veja o registro)."
+        };
+        Report(progress, db.Name, r.Success ? RepairLogLevel.Success : RepairLogLevel.Warning, result.Message);
+        return result;
+    }
+
     private static string Quote(string ident) => "[" + ident.Replace("]", "]]") + "]";
 
     private void Report(IProgress<RepairLogEntry> p, string db, RepairLogLevel level, string message)
