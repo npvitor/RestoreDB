@@ -342,6 +342,24 @@ public sealed class RepairIntegrationTests
     }
 
     [IntegrationFact]
+    public async Task Manutencao_ComFalha_NaoDizQueConcluiu()
+    {
+        await using var db = await TestDatabase.CreateAsync("maintfail", withData: false);
+        // Chave GUID aleatória: índice bem fragmentado e com mais de 100 páginas.
+        await It.ExecAsync($"EXEC(N'USE {It.Q(db.Name)}; " +
+            "CREATE TABLE dbo.F(Id uniqueidentifier NOT NULL DEFAULT NEWID() PRIMARY KEY, Pad char(800) NOT NULL); " +
+            "INSERT dbo.F(Pad) SELECT TOP (5000) ''x'' FROM sys.all_objects a CROSS JOIN sys.all_objects b;');");
+        // Somente leitura: o REBUILD/REORGANIZE (e o sp_updatestats) falham.
+        await It.ExecAsync($"ALTER DATABASE {It.Q(db.Name)} SET READ_ONLY WITH ROLLBACK IMMEDIATE;");
+
+        var r = await new MaintenanceService(new LogService()).RunMaintenanceAsync(db.AsInfo("ONLINE"), It.Conn, It.NoProgress);
+
+        Assert.Equal(RepairStatus.Failed, r.Status);
+        Assert.DoesNotContain("Manutenção concluída", r.Message);
+        Assert.Contains("INCOMPLETA", r.Message);
+    }
+
+    [IntegrationFact]
     public async Task Anexar_BancoDesanexado_VoltaOnline()
     {
         await using var db = await TestDatabase.CreateAsync("attach");

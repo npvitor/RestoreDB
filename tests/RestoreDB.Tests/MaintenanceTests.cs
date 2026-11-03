@@ -1,4 +1,5 @@
 using RestoreDB.Domain.Models;
+using RestoreDB.Services;
 using Xunit;
 
 namespace RestoreDB.Tests;
@@ -20,6 +21,22 @@ public class MaintenanceTests
     [InlineData(9.9, false)]
     public void Fragmentation_NeedsMaintenance(double pct, bool expected)
         => Assert.Equal(expected, new IndexFragmentation { FragmentationPercent = pct }.NeedsMaintenance);
+
+    [Theory]
+    [InlineData(3, 1, true)]
+    [InlineData(3, 0, false)]
+    [InlineData(0, 0, false)]
+    public void ManutencaoComFalha_NaoDizQueConcluiu(int indexes, int failed, bool statsOk)
+    {
+        var msg = MaintenanceService.Summary(indexes, failed, statsOk);
+        Assert.DoesNotContain("concluída", msg);
+        Assert.Contains("INCOMPLETA", msg);
+        Assert.Contains($"{indexes - failed} de {indexes}", msg);
+    }
+
+    [Fact]
+    public void ManutencaoSemFalha_DizQueConcluiu()
+        => Assert.StartsWith("Manutenção concluída: 2 índice(s)", MaintenanceService.Summary(2, 0, true));
 
     [Fact]
     public void TableLoss_ComputesRowsLost()

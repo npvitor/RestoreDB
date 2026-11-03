@@ -44,7 +44,7 @@ public sealed class MaintenanceService
         Report(progress, db.Name, RepairLogLevel.Info,
             $"{targets.Count} índice(s) precisam de manutenção (de {frags.Count} avaliado(s)).");
 
-        var ok = true;
+        var failed = 0;
         foreach (var f in targets)
         {
             var op = f.RecommendedAction; // REBUILD ou REORGANIZE
@@ -56,7 +56,7 @@ public sealed class MaintenanceService
                 new Dictionary<string, object?> { ["@db"] = db.Name, ["@stmt"] = inner }, AppConstants.RepairCommandTimeoutSeconds, ct);
             Report(progress, db.Name, r.Success ? RepairLogLevel.Success : RepairLogLevel.Warning,
                 $"  {(r.Success ? "✔" : "⚠")} {op} {f.Table}/{f.Index} ({f.FragmentationPercent:0.#}%)");
-            ok = ok && r.Success;
+            if (!r.Success) failed++;
         }
 
         // Atualizar estatísticas (sempre, mesmo sem fragmentação relevante).
@@ -68,11 +68,19 @@ public sealed class MaintenanceService
         Report(progress, db.Name, stats.Success ? RepairLogLevel.Success : RepairLogLevel.Warning,
             stats.Success ? "Estatísticas atualizadas." : "Não foi possível atualizar todas as estatísticas.");
 
-        result.Status = ok && stats.Success ? RepairStatus.Success : RepairStatus.Failed;
-        result.Message = $"Manutenção concluída: {targets.Count} índice(s) tratado(s), estatísticas atualizadas.";
-        Report(progress, db.Name, RepairLogLevel.Success, result.Message);
+        result.Status = failed == 0 && stats.Success ? RepairStatus.Success : RepairStatus.Failed;
+        result.Message = Summary(targets.Count, failed, stats.Success);
+        Report(progress, db.Name, result.Status == RepairStatus.Success ? RepairLogLevel.Success : RepairLogLevel.Warning, result.Message);
         return result;
     }
+
+    /// <summary>Resumo da manutenção — nunca diz "concluída" se algum índice ou as estatísticas falharam.</summary>
+    internal static string Summary(int indexes, int failed, bool statsOk)
+        => failed == 0 && statsOk
+            ? $"Manutenção concluída: {indexes} índice(s) tratado(s), estatísticas atualizadas."
+            : $"Manutenção INCOMPLETA: {indexes - failed} de {indexes} índice(s) tratado(s)" +
+              (statsOk ? ", estatísticas atualizadas." : "; as estatísticas NÃO foram atualizadas.") +
+              " Veja o registro de operações.";
 
     /// <summary>
     /// Corrige os CONTADORES de espaço/linhas do catálogo (DBCC UPDATEUSAGE) — relatórios de tamanho e
