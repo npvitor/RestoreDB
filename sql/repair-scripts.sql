@@ -1,11 +1,15 @@
 /* ============================================================================
-   RestoreDB — Scripts T-SQL de reparo (Módulo de Faturamento)
+   RestoreDB — Scripts T-SQL de reparo (referência para DBA)
    Compatíveis com SQL Server 2008 R2 (e versões superiores).
 
-   Estes são EXATAMENTE os comandos que a aplicação executa. Na aplicação eles
-   são montados com QUOTENAME(@db) e executados via sp_executesql (o nome do
-   banco entra como parâmetro, evitando injeção de SQL). Aqui estão na forma
-   legível, com o placeholder [NomeDoBanco] para revisão por um DBA.
+   REFERÊNCIA dos comandos principais do fluxo de reparo, na forma legível, com
+   o placeholder [NomeDoBanco], para revisão por um DBA. Não cobre todas as
+   opções da aplicação (log cheio, arquivos inacessíveis, ajustes, salvamento,
+   quarentena...) e pode não refletir cada detalhe da versão atual: o script
+   exato para um banco aparece no app em "Ver script planejado (não executa
+   nada)" e cada comando executado fica no Registro de operações. Na aplicação
+   os comandos são montados com QUOTENAME(@db) e executados via sp_executesql
+   (o nome do banco entra como parâmetro, evitando injeção de SQL).
 
    AVISO: comandos marcados como DESTRUTIVOS podem causar PERDA DE DADOS.
    ============================================================================ */

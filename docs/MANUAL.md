@@ -1,649 +1,543 @@
 # Manual de Utilização — RestoreDB
 
-**RestoreDB — Diagnóstico, Reparo e Manutenção de Bancos SQL Server (Módulo de Faturamento)**
+**RestoreDB — Diagnóstico e reparo de bancos SQL Server**
 
-Ferramenta para desktop (Windows) que ajuda a **diagnosticar, reparar, restaurar e manter**
-bancos de dados SQL Server — em estados problemáticos (`SUSPECT`, `RECOVERY_PENDING`,
-`EMERGENCY`, `RECOVERING`, `RESTORING`, `OFFLINE`) **ou aparentemente saudáveis** (`ONLINE`) —
-com linguagem acessível a usuários não técnicos. Compatível com **SQL Server 2008 R2** e superiores.
+Este manual é para quem atende o cliente: explica, em linguagem simples, como usar a ferramenta em
+cada situação, o que cada botão faz e qual o risco. Os nomes entre aspas são exatamente os que
+aparecem na tela.
 
-> **Princípio central:** a ferramenta sempre tenta **primeiro o caminho SEM perda de dados**.
-> Qualquer operação que possa descartar dados exige **confirmação explícita** — e, quando há
-> risco de perda, é possível **simular antes** para ver exatamente o que seria descartado.
+> **Regra de ouro:** comece sempre pelo **Diagnosticar** (não altera nada) e siga as opções **de
+> cima para baixo** no Passo 2 — elas estão em ordem de risco. Se ficar em dúvida diante de uma
+> opção vermelha, **pare e chame o DBA**: esperar não piora o banco; uma decisão errada pode piorar.
 
 ---
 
 ## Sumário
 
-1. [Antes de começar (requisitos)](#1-antes-de-começar-requisitos)
-2. [Conceitos importantes](#2-conceitos-importantes)
-3. [Tela de conexão](#3-tela-de-conexão)
-4. [Tela principal — visão geral](#4-tela-principal--visão-geral)
-5. [Entendendo os estados dos bancos](#5-entendendo-os-estados-dos-bancos)
-6. [Passo a passo do reparo](#6-passo-a-passo-do-reparo)
-7. [Diagnóstico — o que é verificado](#7-diagnóstico--o-que-é-verificado)
-8. [As opções de reparo em detalhe](#8-as-opções-de-reparo-em-detalhe)
-9. [Restauração de backup (básica e avançada)](#9-restauração-de-backup-básica-e-avançada)
-10. [Manutenção e prevenção](#10-manutenção-e-prevenção)
-11. [Ferramentas e cenários especiais](#11-ferramentas-e-cenários-especiais)
-12. [Recursos auxiliares](#12-recursos-auxiliares)
-13. [Modo escuro](#13-modo-escuro)
-14. [Onde ficam os registros (logs)](#14-onde-ficam-os-registros-logs)
-15. [Segurança e proteções automáticas](#15-segurança-e-proteções-automáticas)
-16. [Boas práticas](#16-boas-práticas)
-17. [Solução de problemas (FAQ)](#17-solução-de-problemas-faq)
-18. [Glossário rápido](#18-glossário-rápido)
+1. [Antes de começar](#1-antes-de-começar)
+2. [Conectar ao servidor](#2-conectar-ao-servidor)
+3. [A tela principal](#3-a-tela-principal)
+4. [O que significam os estados](#4-o-que-significam-os-estados)
+5. [O fluxo em três passos](#5-o-fluxo-em-três-passos)
+6. [As opções do Passo 2, uma a uma](#6-as-opções-do-passo-2-uma-a-uma)
+7. [Situações comuns — o que fazer](#7-situações-comuns--o-que-fazer)
+8. [Ferramentas adicionais](#8-ferramentas-adicionais)
+9. [Anexar um banco a partir do .mdf](#9-anexar-um-banco-a-partir-do-mdf)
+10. [Registro, relatório e cancelamento](#10-registro-relatório-e-cancelamento)
+11. [Verificação agendada (monitoramento)](#11-verificação-agendada-monitoramento)
+12. [Quando algo dá errado](#12-quando-algo-dá-errado)
+13. [Limites — o que a ferramenta não faz](#13-limites--o-que-a-ferramenta-não-faz)
+14. [Onde ficam os arquivos](#14-onde-ficam-os-arquivos)
+15. [Glossário](#15-glossário)
 
 ---
 
-## 1. Antes de começar (requisitos)
+## 1. Antes de começar
 
-- **Windows** com o aplicativo RestoreDB instalado.
-- **Acesso a uma instância do SQL Server** (2008 R2 ou superior).
-- Um **login com permissão de `sysadmin`** na instância. As operações de reparo, restauração e
-  manutenção (`DBCC CHECKDB`, `ALTER DATABASE`, `RESTORE`, `ALTER INDEX`) exigem esse nível.
-- Para a **reconstrução de log**, o **anexar arquivos** e a **concessão de permissão aos arquivos do
-  banco** ([8.7](#87-corrigir-acesso-aos-arquivos-e-religar-sem-perda-de-dados)), execute a ferramenta
-  **como Administrador** do Windows e diretamente no servidor.
+Você precisa de:
 
-> ✅ **Versões validadas:** todas as funções foram testadas no **SQL Server 2008 R2 SP3 Express** (a
-> mesma família usada em produção) e no **SQL Server 2025**, com autenticação SQL e do Windows.
+- **Windows 10 ou 11.** Use a pasta publicada do RestoreDB inteira (o `RestoreDB.App.exe` e as
+  DLLs que ficam ao lado dele).
+- **SQL Server 2008 R2 até 2025** (inclusive Express).
+- **Um login sysadmin** no SQL Server (ex.: `sa` ou um usuário do Windows administrador da
+  instância). Sem sysadmin, a ferramenta avisa logo ao conectar e os reparos vão falhar.
+- **Para duas opções específicas** — *Corrigir acesso aos arquivos e religar* (quando falta
+  permissão na pasta) e *Reconstruir log (recriar .ldf)* —, rodar o RestoreDB **no próprio
+  servidor** do SQL Server, com **botão direito → Executar como administrador**. Sem isso a
+  ferramenta não altera nada e mostra no registro os comandos para o suporte.
+- **Espaço em disco** no servidor: algumas opções fazem backups de segurança e cópias do banco.
 
-> A ferramenta conecta-se sempre ao catálogo **`master`** — nunca diretamente ao banco com
-> problema. Isso é o procedimento correto e seguro.
+Antes de qualquer operação que mexa no banco, **avise o cliente**: quem estiver usando o sistema é
+desconectado durante reparos e restaurações.
 
----
+## 2. Conectar ao servidor
 
-## 2. Conceitos importantes
+1. Em **SERVIDOR**, digite o nome da instância. Exemplos: `localhost`, `.\SQLEXPRESS`,
+   `NOMEDOSERVIDOR\INSTANCIA`, `192.168.0.10,1433`.
+2. Escolha a autenticação:
+   - marque **"Usar autenticação do Windows (Integrated Security)"** para entrar com o usuário do
+     Windows; ou
+   - deixe desmarcado e preencha **USUÁRIO** e **SENHA** (login do SQL Server).
+3. Clique em **"Conectar"**.
 
-- **Diagnóstico primeiro, ação depois.** Para qualquer banco — inclusive um que parece saudável —
-  a ação inicial recomendada é **diagnosticar** (somente leitura). Só depois a ferramenta libera
-  **apenas as opções que fazem sentido** para a situação encontrada.
-- **`ONLINE` não é garantia de saúde.** Um banco pode estar `ONLINE` e, ainda assim, ter corrupção
-  física ou de integridade (ex.: um registro apontando para outro que não existe mais). Por isso
-  você pode **diagnosticar qualquer banco**.
-- **Sem perda de dados sempre que possível.** A ferramenta tenta religar/recuperar, reconstruir
-  índices ou corrigir a integridade antes de qualquer caminho destrutivo.
-- **Simular antes de arriscar.** Quando o único caminho é o reparo com perda de dados, você pode
-  **simular numa cópia** e ver a **perda exata por tabela** antes de decidir.
-- **Confirmação explícita** para tudo que pode perder dados (caixa de seleção + diálogo).
-- **Tudo é registrado** no painel **Registro de operações** e em arquivo (veja a [seção 14](#14-onde-ficam-os-registros-logs)).
+Se aparecer **"RestoreDB — Aviso de pré-requisito"**, leia: normalmente é porque o login não é
+sysadmin. Responda **Não** e conecte com outro login. A senha não é guardada; ela é pedida de novo
+a cada abertura.
 
----
+## 3. A tela principal
 
-## 3. Tela de conexão
+- **Topo:** servidor conectado, versão do SQL Server e se o login é sysadmin. Botões
+  **"⟳ Atualizar lista"**, **"📎 Anexar .mdf"**, **"Trocar conexão"** e **"🌙 Tema escuro"** /
+  **"☀ Tema claro"**.
+- **Bancos de dados (esquerda):** a lista de bancos com o **Estado**. Use **"🔍 Filtrar por
+  nome..."** para achar um banco.
+  - **Vermelho** = estado problemático (fora do ar ou em recuperação).
+  - **Amarelo** = `ONLINE`, mas travado (acesso restrito ou somente leitura).
+  - Um banco sem cor pode, mesmo assim, ter corrupção — **só o diagnóstico mostra**.
+- **Centro:** o banco selecionado, o indicador **Diagnosticar → Resolver → Conferir** e a faixa
+  **"PRÓXIMO PASSO"**, que diz o que fazer agora. Abaixo, **"RESULTADO DA ÚLTIMA OPERAÇÃO"** (verde
+  = deu certo, amarelo = atenção, vermelho = falhou), os cartões do **Passo 1** e do **Passo 2** e as
+  **Ferramentas adicionais**.
+- **Registro de operações (embaixo):** cada comando executado, em tempo real.
+- **Barra de status:** o que está acontecendo, o botão **"■ Cancelar operação"** (só durante uma
+  operação) e o caminho do arquivo de log.
 
-Ao abrir a ferramenta, aparece a tela **RestoreDB — Conexão**.
+## 4. O que significam os estados
 
-| Campo | O que informar |
-|---|---|
-| **SERVIDOR** | Nome ou endereço da instância. Ex.: `localhost`, `.\SQLEXPRESS`, `192.168.0.10,1433` |
-| **Usar autenticação do Windows (Integrated Security)** | Marque para entrar com o usuário do Windows. Ao marcar, os campos Usuário/Senha são desativados. |
-| **USUÁRIO** / **SENHA** | Usados apenas na autenticação do SQL Server (quando a caixa acima está **desmarcada**). Ex.: usuário `sa`. |
-
-Clique em **Conectar**.
-
-**Pré-checagem automática:** logo após conectar, a ferramenta **avisa** caso o login **não seja
-`sysadmin`** (os reparos provavelmente falharão) ou a instância seja **Azure SQL Database** (onde os
-comandos de reparo locais não se aplicam). Você pode continuar mesmo assim, mas o ideal é um login
-`sysadmin`.
-
-> Os demais parâmetros (tempo limite, criptografia, *application name*, etc.) são pré-definidos e
-> compatíveis com o TLS antigo do **SQL Server 2008 R2** (um aviso benigno de “TLS 1.0” pode aparecer).
-
----
-
-## 4. Tela principal — visão geral
-
-Após conectar, abre a tela principal. A **lista de bancos** fica à esquerda e o **fluxo guiado**
-ocupa o maior espaço à direita (você pode arrastar o divisor entre eles). O fluxo tem três passos —
-**1 Diagnosticar → 2 Resolver → 3 Conferir** — e só libera a próxima ação quando ela faz sentido,
-sempre da **menos** para a **mais** arriscada.
-
-```
-┌──────────────────────────────────────────────────────────────────────────────────────┐
-│ RestoreDB · info do servidor           [Atualizar lista] [Anexar .mdf] [Trocar] [Tema] │
-├─────────────────────┬────────────────────────────────────────────────────────────────┤
-│ BANCOS DE DADOS     │ BANCO SELECIONADO  [ESTADO]       ① Diagnosticar ─ ② Resolver ─ ③ │
-│ N no servidor •     │ PRÓXIMO PASSO: o que fazer agora                                │
-│ X precisam atenção  ├────────────────────────────────────────────────────────────────┤
-│ [Filtrar por nome]  │ RESULTADO DA ÚLTIMA OPERAÇÃO                                    │
-│ Banco | Estado      ├───────────────────────────────┬────────────────────────────────┤
-│ (problemáticos em   │ ① DIAGNOSTICAR                │ ② RESOLVER                     │
-│  vermelho)          │ [Diagnosticar] + resultado    │ opções em ordem de risco:      │
-│                     │                               │ SEM PERDA → QUARENTENA →       │
-│                     │                               │ RESTAURA BACKUP → PODE PERDER  │
-│                     ├───────────────────────────────┴────────────────────────────────┤
-│                     │ FERRAMENTAS ADICIONAIS (recolhíveis)                            │
-├─────────────────────┴────────────────────────────────────────────────────────────────┤
-│ REGISTRO DE OPERAÇÕES (log ao vivo)                        [Exportar relatório] [Limpar]│
-├──────────────────────────────────────────────────────────────────────────────────────┤
-│ [andamento] mensagem de status            [■ Cancelar operação]   caminho do log       │
-└──────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-- **Cabeçalho:** `Servidor`, `Catálogo: master`, edição/versão e se o login é `sysadmin`. À
-  direita: **Atualizar lista**, **Anexar .mdf** (veja [11.4](#114-anexar-um-banco-a-partir-de-um-arquivo-mdf)),
-  **Trocar conexão** e **Tema**.
-- **Lista de bancos:** todas as bases e seu **Estado**; problemáticos **em vermelho**. O campo
-  **“Filtrar por nome”** ajuda em servidores com muitos bancos.
-- **Banco selecionado:** nome, estado, o **indicador de passos** (✓ = concluído, azul = passo atual)
-  e a faixa **“PRÓXIMO PASSO”**, que diz em linguagem simples o que fazer agora.
-- **Resultado da última operação:** aparece logo abaixo, em verde (sucesso), amarelo (atenção) ou
-  vermelho (falha).
-- **Passo 1 — Diagnosticar** e **Passo 2 — Resolver:** lado a lado em telas largas, um abaixo do
-  outro em telas estreitas. Antes do diagnóstico o Passo 2 fica **bloqueado** (🔒).
-- **Ferramentas adicionais:** grupos recolhíveis fora do fluxo de reparo — **“Verificar uma tabela /
-  reajustar identidades”**, **“Manutenção preventiva e verificação agendada”** e **“Recuperar exclusão
-  acidental”**.
-- **Registro de operações:** cada passo, colorido por tipo (informação, comando, sucesso, aviso, erro).
-- **Barra de status:** mensagem atual e o caminho do arquivo de log do dia; durante uma operação
-  mostra o **andamento** e o botão **“■ Cancelar operação”**.
-
----
-
-## 5. Entendendo os estados dos bancos
-
-| Estado | Situação | É problema? | Caminho típico |
-|---|---|---|---|
-| **ONLINE** | Disponível. Pode estar saudável **ou** corrompido sem aparentar. | Talvez | **Diagnosticar** para confirmar |
-| **OFFLINE** | Desligado manualmente. Religável sem perda. | Sim | Religar (modo seguro) |
-| **RESTORING** | Em restauração / aguardando finalização. | Sim | Finalizar recuperação (sem perda) |
-| **RECOVERING** | Em recuperação automática. | Sim | Aguardar / finalizar (sem perda) |
-| **RECOVERY_PENDING** | Recuperação pendente — geralmente falta de arquivo/recurso. | Sim | **Diagnosticar**: arquivo inacessível ou log cheio têm correção própria, sem perda |
-| **SUSPECT** | Suspeito — possível corrupção. | Sim | Diagnóstico + reparo (1º sem perda) |
-| **EMERGENCY** | Modo de emergência (somente leitura, usado durante o reparo). | Sim | Diagnóstico + reparo (1º sem perda) |
-
-> Em estados demorados (`RECOVERING`/`RESTORING`), o diagnóstico mostra o **progresso** da operação
-> (“faltam ~X min”) para você saber que **não** está travado — basta aguardar.
-
----
-
-## 6. Passo a passo do reparo
-
-### Passo 1 — Selecione o banco
-Clique no banco na lista. O painel mostra o **nome**, o **ESTADO ATUAL** e a **AÇÃO RECOMENDADA**.
-Para **banco de sistema** (`master`, `model`, `msdb`, `tempdb`) com problema, o reparo automático
-**não é permitido** — há um botão **“Ver procedimento manual recomendado”** (veja [11.5](#115-procedimento-manual-para-bancos-de-sistema)).
-
-### Passo 2 — Diagnostique (não altera o banco)
-Clique em **“🔍 Diagnosticar (sem alterar o banco)”**. É **somente leitura**.
-- Para bancos **muito grandes**, marque **“Verificação rápida (PHYSICAL_ONLY)”** para uma checagem
-  física mais veloz.
-- O que é verificado está na [seção 7](#7-diagnóstico--o-que-é-verificado).
-
-### Passo 3 — Leia o resultado
-Aparece o painel **RESULTADO DO DIAGNÓSTICO**, com:
-- um **resumo** e a linha **“→ Ação recomendada: …”** (cor indica a gravidade);
-- ⚠ **“NOVO desde a última verificação”**, quando algo piorou em relação a uma checagem anterior;
-- **POLÍTICA DE BACKUP / SAÚDE LÓGICA**: avisos de RPO (ex.: FULL sem backup de log), índices
-  desabilitados, dependências quebradas e **causa-raiz** (erros de E/S, corrupção recorrente).
-
-### Passo 4 — Execute a opção recomendada
-No **Passo 2 — Resolver**, a ferramenta exibe **apenas a(s) opção(ões) aplicável(is)**, em ordem de risco (cada uma traz um selo: **SEM PERDA**, **QUARENTENA**, **RESTAURA BACKUP**, **PODE PERDER DADOS** ou **ÚLTIMO RECURSO**). Comece pela primeira.
-
-| O diagnóstico concluiu… | O que aparece em “Como resolver” | Perde dados? |
+| Estado | O que quer dizer | Gravidade |
 |---|---|---|
-| Nenhuma corrupção | Nada a fazer (ou **Reparar — modo seguro**, se o banco estiver fora do ar) | Não |
-| Corrupção só em índices | **Reparar índices** ([8.1](#81-reparar-índices-sem-perda-de-dados)) | Não |
-| Arquivo ausente / sem permissão / preso | **Corrigir acesso aos arquivos e religar** ([8.7](#87-corrigir-acesso-aos-arquivos-e-religar-sem-perda-de-dados)) | Não |
-| Log de transações cheio (9002) | **Resolver log cheio** ([8.6](#86-resolver-log-cheio-sem-perda-de-dados)) | Não |
-| Registros órfãos (chave estrangeira) | **Corrigir integridade** — pai recuperado do backup; o resto vai para a quarentena ([8.3](#83-corrigir-integridade-remover-registros-órfãos)) | Não* |
-| Corrupção de dados | **Restaurar de backup** / **restaurar páginas**; alternativa: reparo seguro → reparo com perda ([8.4](#84-reparo-com-possível-perda-de-dados-exige-confirmação)) | Só no reparo com perda (e as linhas voltam do backup quando a cadeia permite) |
-| Problema no log (`.ldf`) | Reparo seguro e **Reconstruir o log** ([8.5](#85-reconstruir-o-log-último-recurso)) | Talvez |
-
-\* As linhas saem da tabela, mas ficam guardadas na quarentena (`RestoreDB_Quarentena`).
-
-> A qualquer momento, **“Ver script planejado (não executa nada)”** mostra o T-SQL que *seria*
-> executado (para um DBA revisar ou rodar manualmente).
-
----
-
-## 7. Diagnóstico — o que é verificado
-
-O diagnóstico cruza **fontes oficiais** e é **somente leitura**:
-
-- **Consistência física** — `DBCC CHECKDB` (estruturado): identifica objeto/índice afetado e o nível
-  mínimo de reparo. A verificação completa inclui **valores inválidos** (`DATA_PURITY`) e, se o
-  disco estiver cheio demais para o snapshot interno, repete automaticamente de outro modo
-  (`TABLOCK`) em vez de falhar. Opção **`PHYSICAL_ONLY`** para uma varredura rápida.
-- **Integridade lógica** — `DBCC CHECKCONSTRAINTS`: encontra **registros órfãos** (chave estrangeira
-  apontando para um registro inexistente) — o que o CHECKDB **não** detecta. Quando há corrupção
-  **física**, esta checagem é **adiada** (ela lê os dados e poderia interromper a sessão) — repare o
-  físico primeiro e diagnostique de novo.
-- **Constraints desabilitadas** (desligadas de propósito pelo sistema, `NOCHECK`) são apenas
-  **informadas** — as linhas que as violam **não** são tratadas como corrupção nem removidas.
-- **Metadados** — `DBCC CHECKCATALOG`.
-- **Páginas suspeitas** (`msdb.suspect_pages`) e **log de erros** do SQL (erros 823/824/825 = E/S,
-  9002 = log cheio), reconciliados com o estado atual (sem falso positivo de corrupção já resolvida).
-- **Saúde lógica adicional** — índices **desabilitados**, **dependências quebradas**, constraints
-  **não confiáveis**.
-- **Política de backup (RPO)** — modelo de recuperação × histórico de backups (alerta FULL sem log,
-  full antiga, etc.), classificado por severidade.
-- **Causa-raiz** — erros de E/S e **corrupção recorrente** (via histórico) ⇒ suspeita de hardware/volume.
-- **Arquivos do banco** — confere **no servidor** se cada `.mdf`/`.ndf`/`.ldf` existe e lê no log de
-  erros as falhas de abertura (**arquivo ausente**, **sem permissão** — erro 5 —, **preso por outro
-  processo** — erro 32). Isso **não é corrupção** e tem ação própria ([8.7](#87-corrigir-acesso-aos-arquivos-e-religar-sem-perda-de-dados)).
-- **Log de transações** — % usado, o que impede a reutilização (`LOG_BACKUP`, transação aberta,
-  replicação...) e se os arquivos de log ainda podem crescer. Log cheio (9002) **não é corrupção** e
-  tem ação própria ([8.6](#86-resolver-log-cheio-sem-perda-de-dados)).
-- **Topologia** (espelhamento/AG/log shipping/replicação), **espaço em disco**, **`PAGE_VERIFY`**,
-  **criptografia (TDE)** e **progresso** de recuperações em andamento.
-- **Histórico** — cada diagnóstico é guardado e comparado com o anterior para apontar o que é **novo**.
-
----
-
-## 8. As opções de reparo em detalhe
-
-A opção exibida depende do diagnóstico:
-
-### 8.1. Reparar índices (sem perda de dados)
-**Quando:** a corrupção está **restrita a índices não-clusterizados** (redundantes).
-**O que faz:** reconstrói (`ALTER INDEX … REBUILD`) os índices afetados e verifica.
-**Resultado:** banco consistente, **zero perda**.
-
-### 8.2. Reparar (modo seguro, sem perda de dados)
-**Quando:** `OFFLINE`, `RESTORING`, `RECOVERING`, `RECOVERY_PENDING` e casos em que o caminho seguro
-basta; também para um banco **`ONLINE` corrompido** (repara em acesso exclusivo, sem precisar de
-emergência).
-**O que faz (escalonamento automático):** religar / finalizar recuperação / `REPAIR_REBUILD`, com
-verificação. Se **não** bastar, a ferramenta passa a oferecer o reparo com perda — que **exige
-confirmação** ([8.4](#84-reparo-com-possível-perda-de-dados-exige-confirmação)).
-
-### 8.3. Corrigir integridade (remover registros órfãos)
-**Quando:** o diagnóstico encontrou **violações de chave estrangeira** (registros órfãos), com os
-arquivos físicos íntegros.
-**O que faz:** obtém acesso exclusivo, faz **backup de segurança** e, **antes de remover qualquer
-linha, tenta recuperar o "registro-pai" que faltava a partir de um backup** — assim o registro
-**filho** (que normalmente está saudável, apenas sem referência) é **preservado**. Só as linhas cujo
-pai **não existir em backup nenhum** são **removidas** (só violações de chave estrangeira; violações
-de CHECK são apenas reportadas). Reverifica ao final.
-
-**As linhas "removidas" não se perdem — vão para a QUARENTENA.** Na mesma transação em que saem da
-tabela, elas são copiadas para o banco **`RestoreDB_Quarentena`** (na mesma instância), numa tabela
-`<banco>__<schema>__<tabela>` com a **data** e a **constraint** de origem. Quando o registro-pai for
-recadastrado, dá para devolvê-las (`INSERT … SELECT` a partir da quarentena). Se a quarentena não
-puder ser usada, a exclusão simples é feita (há backup de segurança antes).
-> ℹ️ Gatilhos (triggers) da tabela **não disparam** nessas correções: é um reparo de dados, não uma
-> operação de negócio — um gatilho poderia, por exemplo, estornar estoque.
-
-**Recuperação do registro-pai a partir de backup (opcional).** No painel há o bloco
-**"RECUPERAÇÃO DE REGISTROS-PAI"**:
-- **Automático** (padrão): usa o **backup FULL mais recente** do histórico do servidor.
-- **📁 Escolher .bak…**: aponte um arquivo específico — útil quando o backup está em **outra mídia**
-  (HD externo, pasta de rede) que o histórico do servidor nem conhece. O botão **↺ Automático** volta
-  ao padrão.
-- Se a recuperação **falhar ou recuperar só parte** (arquivo ilegível, sem um backup FULL, ou sem o
-  pai procurado), a ferramenta **pergunta se você quer escolher OUTRO `.bak`** e tentar de novo,
-  mirando só os órfãos restantes — e **só remove os órfãos** quando você optar por **prosseguir**.
-  Nada é excluído sem essa decisão.
-
-**Atenção:** a remoção é destrutiva (descarta linhas) — exige confirmação. Para preservar 100% dos
-registros, prefira **restaurar de backup**.
-> 📁 O arquivo `.bak` escolhido precisa ser **legível pelo SQL Server** (a restauração roda no
-> servidor, não no aplicativo). Para servidor remoto, informe um caminho de **rede (UNC)** acessível
-> à conta de serviço do SQL Server.
-
-### 8.4. Reparo COM possível perda de dados (exige confirmação)
-**Quando:** o reparo seguro não resolveu e não há (ou não se quer) restaurar de backup. O painel
-de **restauração de backup** aparece lado a lado — é a alternativa que preserva 100% dos dados.
-**Simule antes:** clique em **“🔬 Simular antes (pré-visualizar a perda, sem tocar no banco)”** — a
-ferramenta restaura uma **cópia descartável**, executa o reparo **na cópia** e mostra a **perda exata
-por tabela** e se o banco ficaria limpo. **O banco real não é tocado.**
-**O que faz (ao confirmar):** primeiro a **rede de segurança automática** — captura as transações
-mais recentes (**tail-log**, que funciona mesmo com os arquivos de dados danificados) e um backup
-de segurança (`COPY_ONLY`); depois executa `DBCC CHECKDB … REPAIR_ALLOW_DATA_LOSS`, que
-**descarta** páginas corrompidas. Em seguida, **reconcilia** as chaves estrangeiras que a operação
-possa ter deixado órfãs — **recuperando o registro-pai a partir de um backup quando possível**
-(mesmo mecanismo da [seção 8.3](#83-corrigir-integridade-remover-registros-órfãos), inclusive a
-opção de escolher um `.bak` em outra mídia) e removendo só os órfãos irrecuperáveis —, **reajusta as
-identidades** e cria um **backup FULL novo** (os backups antigos deixam de ser confiáveis após o
-reparo). Os arquivos ficam na **pasta padrão de backups do servidor**.
-**Devolução automática das linhas descartadas (padrão: ligada).** Com a opção **“Devolver
-automaticamente, a partir dos backups, as linhas que o reparo descartar”**, depois do reparo a
-ferramenta compara a contagem de linhas **antes × depois** (e as páginas que o próprio reparo diz ter
-descartado), restaura numa **cópia temporária** a cadeia de backups **até o instante do reparo**
-(backup FULL → diferencial → logs → o tail-log recém-capturado) e **devolve só as linhas que faltam**
-(por chave primária, sem duplicar, com gatilhos desligados). A cópia é descartada ao final.
-Só é automático quando a cópia retrata **exatamente** o momento anterior ao reparo — tail-log
-capturado e cadeia contínua (modelo FULL). Sem isso (modelo SIMPLE, log ilegível, cadeia quebrada), a
-ferramenta **informa a perda por tabela** e orienta a revisão manual (**Recuperar para cópia** +
-**Assistente de salvamento**) — um backup mais antigo traria de volta também registros apagados de
-propósito.
-**Como usar:** marque **“Estou ciente e autorizo…”**, clique em **“Executar reparo COM perda de
-dados”** e confirme.
-> ⚠️ **Pode haver perda de dados** — prefira sempre **restaurar de backup**. Mas, se o banco tem
-> **cadeia de backups** (modelo FULL), o tail-log capturado antes do reparo permite depois
-> **restaurar até o instante imediatamente anterior** e recuperar 100% do que foi descartado
-> (peça ajuda ao suporte de nível 2/DBA usando a restauração ponto-no-tempo).
-
-### 8.5. Reconstruir o log (último recurso)
-**Quando:** o problema está no **log de transações** (`.ldf` corrompido/ausente) e o reparo não
-resolveu. A opção só aparece quando o **estado do banco indica** problema de log/recuperação
-(`SUSPECT`, `RECOVERY_PENDING`, `EMERGENCY`) ou quando o diagnóstico a recomendou — nunca como
-"saída" genérica para outras falhas.
-**O que faz:** coloca em emergência, **desanexa**, **remove** o `.ldf` antigo (preservando-o como
-`.corrupt_AAAAMMDDHHMMSS`) e o **recria** (`FOR ATTACH_REBUILD_LOG`), forçando o retorno a `ONLINE`.
-Ao final, cria um **backup FULL novo** (a reconstrução quebra a cadeia de backups de log).
-**Requisitos:** arquivos **acessíveis nesta máquina** e ferramenta **como Administrador**.
-> 🔒 Sem Administrador, a operação é **abortada ANTES de desanexar** — o banco **não é alterado** — e
-> as instruções manuais são exibidas. Alternativa sem Administrador: o **reparo com perda de dados**
-> (8.4) também reconstrói o log, inteiramente no servidor.
-
-### 8.6. Resolver log cheio (sem perda de dados)
-**Quando:** o diagnóstico acusa **log de transações cheio** (erro 9002) ou prestes a encher. Não é
-corrupção — o banco recusa gravações (ou não sobe) porque o `.ldf` não tem onde crescer.
-**O que faz (do menos ao mais invasivo):**
-1. descobre **o que segura o log**: se falta **backup de log** (modelo FULL), faz o `BACKUP LOG` na
-   pasta padrão de backups (**guarde o arquivo** — ele faz parte da cadeia); se é uma **transação
-   aberta**, mostra **quem** (sessão, máquina, programa, desde quando) — a ferramenta **não encerra
-   sessões por conta própria**; replicação/espelho atrasado → orientação;
-2. se o arquivo de log chegou ao **limite** ou está **sem crescimento automático** e há espaço no disco,
-   libera o crescimento;
-3. se o **disco do log está cheio**, cria um **arquivo de log extra** no disco da instância com mais
-   espaço livre (depois pode ser removido — o comando aparece no registro);
-4. se o banco estava fora do ar (`RECOVERY_PENDING`/`SUSPECT` por log cheio), **religa**.
-
-### 8.7. Corrigir acesso aos arquivos e religar (sem perda de dados)
-**Quando:** o SQL Server **não consegue abrir** um arquivo do banco — `RECOVERY_PENDING`/`SUSPECT`
-depois de trocar disco/letra de unidade, mexer em permissões, antivírus bloqueando etc. **Não é
-corrupção**, e nenhum reparo de DBCC resolveria.
-**O que faz:**
-- **Arquivo ausente** (foi movido): clique em **“📁 Localizar arquivo ausente…”** e aponte onde ele
-  está agora; a ferramenta confere que o **servidor** enxerga o caminho e atualiza o catálogo
-  (`ALTER DATABASE … MODIFY FILE`).
-- **Sem permissão** (erro 5): concede **Controle Total à conta de serviço do SQL Server** nos arquivos
-  (exige a ferramenta **como Administrador**, no servidor; sem isso, os comandos `icacls` para o
-  suporte aparecem no registro).
-- **Arquivo preso por outro processo** (erro 32): orienta a fechar antivírus/backup de arquivos/cópias.
-- Por fim, **religa** o banco (`SET ONLINE`) — a recuperação normal do SQL Server roda e **nada é
-  perdido**. Rode o diagnóstico de novo para confirmar.
-
----
-
-## 9. Restauração de backup (básica e avançada)
-
-Quando o diagnóstico aponta **corrupção de dados** (`.mdf`/`.ndf`), **restaurar é o caminho correto**.
-
-### 9.1. Restauração básica
-1. Selecione um backup do **histórico** (`msdb`) **ou** clique em **“Escolher arquivo .bak…”**.
-2. Deixe **“Substituir o banco existente (REPLACE)”** marcado.
-3. Clique em **“Restaurar o backup selecionado”** e confirme.
-A ferramenta verifica a mídia antes e **corrige usuários órfãos** ao final.
-
-### 9.2. Restaurar cadeia completa (mais recente)
-**“Restaurar cadeia completa (mais recente)”** monta automaticamente **FULL → diferencial → logs** a
-partir do histórico, **captura o tail-log** (transações mais recentes) e valida a **continuidade**
-antes de executar — se a cadeia estiver quebrada, **aborta** sem alterar o banco.
-
-### 9.3. Mais opções de restauração (avançado)
-Recolhidas sob **“Mais opções de restauração (avançado)”**:
-
-- **Restaurar até um ponto no tempo (STOPAT):** marque a opção, escolha **data e hora** e use a
-  cadeia/STANDBY para restaurar **até aquele instante**.
-- **Testar backup (restauração de teste):** restaura num banco **descartável** e roda `DBCC CHECKDB`,
-  comprovando que o backup é **íntegro e restaurável** — **sem tocar na produção**.
-- **Verificar saúde dos backups:** roda `RESTORE VERIFYONLY` em todo o histórico.
-- **Recuperar para cópia (salvamento):** restaura num banco novo (`…_Recuperado`) para **extrair
-  dados** sem tocar no original. Em seguida, o **Assistente de salvamento** copia de volta ao banco
-  vivo apenas as **linhas que faltam** (por chave primária, sem duplicar).
-- **Restaurar em STANDBY (somente leitura):** deixa o banco **consultável** entre os logs, para você
-  inspecionar e achar o ponto certo; depois use **“Finalizar recuperação”**.
-- **Restaurar apenas as páginas afetadas:** quando poucas páginas estão corrompidas, recupere
-  **só elas** (exige modelo FULL/BULK e a cadeia de backups). Quando o diagnóstico recomenda esse
-  caminho, o campo já vem **preenchido automaticamente** com as páginas corrompidas — normalmente
-  basta clicar em **“Restaurar apenas estas páginas”**. A cadeia (FULL → diferencial → logs + um
-  backup de log novo) é montada e validada automaticamente; se estiver incompleta, a operação é
-  abortada com explicação, sem alterar o banco.
-
-> Backups **divididos em vários arquivos (striped)** e **comprimidos** são reconhecidos e tratados
-> automaticamente.
-
----
-
-## 10. Manutenção e prevenção
-
-Em **Ferramentas adicionais**, no grupo recolhível **“Manutenção preventiva e verificação agendada”**:
-
-### 10.1. Otimizar índices e estatísticas (manutenção preventiva)
-**“Otimizar índices e estatísticas”** desfragmenta os índices conforme a fragmentação
-(10–30% ⇒ `REORGANIZE`; acima de 30% ⇒ `REBUILD`) e atualiza as estatísticas. **Não é destrutivo.**
-Use periodicamente para manter o desempenho.
-
-### 10.2. Verificação agendada (monitoramento + alerta)
-**“Configurar verificação agendada (gerar comando)”** mostra um comando pronto do **Agendador de
-Tarefas do Windows** que roda uma verificação diária (via utilitário `RestoreDB.Probe`). Quando
-aparece **algo novo** (corrupção/violações), é gravado um **alerta** em
-`%LOCALAPPDATA%\RestoreDB\Alerts` e o utilitário sinaliza com um **código de saída** que o Agendador
-pode usar para **enviar e-mail** ao suporte. É a **detecção precoce** de problemas.
-
-> O utilitário usa a **autenticação do Windows** da conta que executa a tarefa (recomendado). Se a
-> instância só aceitar **autenticação SQL**, defina também as variáveis `PROBE_USER` e `PROBE_PASS`
-> na tarefa — lembre-se de que a senha fica gravada na configuração da tarefa; use um login dedicado.
-
----
-
-## 11. Ferramentas e cenários especiais
-
-### 11.1. Recuperar de exclusão acidental (forense)
-Em **Ferramentas adicionais → “Recuperar exclusão acidental”**, **“Procurar exclusões recentes no log”** lê o log de transações e lista **DELETE/DROP/TRUNCATE**
-recentes com horário. Cada item mostra também a **tabela** e a quantidade de linhas. Selecione a transação e escolha:
-- **“Devolver só as linhas excluídas (não sobrescreve o banco)”** — *recomendado para DELETE*: a
-  ferramenta restaura uma **cópia temporária** até **logo antes** do DELETE e devolve à tabela **só as
-  linhas que faltam** (por chave primária, sem duplicar, gatilhos desligados). **Tudo o que foi feito
-  depois continua no banco.** (Linhas dessa tabela apagadas de propósito depois do instante escolhido
-  também voltariam — a confirmação avisa.)
-- **“Restaurar o banco inteiro até ANTES da transação”** — para DROP/TRUNCATE: substitui o banco pela
-  cadeia de backups até logo antes do evento; **o que veio depois é descartado**.
-
-Ambas exigem modelo **FULL** e a cadeia de backups disponível. *Observação:* o log mostra apenas a parte **ativa** — quanto antes,
-melhor a chance.
-
-### 11.2. Simular um reparo destrutivo
-Antes de qualquer reparo com perda, use **“🔬 Simular antes”** (ver [8.4](#84-reparo-com-possível-perda-de-dados-exige-confirmação)):
-você vê a **perda exata por tabela** numa cópia, sem risco para a produção.
-
-### 11.3. Verificações avançadas
-Em **Ferramentas adicionais**, no grupo **“Verificar uma tabela / reajustar identidades”**:
-- **Verificar tabela (CHECKTABLE):** checagem dirigida a uma tabela (mais rápida que o CHECKDB completo).
-- **Reajustar identidades (CHECKIDENT RESEED):** corrige as sementes de colunas de identidade após
-  remoção de linhas (reparo com perda / salvamento).
-
-### 11.4. Anexar um banco a partir de um arquivo `.mdf`
-No cabeçalho, **“Anexar .mdf”** permite recuperar um banco a partir do arquivo de dados solto.
-A ferramenta procura o `.ldf` correspondente pelos padrões comuns; se não encontrar, **pergunta se
-você quer localizá-lo manualmente** — só recria o log (`FOR ATTACH_REBUILD_LOG`) se você optar por
-isso ou se o arquivo realmente não existir (recriar descarta transações não confirmadas). Não
-sobrescreve um banco já existente de mesmo nome.
-
-### 11.5. Procedimento manual para bancos de sistema
-Bancos de sistema não são reparados automaticamente. **“Ver procedimento manual recomendado”** exibe
-o **runbook** específico (`master`/`model`/`msdb`/`tempdb`) com os passos a executar no servidor
-(modo de usuário único, restauração do banco de sistema, etc.). Acione o DBA quando possível.
-
----
-
-## 12. Recursos auxiliares
-
-- **Atualizar lista / Trocar conexão** (cabeçalho) e **Cancelar operação** (barra de status, visível durante uma operação).
-- **Ver script planejado (não executa nada):** mostra o T-SQL que seria executado.
-- **Exportar relatório:** salva o **Registro de operações** em **HTML** (anexe a um chamado).
-- **Limpar:** limpa o registro exibido (não apaga o arquivo de log).
-
----
-
-## 13. Modo escuro
-
-Ao **iniciar**, a ferramenta adota o **tema do Windows** (claro/escuro). Você pode alternar pelo botão
-**“🌙 Tema escuro” / “☀ Tema claro”** no cabeçalho; a escolha vale para toda a sessão.
-
----
-
-## 14. Onde ficam os registros (logs)
-
-```
-%LOCALAPPDATA%\RestoreDB\Logs\repair-AAAAMMDD.log     (um arquivo por dia)
-%LOCALAPPDATA%\RestoreDB\History\<banco>.json         (histórico de diagnósticos)
-%LOCALAPPDATA%\RestoreDB\Alerts\                       (alertas da verificação agendada)
-```
-
-O caminho do log do dia também aparece na **barra de status**. Para entregar o histórico de uma
-sessão a outra pessoa, use **Exportar relatório** (HTML).
-
----
-
-## 15. Segurança e proteções automáticas
-
-- **Diagnóstico não altera nada** (somente leitura).
-- **Simulação na cópia:** o reparo destrutivo pode ser pré-visualizado **sem tocar na produção**.
-- **Guarda de topologia:** espelhamento/Always On/log shipping/replicação **bloqueiam** o reparo
-  destrutivo, com orientação para tratar a topologia primeiro.
-- **Bancos de sistema** não sofrem reparo destrutivo automático (há runbook guiado).
-- **Sempre via `master`:** nunca se conecta diretamente ao banco quebrado.
-- **Rede de segurança automática antes do reparo destrutivo:** captura das transações mais
-  recentes (**tail-log**, mesmo com os dados danificados) + backup de segurança + cópia dos
-  arquivos (quando possível). Com cadeia de backups, o que o reparo descartar **pode ser
-  recuperado depois**.
-- **Recuperação do registro-pai antes de remover órfãos:** ao corrigir integridade (ou reconciliar
-  chaves estrangeiras após um reparo com perda), a ferramenta tenta **trazer o registro-pai de volta
-  a partir de um backup** — preservando os filhos saudáveis — e só remove o que não existir em backup
-  nenhum. Pode-se **apontar um `.bak` de outra mídia** e, se a recuperação ficar incompleta, ela
-  **pergunta antes de excluir**.
-- **Backup FULL novo após reparo destrutivo/reconstrução de log** — nova base da cadeia de backups.
-- **Linhas descartadas pelo reparo com perda são devolvidas dos backups** quando a cadeia chega até o
-  instante do reparo; **órfãos removidos vão para a quarentena** (`RestoreDB_Quarentena`), não para o lixo.
-- **Gatilhos não disparam** ao devolver linhas (salvamento, registro-pai, reparo) nem ao mover órfãos.
-- **Constraints desabilitadas pelo sistema são respeitadas** — nunca geram remoção de linhas.
-- **Reconstruir índices não desliga chaves estrangeiras:** as FKs que o SQL Server desabilita junto
-  com um índice único/PK são reativadas ao final.
-- **Restaurar com a aplicação conectada** funciona: as conexões são encerradas no mesmo comando do
-  `RESTORE`, e o banco volta em acesso normal (`MULTI_USER`).
-- **Backups cujo arquivo foi apagado** (limpeza de retenção) e **cópias de segurança da própria
-  ferramenta** (que retratam o banco já danificado) **não** são escolhidos como base de restauração.
-- **Cadeias de restauração validadas** antes de executar; conjuntos que não podem ser restaurados
-  sozinhos (diferencial/log) geram **aviso com orientação**.
-- **Robustez a falhas graves:** se o SQL Server derrubar a conexão ao ler uma página corrompida
-  (erro 824), a ferramenta **reconecta sozinha** e continua; o acesso exclusivo é de fato mantido
-  pela sessão durante o reparo.
-- **Fechar durante uma operação pede confirmação** — evita abandonar o banco em acesso restrito.
-- **Confirmação explícita** para tudo que pode perder dados; **sem mensagens técnicas cruas**.
-
----
-
-## 16. Boas práticas
-
-1. **Tenha backups** — e verifique a **saúde** deles ([9.3](#93-mais-opções-de-restauração-avançado)). É a única forma de recuperar 100% dos dados.
-2. **Configure a verificação agendada** ([10.2](#102-verificação-agendada-monitoramento--alerta)) — detecte a corrupção cedo.
-3. **Diagnostique antes de agir**, inclusive em bancos `ONLINE`.
-4. **Simule** antes de qualquer reparo com perda de dados.
-5. **Prefira restaurar de backup** a descartar dados.
-6. Em **alta disponibilidade**, trate a topologia antes de qualquer reparo destrutivo.
-7. **Manutenção preventiva** periódica (índices + estatísticas) mantém o desempenho.
-8. Para reconstrução de log / anexar arquivos, rode **como Administrador**, no servidor.
-
----
-
-## 17. Solução de problemas (FAQ)
-
-**Não consigo conectar / “Login failed”.**
-Verifique servidor e credenciais; para Windows, marque a caixa correspondente.
-
-**Conectou, mas avisa que “não é sysadmin”.**
-Os reparos exigem `sysadmin`. Conecte-se com um login adequado.
-
-**As opções de reparo não aparecem.**
-Elas só são liberadas **após o diagnóstico**. Selecione o banco e clique em **“Diagnosticar”**.
-
-**O banco está ONLINE — preciso diagnosticar?**
-Sim, se desconfiar de problemas: `ONLINE` não garante ausência de corrupção. O diagnóstico é
-seguro (somente leitura).
-
-**Quero ver quanto perderia antes de reparar.**
-Use **“🔬 Simular antes”** no painel de reparo com perda — ele mostra a perda por tabela numa cópia,
-sem tocar na produção.
-
-**Apaguei dados sem querer.**
-Use **“Procurar exclusões recentes no log”** ([11.1](#111-recuperar-de-exclusão-acidental-forense)) e,
-para um DELETE, **“Devolver só as linhas excluídas”** — o resto do banco não é tocado. Exige modelo
-FULL e cadeia de backups.
-
-**O banco está RECOVERY_PENDING depois de trocar o disco / a letra da unidade.**
-Diagnostique: se aparecer **arquivo ausente** ou **sem permissão**, use **“Corrigir acesso aos
-arquivos e religar”** ([8.7](#87-corrigir-acesso-aos-arquivos-e-religar-sem-perda-de-dados)) —
-aponte o novo local do arquivo; nada é perdido.
-
-**Aparece “log de transações cheio” (erro 9002).**
-Não é corrupção. Use **“Resolver log cheio”** ([8.6](#86-resolver-log-cheio-sem-perda-de-dados)).
-Se o motivo for uma transação aberta, a ferramenta mostra qual é — conclua-a ou encerre-a com o
-responsável.
-
-**Onde estão as linhas órfãs que a correção de integridade removeu?**
-No banco **`RestoreDB_Quarentena`**, tabela `<banco>__<schema>__<tabela>`, com a data e a constraint
-de origem. Podem ser devolvidas quando o registro-pai for recadastrado.
-
-**Aparece um aviso de topologia (espelhamento/AG/replicação).**
-O reparo destrutivo foi bloqueado por segurança. Trate a topologia primeiro e tente novamente.
-
-**A reconstrução de log / anexar diz que exige Administrador.**
-Reabra a ferramenta **como Administrador**, no servidor. Para o log, a alternativa é o **reparo com
-perda de dados**, que não mexe em arquivos.
-
-**O diagnóstico mostra páginas suspeitas antigas, mas o CHECKDB está limpo.**
-A ferramenta reconcilia histórico × estado atual: corrupção **já resolvida** não gera falso positivo.
-
-**Aparece “Corrupção RECORRENTE” / erros de E/S.**
-É um alerta de **causa-raiz**: suspeite do disco/volume/storage e considere migrar os arquivos.
-
-**Autorizei o reparo com perda de dados — dá para recuperar o que foi descartado?**
-Se o banco usa o modelo de recuperação **FULL** e tem cadeia de backups, **sim**: antes do reparo
-a ferramenta capturou o **tail-log** (arquivo `*_tail_*.trn` na pasta padrão de backups do
-servidor). Uma **restauração ponto-no-tempo** até o instante imediatamente anterior ao reparo
-recupera 100% dos dados. Peça apoio ao nível 2/DBA e informe o horário do reparo (está no
-Registro de operações).
-
-**Posso fechar a ferramenta durante um reparo?**
-Evite. A ferramenta pede confirmação: fechar no meio pode deixar o banco em acesso restrito
-(`SINGLE_USER`). Prefira **Cancelar operação** (barra de status) e aguardar.
-
-**Selecionei um backup e a restauração diz que não é FULL.**
-Diferenciais e logs não se restauram sozinhos — precisam do FULL antes. Use **“Restaurar cadeia
-completa”**, que monta a sequência correta automaticamente.
-
-**Depois do reparo com perda, os backups antigos ainda valem?**
-Não confie neles: o reparo altera a estrutura do banco. A ferramenta cria automaticamente um
-**backup FULL novo** (arquivo `*_PosReparo_*.bak`) — ele é a nova base. Configure a rotina de
-backups a partir dele.
-
-**Ao corrigir integridade, dá para preservar os registros filhos em vez de apagá-los?**
-Sim. Antes de remover um órfão, a ferramenta tenta **recuperar o registro-pai** que faltava a partir
-de um backup (o FULL mais recente do histórico) — com isso o filho é **preservado**. Se o seu backup
-estiver em **outra mídia** (HD externo, pasta de rede), use **"RECUPERAÇÃO DE REGISTROS-PAI → 📁
-Escolher .bak…"** no painel. Se a recuperação não resolver tudo, a ferramenta **pergunta antes de
-remover** se você quer apontar outro `.bak`. O arquivo precisa ser **legível pelo SQL Server** (a
-restauração roda no servidor; para servidor remoto, use um caminho de rede UNC).
-
----
-
-## 18. Glossário rápido
-
-- **`DBCC CHECKDB`** — verifica a consistência **física** de um banco.
-- **`DBCC CHECKCONSTRAINTS`** — verifica a integridade **lógica** (chaves estrangeiras / CHECK).
-- **`REPAIR_REBUILD`** — reparo **sem** perda (estruturas reconstruíveis).
-- **`REPAIR_ALLOW_DATA_LOSS`** — reparo que pode **descartar** dados corrompidos.
-- **Registro órfão** — linha cuja **chave estrangeira** aponta para um registro que não existe.
-- **Registro-pai / registro-filho** — numa chave estrangeira, o **pai** é o registro referenciado
-  (a chave primária) e o **filho** é o que aponta para ele. Um filho fica **órfão** quando o pai
-  some — a ferramenta tenta **recuperar o pai do backup** antes de remover o filho.
-- **Ponto-no-tempo (STOPAT)** — restaurar até um instante específico (logo antes de um erro).
-- **STANDBY** — banco restaurado em **somente leitura**, consultável entre os logs.
-- **Tail-log** — backup das transações mais recentes, capturado antes de sobrescrever.
-- **Striped** — backup dividido em vários arquivos. **TDE** — banco criptografado.
-- **Fragmentação** — desorganização dos índices que prejudica o desempenho (resolve com manutenção).
-- **`.mdf`/`.ndf`** — arquivos de **dados**. **`.ldf`** — arquivo de **log** de transações.
-- **Usuário órfão** — usuário do banco sem login no servidor (corrigido após o restore).
-- **Topologia de alta disponibilidade** — espelhamento, Always On (AG), log shipping ou replicação.
-
----
-
-> Para detalhes técnicos (arquitetura, T-SQL exato e cenários de teste), consulte o
-> [`README.md`](../README.md) e os scripts em [`sql/`](../sql).
+| `ONLINE` | No ar. Pode ainda assim ter corrupção escondida. | Normal |
+| `OFFLINE` | Desligado de propósito ou por alguém. Os dados estão lá. | Baixa |
+| `RESTORING` | Uma restauração ficou pela metade, esperando a finalização. | Média |
+| `RECOVERING` | O SQL Server está recuperando o banco sozinho (depois de reiniciar). **Aguarde.** | Média |
+| `RECOVERY_PENDING` | A recuperação não conseguiu começar: arquivo faltando, sem permissão, disco cheio, log cheio. | Alta |
+| `SUSPECT` | A recuperação começou e falhou: em geral há corrupção. | Alta |
+| `EMERGENCY` | Modo de emergência (somente leitura, só sysadmin). Usado durante reparos. | Alta |
+
+Na lista também aparecem situações de **acesso**: `SINGLE_USER` (só uma conexão por vez — o
+sistema fica de fora), `RESTRICTED_USER` (só administradores) e somente leitura.
+
+## 5. O fluxo em três passos
+
+### Passo 1 — Diagnosticar
+
+1. Selecione o banco na lista.
+2. Clique em **"🔍 Diagnosticar (sem alterar o banco)"**. Em bancos muito grandes, você pode marcar
+   **"Verificação rápida (PHYSICAL_ONLY) — para bancos muito grandes"**: é mais rápida, mas não
+   confere os valores das colunas.
+3. Acompanhe no **Registro de operações**. Bancos grandes podem levar muitos minutos.
+4. Leia o **"RESULTADO DO DIAGNÓSTICO"**: o resumo, a ação recomendada (linha que começa com `→` ou
+   `✔`) e a explicação. Se houver **"⚠ NOVO desde a última verificação"**, é algo que não existia no
+   diagnóstico anterior. **"POLÍTICA DE BACKUP / SAÚDE LÓGICA"** lista riscos de backup e sinais de
+   problema de hardware.
+
+O diagnóstico não altera o banco. A única coisa que ele limpa é o histórico antigo de páginas
+suspeitas do `msdb`, quando confirma que aquela corrupção já foi resolvida.
+
+Se aparecer **"⚠ TOPOLOGIA DE ALTA DISPONIBILIDADE / REPLICAÇÃO"**, o banco participa de
+espelhamento, Always On, log shipping ou replicação: os reparos ficam bloqueados. **Chame o DBA.**
+
+Se o diagnóstico **não terminar** (erro ou cancelamento), a ferramenta não mostra correções.
+Veja o motivo no registro e clique em **"Diagnosticar novamente (sem alterar o banco)"**.
+
+### Passo 2 — Resolver
+
+Só aparecem as opções que se aplicam. Cada cartão tem uma etiqueta de risco:
+
+- **SEM PERDA DE DADOS** (verde) — pode usar.
+- **MOVE REGISTROS PARA A QUARENTENA** (amarelo) — tira linhas da tabela, mas guarda.
+- **RESTAURA DO BACKUP — SUBSTITUI O BANCO** (azul) — volta o banco a um backup.
+- **PODE PERDER DADOS** e **⛔ ÚLTIMO RECURSO** (vermelho) — exigem marcar uma caixa de
+  confirmação e responder Sim a uma pergunta.
+
+Siga a faixa **"PRÓXIMO PASSO"**: ela diz o nome do cartão por onde começar.
+
+### Passo 3 — Conferir
+
+Depois de uma correção que deu certo, o indicador marca os passos 1 e 2 como concluídos e pede o
+Passo 3: clique de novo em **"Diagnosticar novamente (sem alterar o banco)"**. Só o novo diagnóstico
+confirma que o banco ficou íntegro. Se aparecer outro problema, siga as novas opções.
+
+## 6. As opções do Passo 2, uma a uma
+
+### Acesso ao banco travado — SEM PERDA
+
+Quando aparece: o banco está `ONLINE`, mas em `SINGLE_USER` ou `RESTRICTED_USER` — o sistema não
+consegue entrar. Costuma sobrar de um reparo, restauração ou manutenção interrompidos.
+
+- O cartão mostra **quem está segurando o acesso** (programa, máquina, login).
+- **"Desconectar as sessões presas, se preciso"** vem marcado. O que essas sessões ainda não tinham
+  gravado é desfeito pelo SQL Server; o que já estava gravado fica.
+- Clique em **"Liberar acesso (voltar ao modo normal)"**. Se houver sessões presas, a ferramenta
+  pede confirmação listando quem será desconectado.
+
+### Reconstruir índices — SEM PERDA
+
+Quando aparece: a corrupção está só em **índices** (estruturas de busca), não nas tabelas.
+
+- Clique em **"Reparar índices (sem perda de dados)"**. Os índices são refeitos a partir dos dados.
+- Quem estiver usando o banco é desconectado durante a operação (não há pergunta de confirmação).
+- Se não bastar, aparece o **Reparo no modo seguro** como próximo passo.
+
+### Log de transações cheio — SEM PERDA
+
+Quando aparece: erro 9002 — o arquivo de log não tem mais espaço e o banco recusa gravações. **Não
+é corrupção.**
+
+- Clique em **"Resolver log cheio (sem perda de dados)"**. A ferramenta descobre o que segura o log
+  e, conforme o caso: faz backup de log, libera o crescimento do arquivo, ou cria um arquivo de log
+  extra no disco com mais espaço. Se o banco estava fora do ar por isso, religa.
+- **Ela não desconecta ninguém.** Se uma transação aberta estiver segurando o log, o registro mostra
+  qual é — combine com o cliente fechar o programa ou chame o DBA.
+
+### Arquivos do banco inacessíveis — SEM PERDA
+
+Quando aparece: o SQL Server não consegue abrir um arquivo do banco (`.mdf`, `.ndf` ou `.ldf`):
+arquivo **ausente** (disco ou letra trocados, pasta movida), **sem permissão**, ou **preso** por
+outro programa (antivírus, backup de arquivos). **Não é corrupção.**
+
+1. Se algum arquivo estiver **ausente**, clique em **"📁 Localizar arquivo ausente…"** e aponte onde
+   ele está agora. O caminho precisa ser válido **no servidor**.
+2. Se estiver **preso**, feche o programa que o segura (antivírus, cópia em andamento).
+3. Clique em **"Corrigir acesso aos arquivos e religar"**. A ferramenta atualiza o caminho, dá
+   permissão à conta do SQL Server (só se estiver rodando como Administrador no servidor) e religa
+   o banco.
+
+### Reparo no modo seguro — SEM PERDA
+
+Quando aparece: banco fora do ar (`OFFLINE`, `RESTORING`, `RECOVERY_PENDING`, `SUSPECT`) ou
+corrupção que o próprio SQL Server diz que dá para reconstruir sem perda.
+
+- Clique em **"Reparar (modo seguro, sem perda de dados)"**. A ferramenta tenta religar o banco e,
+  se preciso, roda o reparo do SQL Server que **só reconstrói estruturas** (`REPAIR_REBUILD`).
+- Quem estiver usando o banco é desconectado durante o reparo (não há pergunta de confirmação).
+- **Se não bastar, nada é descartado:** a ferramenta para e mostra as próximas opções (restaurar
+  de backup e reparo com perda), que pedem confirmação.
+- **"Ver script planejado (não executa nada)"** mostra os comandos que o fluxo de reparo usaria
+  para o estado atual do banco — útil para mandar ao DBA antes.
+
+Se o estado for `RECOVERING`, a recomendação é **aguardar**: o SQL Server está trabalhando. Use o
+reparo só se o andamento não mudar por muito tempo.
+
+### Ajustes recomendados — SEM PERDA
+
+Quando aparece: em qualquer diagnóstico (até num banco íntegro) que encontre configurações que
+causam lentidão, travamentos ou escondem corrupção. **Nenhum ajuste altera os dados.**
+
+- Cada item tem a explicação e, embaixo, **"→ Correção: …"**. Marque os que quer aplicar (os
+  corrigíveis já vêm marcados, menos o de somente leitura) e clique em **"Aplicar os ajustes
+  selecionados"**. A ferramenta pede confirmação.
+- Itens com **ℹ** e o texto "Apenas aviso — depende do fornecedor do sistema ou do DBA." não têm
+  correção automática (ex.: nível de compatibilidade antigo, `TRUSTWORTHY` ligado).
+
+| Ajuste | Correção |
+|---|---|
+| Proteção contra corrupção desligada (`PAGE_VERIFY`) | Ligar `PAGE_VERIFY CHECKSUM` |
+| Encolhimento automático ligado (`AUTO_SHRINK`) | Desligar `AUTO_SHRINK` |
+| Fechamento automático ligado (`AUTO_CLOSE`) | Desligar `AUTO_CLOSE` |
+| Crescimento dos arquivos mal configurado | Usar crescimento fixo |
+| Log de transações muito fragmentado (VLFs) | Reorganizar o log |
+| Usuários do banco sem login correspondente | Religar usuários aos logins |
+| Dono do banco inválido | Corrigir o dono do banco |
+| Banco em modo SOMENTE LEITURA | Liberar gravação (`READ_WRITE`) — **vem desmarcado**: pode ser proposital |
+| Regras de integridade não verificadas (constraints não confiáveis) | Revalidar as regras |
+| Índices desabilitados | Reconstruir os índices |
+| Views/procedures com referência quebrada | Revalidar os objetos |
+
+Alguns ajustes (reconstruir índices, reorganizar o log) podem demorar em bancos grandes. Se houver
+outra correção na tela, ela continua pendente depois dos ajustes.
+
+### Integridade lógica: registros órfãos — QUARENTENA
+
+Quando aparece: há linhas cuja **chave estrangeira aponta para um registro que não existe** (ex.:
+um item de nota cuja nota foi apagada). O `DBCC CHECKDB` não detecta isso.
+
+1. (Opcional) Em **"BACKUP PARA RECUPERAR REGISTROS-PAI (OPCIONAL)"**: por padrão
+   (**"↺ Automático"**) a ferramenta usa o backup completo mais recente do histórico. Se o backup
+   estiver em outra mídia, clique em **"📁 Escolher .bak…"** (o SQL Server precisa conseguir ler o
+   arquivo).
+2. Marque **"Entendo e autorizo retirar os registros órfãos das tabelas (ficam guardados na
+   quarentena)."**
+3. Clique em **"Corrigir integridade (órfãos para a quarentena)"** e confirme.
+
+O que acontece: a ferramenta tenta um backup de segurança; procura no backup os **registros-pai**
+que faltam e os devolve; se não achar todos, pergunta se você quer escolher **outro .bak**; os órfãos
+que sobrarem **saem da tabela e ficam guardados no banco `RestoreDB_Quarentena`**, de onde o DBA
+pode devolvê-los. Se a quarentena não puder ser usada numa tabela, as linhas dessa tabela são
+**excluídas** (o registro avisa). Quem estiver usando o banco é desconectado.
+
+Se o problema for só de regra `CHECK` ou de catálogo, **não há correção automática**: a faixa
+"PRÓXIMO PASSO" pede para revisar os dados com o fornecedor/DBA ou restaurar de backup.
+
+### Restaurar de backup — SUBSTITUI O BANCO
+
+Quando aparece: corrupção nos arquivos de **dados**, registros órfãos (como alternativa) ou quando o
+reparo sem perda não bastou. Restaurar traz dados **íntegros** do backup, em vez de descartar o que
+está corrompido.
+
+**Caminho recomendado — "Restaurar cadeia completa (mais recente)":**
+a ferramenta junta sozinha o backup completo, o diferencial e os backups de log do histórico, confere
+que a sequência não tem buracos (se tiver, não mexe no banco), tenta salvar as transações mais
+recentes (**tail-log**) e então substitui o banco. Se o tail-log não puder ser salvo (modelo
+`SIMPLE` ou log danificado), **o que foi gravado depois do último backup se perde**. Pede
+confirmação. Quem estiver usando o banco é desconectado.
+
+**"OU ESCOLHA UM BACKUP ESPECÍFICO":**
+
+1. A lista mostra os backups do histórico do servidor. Para usar um arquivo, clique em
+   **"📁 Escolher arquivo .bak..."**.
+2. Selecione um backup na lista.
+3. **"Substituir o banco existente (REPLACE)"** vem marcado (sem ele, a restauração falha se o banco
+   já existir).
+4. Clique em **"Restaurar o backup selecionado"**. O banco volta **exatamente ao momento desse
+   backup**: tudo o que foi gravado depois **se perde** (este modo não salva o tail-log). Se o
+   backup escolhido não for completo (é diferencial ou de log), a ferramenta avisa — prefira a
+   cadeia completa.
+
+**"Mais opções de restauração (avançado)":**
+
+- *SEM ALTERAR O BANCO*
+  - **"Testar backup selecionado (restauração de teste)"** — restaura um backup completo num banco
+    temporário, verifica e apaga. Prova que o backup funciona.
+  - **"Verificar saúde dos backups (VERIFYONLY)"** — confere se os arquivos de backup do histórico
+    são legíveis, sem restaurar.
+  - **"Recuperar para cópia (salvamento, não altera o original)"** — restaura o backup mais recente
+    num banco novo `<banco>_Recuperado`. Depois aparece o **Assistente de salvamento** (abaixo).
+- *PONTO NO TEMPO / INSPEÇÃO*
+  - **"Restaurar até um ponto no tempo (STOPAT)"** — marque e informe data e hora: vale para a
+    cadeia completa e para o STANDBY. O que foi gravado depois desse instante deixa de existir no
+    banco (fica só no arquivo de tail-log). Exige modelo `FULL` e a cadeia de backups de log.
+  - **"Restaurar em STANDBY (substitui o banco; fica só leitura para inspecionar)"** — o banco
+    fica consultável, mas o sistema não grava nele. **Não salva o tail-log.** Para só olhar dados,
+    prefira "Recuperar para cópia".
+  - **"Finalizar recuperação (sair do STANDBY)"** — devolve o banco ao uso normal.
+- *SÓ AS PÁGINAS AFETADAS*
+  - Quando poucas páginas estão corrompidas, recupera só elas e preserva o resto. O campo já vem
+    preenchido pelo diagnóstico (formato `arquivo:página`, ex.: `1:57,1:58`). Clique em
+    **"Restaurar apenas estas páginas"**. Exige modelo `FULL`/`BULK_LOGGED`, banco `ONLINE` e a
+    cadeia de backups.
+
+### Assistente de salvamento — SEM PERDA
+
+Aparece depois de "Recuperar para cópia", de um reparo com perda que guardou linhas para revisão, ou
+de uma recuperação de exclusão que não conseguiu devolver tudo.
+
+1. Escolha a tabela na lista.
+2. Clique em **"Copiar linhas faltantes desta tabela"** e confirme.
+
+Só entram no banco as linhas que **ainda não existem** (pela chave primária) — nada é duplicado.
+Tabelas sem chave primária e linhas parciais (`tabela__parcial`) precisam do DBA.
+
+### Reparo com possível perda de dados — PODE PERDER DADOS
+
+Aparece quando o **reparo sem perda não bastou**. A faixa "PRÓXIMO PASSO" lembra: **se houver
+backup, prefira "Restaurar de backup".** Use o reparo com perda quando não houver backup bom.
+
+1. Clique em **"🔬 Simular antes (pré-visualizar a perda, sem tocar no banco)"**. A ferramenta faz
+   uma cópia do banco, repara a cópia e mostra quantas linhas cada tabela perderia. A cópia é
+   apagada ao final. Precisa de espaço em disco para a cópia.
+2. (Opcional) Escolha o backup para recuperar registros-pai, como no cartão de órfãos.
+3. Deixe marcado **"Salvar e devolver automaticamente as linhas que o reparo descartar
+   (recomendado)"**: antes do reparo, as linhas que ainda dá para ler nas tabelas danificadas são
+   copiadas para um banco de salvamento; depois do reparo, as que foram descartadas voltam. Se a
+   cadeia de backups chegar até o instante do reparo, ela também é usada.
+4. Marque **"Estou ciente e autorizo o reparo com possível perda de dados."**
+5. Clique em **"Executar reparo COM perda de dados"** e confirme.
+
+O que acontece, em ordem: tail-log e backup de segurança → cópia das linhas legíveis →
+`REPAIR_ALLOW_DATA_LOSS` → verificação → devolução das linhas descartadas → tratamento de órfãos
+(recupera o pai ou move para a quarentena) → reajuste das identidades → **backup completo novo** se
+o banco ficou íntegro.
+
+> **O que pode se perder:** linhas que estavam em páginas **destruídas** e que não estão em nenhum
+> backup. O salvamento só copia o que ainda dá para ler. O resultado diz, em linguagem simples, o
+> que ficou de fora; se uma cópia de salvamento for mantida, use o Assistente de salvamento ou
+> chame o DBA.
+
+### Reconstruir o log de transações — ⛔ ÚLTIMO RECURSO
+
+Aparece quando o problema está no **log de transações** (`.ldf` corrompido ou ausente, com o banco
+em `RECOVERY_PENDING`/`SUSPECT`) e o reparo não resolveu. Nunca aparece para bancos de sistema.
+
+- Exige rodar o RestoreDB **como Administrador no próprio servidor**. Sem isso, a ferramenta
+  **não altera nada** e mostra as instruções para o DBA.
+- Marque **"Entendo os riscos e autorizo reconstruir o log."** e clique em
+  **"Reconstruir log (recriar .ldf)"**, confirmando.
+- A ferramenta tenta copiar os arquivos para o lado, desanexa o banco, guarda o log antigo com a
+  extensão `.corrupt_AAAAMMDDHHMMSS`, cria um log novo e verifica o banco.
+- **Pode haver perda de dados** (o que estava só no log) e inconsistências. Depois, faça o Passo 3.
+
+### Bancos de sistema (`master`, `model`, `msdb`, `tempdb`)
+
+A ferramenta, no máximo, tenta **religar** um banco de sistema (modo seguro). Corrupção e
+restauração são manuais: clique em **"Ver procedimento manual"** e acione o DBA.
+
+## 7. Situações comuns — o que fazer
+
+| O cliente diz… / você vê… | Faça |
+|---|---|
+| "O sistema não abre o banco" e a linha está **amarela** (`SINGLE_USER`) | Diagnosticar → **Acesso ao banco travado** → "Liberar acesso (voltar ao modo normal)". |
+| "Não consigo gravar nada" (somente leitura) | Diagnosticar → **Ajustes recomendados** → marque "Banco em modo SOMENTE LEITURA" → "Aplicar os ajustes selecionados". |
+| Erro 9002 / "log de transações cheio" | Diagnosticar → **Log de transações cheio** → "Resolver log cheio (sem perda de dados)". |
+| Banco `RECOVERY_PENDING` depois de trocar disco ou letra | Diagnosticar → **Arquivos do banco inacessíveis** → "📁 Localizar arquivo ausente…" → "Corrigir acesso aos arquivos e religar". |
+| Banco `OFFLINE` ou `RESTORING` | Diagnosticar → **Reparo no modo seguro**. |
+| Banco `RECOVERING` | Aguarde e diagnostique de novo mais tarde. |
+| Banco `SUSPECT` | Diagnosticar → siga a recomendação. Com backup, **Restaurar de backup**. Sem backup: **Reparo no modo seguro** → se não bastar, **Simular antes** → reparo com perda (só com autorização do responsável). |
+| Banco `ONLINE`, mas erros 823/824 ou "página corrompida" | Diagnosticar. Só índices → **Reconstruir índices**. Dados → **Restaurar de backup** (ou só as páginas). |
+| Registros "sumidos" ligados a outros (órfãos) | Diagnosticar → **Integridade lógica: registros órfãos**. |
+| "Apagaram dados sem querer" | **Ferramentas adicionais → Recuperar exclusão acidental** (seção 8.4). |
+| Banco grande demais para diagnosticar no horário disponível | **Ferramentas adicionais → Verificação em partes**. |
+| Só tenho o `.mdf` | **"📎 Anexar .mdf"** (seção 9). |
+
+## 8. Ferramentas adicionais
+
+Ficam embaixo do fluxo, com a lista à esquerda e a ferramenta escolhida à direita (em janelas
+estreitas, o detalhe desce para baixo da lista). São independentes do Passo 2: usar uma delas não
+conclui o fluxo de correção.
+
+### 8.1. Verificar uma tabela
+
+- Escolha ou digite a tabela (ex.: `dbo.Pedido`) e clique em **"Verificar tabela"**: roda
+  `DBCC CHECKTABLE` só nela — bem mais rápido que o diagnóstico completo. Somente leitura.
+- **"Reajustar identidades"** (`CHECKIDENT RESEED`): use depois de um reparo com perda ou de um
+  salvamento, quando o próximo código gerado pelo sistema colide com um que já existe. Não pede
+  confirmação; não altera linhas.
+
+### 8.2. Manutenção preventiva
+
+Nenhuma destas ações apaga dados.
+
+- **"Otimizar"** — desfragmenta índices (`REORGANIZE` de 10% a 30% de fragmentação, `REBUILD` acima
+  de 30%) e atualiza estatísticas. Pede confirmação. Pode demorar e pesar no servidor: prefira fora
+  do horário de uso.
+- **"Corrigir contadores"** (`DBCC UPDATEUSAGE`) — quando tamanhos ou quantidades de linhas aparecem
+  errados (comum em bancos vindos do SQL 2000/2005). Só ajusta o catálogo.
+- **"Gerar comando"** — mostra o comando para a verificação agendada (seção 11). Não executa nada.
+
+### 8.3. Verificação em partes
+
+Para bancos grandes demais para o diagnóstico completo na janela de manutenção.
+
+1. Em **"Tempo desta rodada"**, escolha 15 minutos, 30 minutos, 1 hora ou 2 horas.
+2. Clique em **"Verificar próxima parte"**. A ferramenta verifica as tabelas uma a uma até acabar o
+   tempo e guarda onde parou. **"Andamento"** mostra em que tabela está o ciclo.
+3. Repita em outros dias. Ao fim do ciclo, o banco inteiro foi verificado.
+
+Somente leitura. Se aparecerem problemas, rode o **Diagnosticar** completo para ver as opções.
+Cancelar no meio não perde o progresso.
+
+### 8.4. Recuperar exclusão acidental
+
+1. Clique em **"Procurar no log"**: a ferramenta lê o log de transações e lista os `DELETE`, `DROP`
+   e `TRUNCATE` recentes (somente leitura). Se o log já foi reaproveitado, a exclusão pode não
+   aparecer mais.
+2. Selecione a transação na lista e escolha:
+   - **"Devolver só as linhas excluídas (não sobrescreve o banco)"** — *preferível*. Uma cópia
+     temporária é restaurada até logo antes da exclusão e só as linhas que faltam voltam (por chave
+     primária). Tudo o que foi feito depois continua no banco. Atenção: linhas daquela tabela
+     excluídas **de propósito** depois desse instante também voltariam. Serve para `DELETE` numa
+     tabela identificada.
+   - **"Restaurar o banco inteiro até ANTES da transação"** — substitui o banco pela cadeia de
+     backups até um segundo antes. **Tudo o que foi gravado depois deixa de existir no banco**
+     (fica só no arquivo de tail-log). Exige modelo `FULL` e a cadeia de backups. Use para
+     `DROP`/`TRUNCATE`.
+
+## 9. Anexar um banco a partir do .mdf
+
+Quando o banco não está no servidor, mas você tem o arquivo de dados (`.mdf`).
+
+1. Clique em **"📎 Anexar .mdf"** e escolha o arquivo. O nome do banco será o nome do arquivo.
+2. A ferramenta procura o `.ldf` ao lado. Se não achar, pergunta se você quer localizá-lo. Se não
+   houver log, **um log novo é criado** — transações que não estavam confirmadas podem se perder.
+3. Confirme. O banco aparece na lista. Não sobrescreve um banco que já exista com o mesmo nome.
+
+Depois, diagnostique o banco anexado.
+
+## 10. Registro, relatório e cancelamento
+
+- **Registro de operações:** tudo o que a ferramenta faz, com horário. Cores indicam informação,
+  sucesso, aviso e erro. **"Limpar"** só limpa a tela (o arquivo de log continua).
+- **"Exportar relatório":** salva o registro da sessão num arquivo HTML — anexe ao chamado.
+- **"■ Cancelar operação":** interrompe a operação em andamento. A ferramenta tenta deixar o banco
+  em modo normal ao parar. Espere a mensagem "Operação cancelada." antes de fazer outra coisa.
+- **Não feche a janela no meio de uma operação.** A ferramenta pergunta antes; fechar pode deixar o
+  banco travado em `SINGLE_USER` ou num estado intermediário. Se isso acontecer, diagnostique de
+  novo e use **Acesso ao banco travado**.
+
+## 11. Verificação agendada (monitoramento)
+
+Para descobrir problemas cedo, sem esperar o cliente ligar.
+
+1. Em **Ferramentas adicionais → Manutenção preventiva → Verificação agendada**, clique em
+   **"Gerar comando"**. Aparece um comando `schtasks` para o Agendador de Tarefas do Windows.
+2. Peça ao responsável pela máquina para registrar a tarefa, trocando `C:\Caminho\` pelo local do
+   `RestoreDB.Probe.exe` (o utilitário de linha de comando do RestoreDB — veja o README).
+3. A conta que roda a tarefa precisa ser sysadmin no SQL Server (o comando usa a autenticação do
+   Windows).
+
+Todo dia a tarefa faz um diagnóstico **somente leitura** e compara com o anterior. Quando aparece
+algo **novo** (corrupção nova, mais erros, mais registros órfãos, banco fora do ar), grava um alerta
+em `%LOCALAPPDATA%\RestoreDB\Alerts` e termina com **código de saída 2**. A **primeira execução**
+só registra a situação inicial — ela não alerta.
+
+> A ação "Enviar e-mail" citada na tela é antiga e não funciona nas versões atuais do Agendador do
+> Windows. Para avisar o suporte por e-mail, use um script que confira o código de saída 2 ou a
+> pasta de alertas e envie a mensagem.
+
+## 12. Quando algo dá errado
+
+| O que aconteceu | O que fazer |
+|---|---|
+| "Falha ao conectar" | Confira o nome da instância, se o serviço do SQL Server está rodando, o firewall e a senha. Para instância nomeada, use `SERVIDOR\INSTANCIA`. |
+| Aviso de que o login não é sysadmin | Conecte com um login sysadmin. Sem ele, reparos e restaurações falham. |
+| O diagnóstico não terminou | Leia o motivo no registro. Banco inacessível ou ocupado: tente de novo; se persistir, chame o DBA. |
+| "Operação bloqueada por segurança" (topologia) | O banco está em espelhamento/Always On/log shipping/replicação. Chame o DBA. |
+| O reparo seguro terminou com "não foi suficiente" | Normal: a ferramenta não descarta nada sozinha. Siga as opções que aparecerem (restaurar ou simular + reparo com perda). |
+| Mensagem sobre transações **ADIADAS** (deferred transactions) | O SQL Server não consegue desfazer uma transação por causa de uma página danificada; nem o reparo roda. Restaure as páginas ("Restaurar apenas estas páginas") ou o banco inteiro; sem backup, chame o DBA. |
+| A cadeia de backups "tem buracos" ou não existe | A restauração da cadeia não mexe no banco. Escolha um backup específico (aceitando a perda do que veio depois) ou chame o DBA. |
+| Restauração de páginas recusada | Exige modelo `FULL`/`BULK_LOGGED`, banco `ONLINE` e a cadeia de backups. Use a restauração do banco inteiro. |
+| "Exige executar a ferramenta como Administrador" | Feche o RestoreDB e abra de novo no próprio servidor com **Executar como administrador**. |
+| O banco ficou em `SINGLE_USER` depois de um erro ou cancelamento | Diagnosticar → **Acesso ao banco travado** → "Liberar acesso (voltar ao modo normal)". |
+| Uma cópia `_Recuperado`, `_Salvamento_` ou `_AntesExclusao_` ficou no servidor | Foi mantida para revisão. Depois de recuperar o que precisa (Assistente de salvamento) e com o DBA de acordo, ela pode ser apagada pelo SQL Server Management Studio. |
+| Corrupção que volta depois de reparada | Possível problema de disco/controladora. O diagnóstico avisa ("Corrupção RECORRENTE"). Chame o responsável pelo hardware. |
+
+Em qualquer dúvida: **Exportar relatório** e envie ao DBA junto com o arquivo de log.
+
+## 13. Limites — o que a ferramenta não faz
+
+Seja transparente com o cliente:
+
+- **O reparo com perda pode descartar dados.** O que estava em páginas destruídas e não está em
+  nenhum backup **não volta**.
+- **O salvamento sem backup não recupera páginas destruídas** — só copia o que ainda dá para ler.
+- **Restaurar substitui o banco.** O que foi gravado depois do backup (ou do ponto escolhido) se
+  perde quando o tail-log não pode ser salvo.
+- **Reconstruir o log** pode deixar o banco com dados inconsistentes.
+- **Não corrige** regras `CHECK` violadas nem inconsistências de catálogo — avisa e pede o DBA.
+- **Não repara nem restaura bancos de sistema.**
+- **Não substitui backup.** Sem uma rotina de backup, várias situações não têm saída sem perda.
+- **Não funciona no Azure SQL Database.**
+
+## 14. Onde ficam os arquivos
+
+| Onde | O quê |
+|---|---|
+| `%LOCALAPPDATA%\RestoreDB\Logs\repair-AAAAMMDD.log` | Log de cada comando (o caminho aparece na barra de status). |
+| `%LOCALAPPDATA%\RestoreDB\History\` | Histórico dos diagnósticos (para mostrar o que é novo). |
+| `%LOCALAPPDATA%\RestoreDB\IncrementalCheck\` | Progresso da verificação em partes. |
+| `%LOCALAPPDATA%\RestoreDB\Alerts\` | Alertas da verificação agendada. |
+| Pasta de backups do SQL Server | `_tail_` (tail-log), `_RestoreDB_` (backup de segurança) e `_PosReparo_` (backup novo depois do reparo com perda). |
+| Bancos no servidor | `RestoreDB_Quarentena`, `<banco>_Recuperado`, `<banco>_Salvamento_<data>`, `<banco>_AntesExclusao_<data>`. |
+
+Esses arquivos e bancos ocupam espaço: combine com o DBA quando apagá-los.
+
+## 15. Glossário
+
+- **Backup completo (FULL):** cópia do banco inteiro num momento.
+- **Backup diferencial:** o que mudou desde o último backup completo.
+- **Backup de log:** as transações desde o backup de log anterior. Com eles dá para voltar a
+  qualquer momento (ponto no tempo).
+- **Cadeia de backups:** completo → diferencial → logs, em sequência e sem buracos.
+- **Tail-log:** o último pedaço do log, ainda sem backup. Salvá-lo antes de restaurar evita perder
+  as transações mais recentes.
+- **Modelo de recuperação:** `SIMPLE` (sem backups de log; não permite ponto no tempo nem tail-log)
+  ou `FULL`/`BULK_LOGGED` (com backups de log).
+- **DBCC CHECKDB:** verificação de consistência do SQL Server. Com `REPAIR_REBUILD` repara sem
+  perda; com `REPAIR_ALLOW_DATA_LOSS`, descarta o que está corrompido.
+- **Página:** bloco de 8 KB onde o SQL Server guarda os dados. "Página corrompida" = bloco ilegível.
+- **Índice clusterizado / não clusterizado:** o clusterizado é a própria tabela ordenada; os não
+  clusterizados são cópias auxiliares para busca — dá para refazê-los sem perder dados.
+- **Chave primária:** o código que identifica cada linha (ex.: número da nota).
+- **Chave estrangeira:** uma coluna que aponta para a chave primária de outra tabela.
+- **Registro órfão:** linha cuja chave estrangeira aponta para um registro que não existe.
+- **Quarentena:** o banco `RestoreDB_Quarentena`, onde ficam guardados os órfãos retirados das
+  tabelas.
+- **SINGLE_USER / MULTI_USER:** só uma conexão por vez / modo normal.
+- **STANDBY:** banco restaurado em modo só leitura, à espera de mais backups ou da finalização.
+- **Erro 9002:** log de transações cheio.
+- **Erros 823/824/825:** erros de leitura no disco — corrupção ou problema de hardware.
+- **VLF:** pedaços internos do arquivo de log; em excesso deixam o banco lento para subir.
+- **TDE:** criptografia do banco; restaurar em outro servidor exige o certificado do original.
+- **sysadmin:** o perfil com poder total no SQL Server.
+- **Topologia (espelhamento, Always On, log shipping, replicação):** o banco tem cópias em outros
+  servidores; repará-lo sozinho pode quebrar essa configuração.

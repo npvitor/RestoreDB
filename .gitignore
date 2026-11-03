@@ -4,10 +4,26 @@ obj/
 .vs/
 *.user
 *.suo
+*.rsuser
+TestResults/
 
 ## Build / publish
 [Pp]ublish/
 artifacts/
+*.rar
+*.zip
 
 ## Logs locais
 *.log
+
+## Arquivos de banco e backups (nunca versionar dados reais)
+*.bak
+*.trn
+*.mdf
+*.ndf
+*.ldf
+*.corrupt_*
+
+## Configurações locais de ferramentas (Claude Code e similares)
+.claude/settings.local.json
+.claude/*.local.*
