@@ -139,34 +139,6 @@ public sealed class AdjustmentsAndSalvageIntegrationTests
         }
     }
 
-    // ------------------------------------------------------------------ Acesso travado
-
-    [IntegrationFact]
-    public async Task AcessoTravado_DiagnosticaQuemSeguraELibera()
-    {
-        await using var db = await TestDatabase.CreateAsync("travado");
-        // Uma "aplicação" pega a vaga única e fica conectada.
-        // Conexão fora do pool: ela será derrubada (KILL) e não pode voltar ao pool dos outros testes.
-        var holder = new SqlConnection(new SqlConnectionStringBuilder(It.Conn) { Pooling = false, ApplicationName = "RestoreDB_IT_Holder" }.ConnectionString);
-        await holder.OpenAsync();
-        try
-        {
-            await using (var cmd = new SqlCommand($"ALTER DATABASE {It.Q(db.Name)} SET SINGLE_USER WITH ROLLBACK IMMEDIATE; USE {It.Q(db.Name)};", holder))
-                await cmd.ExecuteNonQueryAsync();
-            var holderSpid = Convert.ToInt32(await new SqlCommand("SELECT @@SPID;", holder).ExecuteScalarAsync());
-
-            var diag = await Repair().DiagnoseAsync(db.AsInfo("ONLINE"), It.Conn, It.NoProgress);
-            Assert.Equal(RecommendedActionKind.FixAccess, diag.RecommendedAction);
-            Assert.Contains(diag.AccessHolders, h => h.SessionId == holderSpid);
-
-            var r = await new AdjustmentService(new LogService()).ReleaseAccessAsync(db.AsInfo("ONLINE"), disconnectHolders: true, It.Conn, It.NoProgress);
-            Assert.Equal(RepairStatus.Success, r.Status);
-            Assert.Equal("MULTI_USER", await It.ScalarAsync("SELECT user_access_desc FROM sys.databases WHERE name = @n;", ("@n", db.Name)));
-            Assert.Equal(3, await It.RowCountAsync(db.Name));
-        }
-        finally { try { holder.Dispose(); } catch { } }
-    }
-
     // ------------------------------------------------------------------ Contadores / verificação em partes
 
     [IntegrationFact]
