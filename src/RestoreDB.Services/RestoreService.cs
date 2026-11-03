@@ -422,20 +422,29 @@ public sealed class RestoreService
 
         var total = 0;
         var failed = new List<string>();
-        foreach (var t in tables.Distinct(StringComparer.OrdinalIgnoreCase))
+        try
         {
-            try
+            foreach (var t in tables.Distinct(StringComparer.OrdinalIgnoreCase))
             {
-                var n = await session.SalvageTableAsync(copy, databaseName, t, ct);
-                total += n;
-                Report(progress, databaseName, RepairLogLevel.Success, $"  ✔ {t}: {n} linha(s) devolvida(s).");
+                try
+                {
+                    var n = await session.SalvageTableAsync(copy, databaseName, t, ct);
+                    total += n;
+                    Report(progress, databaseName, RepairLogLevel.Success, $"  ✔ {t}: {n} linha(s) devolvida(s).");
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    failed.Add(t);
+                    Report(progress, databaseName, RepairLogLevel.Warning, $"  ⚠ {t}: {ex.Message}");
+                }
             }
-            catch (OperationCanceledException) { throw; }
-            catch (Exception ex)
-            {
-                failed.Add(t);
-                Report(progress, databaseName, RepairLogLevel.Warning, $"  ⚠ {t}: {ex.Message}");
-            }
+        }
+        catch
+        {
+            // Cancelado no meio: ninguém recebe o nome da cópia para o assistente de salvamento — não a deixa para trás.
+            await session.DropDatabaseBestEffortAsync(copy, CancellationToken.None);
+            throw;
         }
 
         if (failed.Count == 0)

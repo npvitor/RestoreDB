@@ -232,6 +232,33 @@ public sealed class NewRecoveryIntegrationTests
     }
 
     [IntegrationFact]
+    public async Task ExclusaoAcidental_CanceladaDepoisDaCopia_NaoDeixaACopiaParaTras()
+    {
+        await using var db = await TestDatabase.CreateAsync("undocancel");
+        await It.ExecAsync($"ALTER DATABASE {It.Q(db.Name)} SET RECOVERY FULL;");
+        await db.BackupAsync();
+        await Task.Delay(1500);
+        var target = (DateTime)(await It.ScalarAsync("SELECT GETDATE();"))!;
+        await Task.Delay(1500);
+        await It.ExecAsync($"DELETE FROM {It.Q(db.Name)}.dbo.NotaFiscal WHERE Cliente = N'B';");
+        var pattern = AppConstants.SanitizeToken(db.Name) + "_AntesExclusao_%";
+        try
+        {
+            // Cancela assim que a cópia de antes da exclusão fica pronta (antes de devolver as linhas).
+            using var cts = new CancellationTokenSource();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Restore().RecoverDeletedRowsAsync(
+                db.Name, target, new[] { "dbo.NotaFiscal" }, It.Conn, new CancelOn(cts, "criada e ONLINE"), cts.Token));
+
+            Assert.Equal(0, await CountAsync("SELECT COUNT(*) FROM sys.databases WHERE name LIKE @p;", ("@p", pattern)));
+        }
+        finally
+        {
+            var leftover = await It.ScalarAsync("SELECT TOP 1 name FROM sys.databases WHERE name LIKE @p;", ("@p", pattern)) as string;
+            if (leftover is not null) await It.ForceDropAsync(leftover);
+        }
+    }
+
+    [IntegrationFact]
     public async Task RecuperarParaCopia_FalhaNoMeio_NaoDeixaACopiaPresaEmRestoring()
     {
         await using var db = await TestDatabase.CreateAsync("copyfail");
