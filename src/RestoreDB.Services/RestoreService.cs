@@ -224,7 +224,18 @@ public sealed class RestoreService
         // Força realocar TODOS os arquivos (com nomes novos) para nunca colidir com os do original.
         await ApplyAutoRelocateAsync(session, request, progress, ct, forceRelocate: true);
 
-        var restore = await RestoreDatabaseAsync(session, request, progress, ct);
+        // A cópia foi criada AGORA (não existia): se a restauração falhar ou for cancelada no meio, ela fica em
+        // RESTORING, inútil — e bloquearia a próxima tentativa com o mesmo nome ("Já existe um banco...").
+        var restore = new RepairResult { Status = RepairStatus.Failed };
+        try
+        {
+            restore = await RestoreDatabaseAsync(session, request, progress, ct);
+        }
+        finally
+        {
+            if (restore.Status != RepairStatus.Success && !await session.DropDatabaseBestEffortAsync(copy, CancellationToken.None))
+                Report(progress, originalDb, RepairLogLevel.Warning, $"Não foi possível descartar a cópia incompleta [{copy}] — remova-a manualmente.");
+        }
         if (restore.Status == RepairStatus.Success)
         {
             restore.Message = $"Cópia [{copy}] criada e ONLINE. Use-a para extrair/salvar dados sem afetar [{originalDb}].";

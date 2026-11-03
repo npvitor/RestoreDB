@@ -208,6 +208,34 @@ public sealed class NewRecoveryIntegrationTests
     }
 
     [IntegrationFact]
+    public async Task RecuperarParaCopia_FalhaNoMeio_NaoDeixaACopiaPresaEmRestoring()
+    {
+        await using var db = await TestDatabase.CreateAsync("copyfail");
+        await It.ExecAsync($"ALTER DATABASE {It.Q(db.Name)} SET RECOVERY FULL;");
+        await db.BackupAsync();
+        var log = db.Name + "_reuso.trn";
+        await It.ExecAsync($"BACKUP LOG {It.Q(db.Name)} TO DISK = @f WITH INIT;", ("@f", log));     // log 1
+        await It.ExecAsync($"EXEC(N'USE {It.Q(db.Name)}; INSERT dbo.NotaFiscal(Cliente,Valor) VALUES (N''D'',40);');");
+        // O log 2 SOBRESCREVE o log 1 no mesmo arquivo; o msdb ainda lista o log 1 nele: o RESTORE do 2º elo falha.
+        await It.ExecAsync($"BACKUP LOG {It.Q(db.Name)} TO DISK = @f WITH INIT;", ("@f", log));
+        var copy = db.Name + "_copia";
+        try
+        {
+            var r = await Restore().RestoreAsCopyAsync(db.Name, copy, It.Conn, It.NoProgress);
+
+            Assert.Equal(RepairStatus.Failed, r.Status);
+            // A cópia incompleta (RESTORING) foi descartada — uma nova tentativa com o mesmo nome não é bloqueada.
+            Assert.Equal("DESCONHECIDO", await It.GetStateAsync(copy));
+            Assert.Equal("ONLINE", await It.GetStateAsync(db.Name));
+        }
+        finally
+        {
+            await It.ForceDropAsync(copy);
+            await It.TryDeleteBackupFileAsync(log);
+        }
+    }
+
+    [IntegrationFact]
     public async Task Plano_IgnoraBackupCujoArquivoFoiApagado()
     {
         await using var db = await TestDatabase.CreateAsync("gonebak");
