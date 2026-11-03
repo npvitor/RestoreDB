@@ -136,6 +136,29 @@ public class PreRepairExtractorTests
     }
 
     [Theory]
+    [InlineData("datetime")]
+    [InlineData("smalldatetime")]
+    [InlineData("date")]
+    public void Predicado_Data_UltimaFaixaDaVarredura_NaoTemFim(string type)
+    {
+        // b = maior valor da tabela: b+1 tick arredonda/trunca de volta para b no tipo da coluna, e um fim
+        // exclusivo deixaria de fora as linhas da chave máxima.
+        var key = new RangeKey("Emissao", type, false);
+        var a = new DateTime(2024, 1, 1).Ticks;
+        var b = new DateTime(2024, 1, 31).Ticks;
+        var (where, prm) = PreRepairExtractor.RangePredicate(key, a, b, openEnd: true);
+        Assert.Equal($"[Emissao] >= CAST(CAST(@lo AS datetime2(7)) AS {type})", where);
+        Assert.False(prm.ContainsKey("@hi"));
+    }
+
+    [Fact]
+    public void Predicado_Inteiro_UltimaFaixa_ContinuaExata()
+    {
+        var (where, _) = PreRepairExtractor.RangePredicate(new RangeKey("Id", "int", false), 10, 20, openEnd: true);
+        Assert.Equal("[Id] BETWEEN CAST(@lo AS int) AND CAST(@hi AS int)", where);
+    }
+
+    [Theory]
     [InlineData("tinyint", 0, 255)]
     [InlineData("smallint", short.MinValue, short.MaxValue)]
     [InlineData("int", int.MinValue, int.MaxValue)]

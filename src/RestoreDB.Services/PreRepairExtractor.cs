@@ -126,7 +126,7 @@ internal sealed class PreRepairExtractor
         _report(RepairLogLevel.Info, $"  {table}: páginas ilegíveis no caminho — lendo por faixas de [{key.Column}] para pular só o trecho danificado...");
         var res = await RangeBisector.RunAsync(lo, hi, async (a, b) =>
         {
-            var (where, prm) = RangePredicate(key, a, b);
+            var (where, prm) = RangePredicate(key, a, b, openEnd: b >= hi);
             var o = await s.CopyRowsAsync(db, salvage, table, cols, where, prm, ct: ct);
             return o.Ok ? (RangeCopyStatus.Ok, o.Rows)
                  : o.Corruption ? (RangeCopyStatus.Unreadable, 0L)
@@ -151,7 +151,7 @@ internal sealed class PreRepairExtractor
 
         // 3) Linhas dos trechos ilegíveis que um índice não-clusterizado ainda tem: versão PARCIAL, só para revisão.
         if (res.Unreadable.Count > 0)
-            te.PartialRows = await SalvagePartialRowsAsync(s, db, salvage, table, key, res.Unreadable, ct);
+            te.PartialRows = await SalvagePartialRowsAsync(s, db, salvage, table, key, res.Unreadable, hi, ct);
         return te;
     }
 
@@ -160,7 +160,7 @@ internal sealed class PreRepairExtractor
     /// danificadas) e guarda as linhas PARCIAIS em "tabela__parcial" no banco de salvamento.
     /// </summary>
     private async Task<long> SalvagePartialRowsAsync(SqlSession s, string db, string salvage, string table, RangeKey key,
-        IReadOnlyList<(long Lo, long Hi)> unreadable, CancellationToken ct)
+        IReadOnlyList<(long Lo, long Hi)> unreadable, long hi, CancellationToken ct)
     {
         try
         {
@@ -175,7 +175,7 @@ internal sealed class PreRepairExtractor
             long rows = 0;
             foreach (var (a, b) in unreadable.Take(200))
             {
-                var (where, prm) = RangePredicate(key, a, b);
+                var (where, prm) = RangePredicate(key, a, b, openEnd: b >= hi);
                 var o = await s.CopyRowsAsync(db, salvage, table, ix.Value.Columns, where, prm, partial, ix.Value.Index, ct);
                 if (o.Ok) rows += o.Rows;
             }
@@ -270,8 +270,11 @@ internal sealed class PreRepairExtractor
     /// Predicado da faixa [a, b]. Inteiros: BETWEEN no próprio tipo (seek no índice). Datas: meio-aberto
     /// [a, b+1 tick) convertido via datetime2(7) — a mesma fronteira vira o fim de uma faixa e o início da
     /// seguinte, então nenhuma linha cai em duas faixas, mesmo com o arredondamento do datetime.
+    /// A ÚLTIMA faixa da varredura (<paramref name="openEnd"/>) não tem fim: b é o MAIOR valor da tabela e
+    /// b+1 tick arredonda de volta para b em datetime/smalldatetime (e trunca para o mesmo dia em date) —
+    /// com o fim exclusivo, as linhas da chave máxima ficariam fora da cópia.
     /// </summary>
-    public static (string Where, Dictionary<string, object?> Params) RangePredicate(RangeKey key, long a, long b)
+    public static (string Where, Dictionary<string, object?> Params) RangePredicate(RangeKey key, long a, long b, bool openEnd = false)
     {
         var col = Q(key.Column);
         // Valor único: igualdade (busca pontual). Com BETWEEN x AND x o SQL Server lê a página SEGUINTE para
@@ -284,7 +287,7 @@ internal sealed class PreRepairExtractor
 
         var (_, typeHi) = TypeBounds(key);
         var lo = Iso(a);
-        if (b >= typeHi)
+        if (b >= typeHi || openEnd)
             return ($"{col} >= CAST(CAST(@lo AS datetime2(7)) AS {key.TypeName})", new Dictionary<string, object?> { ["@lo"] = lo });
         return ($"{col} >= CAST(CAST(@lo AS datetime2(7)) AS {key.TypeName}) AND {col} < CAST(CAST(@hi AS datetime2(7)) AS {key.TypeName})",
             new Dictionary<string, object?> { ["@lo"] = lo, ["@hi"] = Iso(b + 1) });
