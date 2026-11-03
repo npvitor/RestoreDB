@@ -27,7 +27,9 @@ public sealed class AdjustmentsAndSalvageIntegrationTests
         await c.OpenAsync();
         c.ChangeDatabase(db);
         await using var cmd = new SqlCommand(sql, c) { CommandTimeout = 0 };
-        return await cmd.ExecuteScalarAsync();
+        try { return await cmd.ExecuteScalarAsync(); }
+        // A conexão volta ao pool ainda "dentro" do banco e disputaria a vaga de um SINGLE_USER posterior.
+        finally { if (c.State == System.Data.ConnectionState.Open) c.ChangeDatabase("master"); }
     }
 
     // ------------------------------------------------------------------ Ajustes recomendados

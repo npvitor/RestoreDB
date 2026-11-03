@@ -32,7 +32,9 @@ public static class BackupChainPlanner
                               "(retrata o banco já danificado). Ela será usada como base por falta de outra.");
             preferred = fulls;
         }
-        var baseFull = preferred.OrderByDescending(b => b.BackupFinishDate ?? DateTime.MinValue).FirstOrDefault();
+        // O msdb data os backups com precisão de SEGUNDO: dois FULLs no mesmo segundo (agendado + manual) empatam —
+        // o LSN diz qual é o mais novo (no empate, a consulta traz o mais ANTIGO primeiro).
+        var baseFull = preferred.OrderByDescending(b => b.BackupFinishDate ?? DateTime.MinValue).ThenByDescending(b => b.LastLsn).FirstOrDefault();
         if (baseFull is null)
         {
             plan.Warnings.Add(target is null
@@ -52,6 +54,7 @@ public static class BackupChainPlanner
                                       && (b.BackupFinishDate ?? DateTime.MinValue) >= (baseFull.BackupFinishDate ?? DateTime.MinValue)
                                       && BelongsTo(b, baseFull))
                           .OrderByDescending(b => b.BackupFinishDate ?? DateTime.MinValue)
+                          .ThenByDescending(b => b.LastLsn)
                           .FirstOrDefault();
         if (diff is not null)
         {
@@ -131,6 +134,7 @@ public static class BackupChainPlanner
         var plan = new BackupChainPlan { DatabaseName = databaseName };
         var baseFull = history.Where(b => b.IsFull && !b.IsCopyOnly)
                               .OrderByDescending(b => b.BackupFinishDate ?? DateTime.MinValue)
+                              .ThenByDescending(b => b.LastLsn)
                               .FirstOrDefault();
         if (baseFull is null)
         {

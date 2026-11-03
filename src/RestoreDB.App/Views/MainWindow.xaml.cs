@@ -344,9 +344,12 @@ public partial class MainWindow : Window
             StateFriendlyText.Text = readOnlyOnly
                 ? "Disponível, mas SOMENTE LEITURA: o sistema não consegue gravar."
                 : $"Disponível, mas TRAVADO ({db.UserAccess}): o sistema não consegue usar o banco normalmente.";
-            RecommendedActionText.Text = readOnlyOnly
-                ? "Diagnostique: se o modo somente leitura não for proposital, os 'Ajustes recomendados' liberam a gravação, sem perda de dados."
-                : "Diagnostique: a ferramenta mostra quem está segurando o acesso e libera sem perda de dados.";
+            // Já diagnosticado: o rótulo aponta a ação concluída (ex.: liberar acesso), não "diagnostique" de novo.
+            RecommendedActionText.Text = diag is not null && diag.RecommendedAction is not (RecommendedActionKind.NoAction or RecommendedActionKind.Unknown)
+                ? RecommendedActionLabel(diag, db)
+                : readOnlyOnly
+                    ? "Diagnostique: se o modo somente leitura não for proposital, os 'Ajustes recomendados' liberam a gravação, sem perda de dados."
+                    : "Diagnostique: a ferramenta mostra quem está segurando o acesso e libera sem perda de dados.";
         }
         else if (problemFound)
         {

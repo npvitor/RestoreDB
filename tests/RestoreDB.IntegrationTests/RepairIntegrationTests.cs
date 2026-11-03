@@ -415,6 +415,9 @@ public sealed class RepairIntegrationTests
         Assert.Equal(RepairStatus.Success, r.Status);
         Assert.Equal("ONLINE", await It.GetStateAsync(db.Name));
         Assert.Equal(3, await It.RowCountAsync(db.Name));
+        // O COUNT(*) pode ler só o índice não-clusterizado: o CHECKDB lê a página restaurada (RestorePending = Msg 829).
+        Assert.True(await Corruption.CheckDbCleanAsync(db.Name));
+        Assert.Equal(3, Convert.ToInt32(await It.ScalarAsync($"SELECT COUNT(*) FROM {It.Q(db.Name)}.dbo.NotaFiscal WITH (INDEX(1));")));
     }
 
     [IntegrationFact]

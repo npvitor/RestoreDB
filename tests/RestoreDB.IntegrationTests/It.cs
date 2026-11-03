@@ -74,14 +74,38 @@ BEGIN
   BEGIN TRY SET @c = N'ALTER DATABASE ' + QUOTENAME(@n) + N' SET ONLINE;'; EXEC(@c); END TRY BEGIN CATCH END CATCH
   BEGIN TRY SET @c = N'ALTER DATABASE ' + QUOTENAME(@n) + N' SET SINGLE_USER WITH ROLLBACK IMMEDIATE;'; EXEC(@c); END TRY BEGIN CATCH END CATCH
   BEGIN TRY SET @c = N'DROP DATABASE ' + QUOTENAME(@n) + N';'; EXEC(@c); END TRY BEGIN CATCH END CATCH
-END";
+END
+-- O 2008 R2 mantém o plano de consultas ad-hoc com nome de 3 partes ([banco].dbo.T, contexto master) depois do
+-- DROP; recriado o banco com o mesmo nome, o plano velho aponta o database_id ANTIGO — que pode já ser de outro
+-- banco (SUSPECT → Msg 926 numa consulta que nem o cita). Descarta os planos que citam o nome.
+DECLARE @h varbinary(64);
+DECLARE planos CURSOR LOCAL FAST_FORWARD FOR
+  SELECT cp.plan_handle FROM sys.dm_exec_cached_plans cp CROSS APPLY sys.dm_exec_sql_text(cp.plan_handle) st
+  WHERE st.text LIKE N'%' + REPLACE(REPLACE(@n, N'[', N'[[]'), N'_', N'[_]') + N'%';
+OPEN planos; FETCH planos INTO @h;
+WHILE @@FETCH_STATUS = 0 BEGIN DBCC FREEPROCCACHE (@h) WITH NO_INFOMSGS; FETCH planos INTO @h; END
+CLOSE planos; DEALLOCATE planos;";
         await ExecAsync(sql, ("@n", name));
     }
 
-    /// <summary>Apaga um arquivo de backup pela própria instância (best-effort).</summary>
+    /// <summary>
+    /// Apaga um arquivo de backup pela própria instância (best-effort). Nome sem pasta = pasta padrão de backups.
+    /// O sys.xp_delete_files só existe nas versões novas; no 2008 R2 vale o xp_delete_file (que só apaga
+    /// arquivos de backup válidos — é o caso). Sem esse desvio, cada execução no 2008 deixava os .bak/.trn para trás.
+    /// </summary>
     public static async Task TryDeleteBackupFileAsync(string path)
     {
-        try { await ExecAsync("EXEC master.sys.xp_delete_files @p;", ("@p", path)); } catch { /* best-effort */ }
+        const string sql = @"
+DECLARE @full nvarchar(4000) = @p;
+IF CHARINDEX(N'\', @full) = 0
+BEGIN
+  DECLARE @dir nvarchar(4000);
+  EXEC master.dbo.xp_instance_regread N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer', N'BackupDirectory', @dir OUTPUT;
+  SET @full = @dir + N'\' + @full;
+END
+IF OBJECT_ID(N'master.sys.xp_delete_files') IS NOT NULL EXEC master.sys.xp_delete_files @full;
+ELSE EXEC master.dbo.xp_delete_file 0, @full;";
+        try { await ExecAsync(sql, ("@p", path)); } catch { /* best-effort */ }
     }
 
     /// <summary>Remove o histórico de backup do banco em msdb (best-effort).</summary>
@@ -126,7 +150,7 @@ internal sealed class TestDatabase : IAsyncDisposable
         var path = await It.ScalarAsync(
             "SELECT TOP (1) bmf.physical_device_name FROM msdb.dbo.backupset bs " +
             "JOIN msdb.dbo.backupmediafamily bmf ON bmf.media_set_id = bs.media_set_id " +
-            "WHERE bs.database_name = @n ORDER BY bs.backup_finish_date DESC;", ("@n", Name)) as string;
+            "WHERE bs.database_name = @n ORDER BY bs.backup_set_id DESC;", ("@n", Name)) as string;
         var resolved = path ?? file;
         _backups.Add(resolved);
         return resolved;

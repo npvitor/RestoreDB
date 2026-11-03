@@ -21,10 +21,14 @@ public sealed record CopyOutcome(bool Ok, long Rows, int ErrorNumber, string Mes
 /// </summary>
 public sealed partial class SqlSession
 {
-    /// <summary>Erros que indicam página/estrutura ilegível — a faixa deve ser dividida, não abandonada.</summary>
+    /// <summary>
+    /// Erros que indicam página/estrutura ilegível — a faixa deve ser dividida, não abandonada. O 601 ("could not
+    /// continue scan with NOLOCK due to data movement") é o que a leitura devolve em EMERGENCY ao esbarrar numa
+    /// página danificada; a extração roda com acesso exclusivo, então não há "movimento" de outra sessão.
+    /// </summary>
     private static readonly HashSet<int> CorruptionErrors = new()
     {
-        605, 606, 608, 823, 824, 825, 829, 2511, 5242, 5243, 7105, 7987, 8909, 8928, 8939, 8944, 8976, 8978, 8984
+        601, 605, 606, 608, 823, 824, 825, 829, 2511, 5242, 5243, 7105, 7987, 8909, 8928, 8939, 8944, 8976, 8978, 8984
     };
 
     /// <summary>Erros de falta de espaço no banco de salvamento — não adianta continuar.</summary>

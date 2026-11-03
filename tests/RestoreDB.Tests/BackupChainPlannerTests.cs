@@ -28,6 +28,22 @@ public class BackupChainPlannerTests
     };
 
     [Fact]
+    public void Plan_DoisFullsNoMesmoSegundo_EscolheOMaisNovoPeloLsn()
+    {
+        // O msdb data os backups em segundos; a consulta traz o mais ANTIGO primeiro no empate.
+        var history = new List<BackupSetInfo>
+        {
+            Full(1, first: 100, last: 200, checkpoint: 150, device: "antigo.bak"),
+            Full(1, first: 300, last: 400, checkpoint: 350, device: "novo.bak"),
+        };
+
+        var plan = BackupChainPlanner.Plan("DB", history, target: null);
+
+        Assert.Equal("novo.bak", plan.BaseFull!.PhysicalDevice);
+        Assert.Equal("novo.bak", BackupChainPlanner.PlanBaseFullOnly("DB", history).BaseFull!.PhysicalDevice);
+    }
+
+    [Fact]
     public void Plan_PicksLatestFull_AndContiguousLogs_ToLatest()
     {
         var history = new List<BackupSetInfo>

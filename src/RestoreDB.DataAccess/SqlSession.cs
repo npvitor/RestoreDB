@@ -622,6 +622,11 @@ public sealed partial class SqlSession : IAsyncDisposable, IDisposable
             catch (OperationCanceledException) { throw; }
             catch { /* segue com relatório vazio */ }
         }
+        catch (SqlException ex) when (ex.Errors.Cast<SqlError>().Any(e => e.Number == 7929))
+        {
+            // "Database contains deferred transactions": o CHECKDB (e o reparo) não roda neste banco.
+            report.DeferredTransactions = true;
+        }
         catch
         {
             // Banco inacessível / sem permissão: relatório fica vazio (Executed = false).

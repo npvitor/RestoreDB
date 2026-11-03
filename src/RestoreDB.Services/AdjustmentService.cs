@@ -78,7 +78,9 @@ public sealed class AdjustmentService
         var ok = 0;
         var pending = new List<string>();
 
-        foreach (var kind in kinds.Distinct().OrderBy(k => k))
+        // Liberar a gravação vem ANTES de tudo: com o banco somente leitura, revalidar regras/objetos, reconstruir
+        // índices, religar usuários e reorganizar o log falhariam.
+        foreach (var kind in kinds.Distinct().OrderBy(k => k == HealthIssueKind.ReadOnly ? -1 : (int)k))
         {
             ct.ThrowIfCancellationRequested();
             var (done, note) = kind switch

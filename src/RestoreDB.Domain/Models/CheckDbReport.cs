@@ -13,6 +13,13 @@ public sealed class CheckDbReport
     /// <summary>true se o CHECKDB executou e retornou um resultado (mesmo sem erros).</summary>
     public bool Executed { get; set; }
 
+    /// <summary>
+    /// O CHECKDB foi recusado porque o banco tem transações ADIADAS (Msg 7929): o SQL Server (Enterprise/
+    /// Developer) não conseguiu desfazer uma transação por causa de uma página danificada e a deixou pendente.
+    /// Nesse estado nem o reparo do DBCC roda — só a restauração da página (ou do banco) a partir de backup.
+    /// </summary>
+    public bool DeferredTransactions { get; set; }
+
     public bool HasErrors => Details.Any(d => d.Error != 0 && d.Level >= 16);
 
     /// <summary>Todos os erros estão em índices não-clusterizados (reconstruíveis sem perda).</summary>

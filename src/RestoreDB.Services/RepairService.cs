@@ -28,6 +28,9 @@ public sealed class RepairService
     private string? _keptSalvageDb;
     private string _lossSummary = string.Empty;
 
+    /// <summary>Algum DBCC da execução corrente foi recusado por transações adiadas (Msg 7929).</summary>
+    private bool _deferredTransactions;
+
     public RepairService(LogService log, RestoreService restore)
     {
         _log = log;
@@ -50,6 +53,7 @@ public sealed class RepairService
         var result = new RepairResult();
         _keptSalvageDb = null;
         _lossSummary = string.Empty;
+        _deferredTransactions = false;
         var mode = allowDataLoss ? "COM possível PERDA DE DADOS" : "seguro (sem perda de dados)";
         Report(progress, db.Name, RepairLogLevel.Info, $"════════ Iniciando reparo de [{db.Name}] — modo {mode} ════════");
 
@@ -89,7 +93,9 @@ public sealed class RepairService
         string finalState;
         try
         {
-            finalState = await session.GetDatabaseStateAsync(db.Name, ct);
+            finalState = state.Trim().Equals("ONLINE", StringComparison.OrdinalIgnoreCase)
+                ? await session.GetDatabaseStateAsync(db.Name, ct)
+                : await GetSettledStateAsync(session, db.Name, ct);
         }
         catch (Exception ex)
         {
@@ -111,6 +117,7 @@ public sealed class RepairService
             _ => $"Não foi possível reparar automaticamente. Estado atual: {finalState}."
         };
         if (_lossSummary.Length > 0) result.Message += " " + _lossSummary;
+        if (_deferredTransactions && status != RepairStatus.Success) result.Message += " " + DeferredTransactionsHint;
         if (_keptSalvageDb is not null)
         {
             result.SalvageDatabase = _keptSalvageDb;
@@ -349,6 +356,16 @@ public sealed class RepairService
         return diag;
     }
 
+    /// <summary>Explicação leiga para a Msg 7929 (transações adiadas), no diagnóstico e no reparo.</summary>
+    internal const string DeferredTransactionsHint =
+        "O banco tem transações ADIADAS (deferred transactions): o SQL Server não conseguiu desfazer uma transação " +
+        "porque uma página está danificada e a deixou pendente. Assim nem o DBCC CHECKDB nem o reparo do DBCC rodam. " +
+        "Restaure as páginas danificadas a partir do backup ('Restaurar páginas') ou o banco inteiro; sem backup, acione o DBA.";
+
+    /// <summary>A execução de um DBCC foi recusada por transações adiadas (Msg 7929)?</summary>
+    private static bool HitDeferredTransactions(CommandExecutionResult r)
+        => r.ErrorMessages.Any(m => m.StartsWith("Msg 7929,", StringComparison.Ordinal));
+
     private static bool LooksLikeCorruptionLine(string line) => ContainsAny(line,
         // EN
         "checksum", "consistency-based", "consistency based", "i/o error", "torn page",
@@ -374,6 +391,12 @@ public sealed class RepairService
             physicalOnly: physicalOnly, dataPurity: !physicalOnly);
         diag.CheckDb = report;
 
+        if (report.DeferredTransactions)
+        {
+            diag.DataCorruptionSuspected = true;
+            Report(progress, db.Name, RepairLogLevel.Warning, DeferredTransactionsHint);
+            return;
+        }
         if (!report.Executed)
         {
             Report(progress, db.Name, RepairLogLevel.Info, "Não foi possível rodar o CHECKDB agora (banco inacessível neste estado). Usando demais evidências.");
@@ -664,6 +687,18 @@ public sealed class RepairService
             return;
         }
 
+        // 1a) O próprio CHECKDB diz que o REPAIR_REBUILD basta (ex.: chaves fora de ordem): conserta SEM perda,
+        //     a partir dos próprios dados — restaurar um backup desfaria à toa o que foi gravado depois dele.
+        if (d.CheckDb is { Executed: true, HasErrors: true } rebuildable
+            && rebuildable.MinRepairLevel.Equals("REPAIR_REBUILD", StringComparison.OrdinalIgnoreCase)
+            && !d.LogCorruptionSuspected && d.SuspectPages.All(p => !p.IsActiveCorruption))
+        {
+            d.RecommendedAction = RecommendedActionKind.SafeRepair;
+            d.Summary = "Há corrupção na estrutura das tabelas que o reparo SEM perda de dados corrige.";
+            d.Recommendation = "Use 'Reparar (modo seguro)': o DBCC reconstrói as estruturas danificadas a partir dos próprios dados (REPAIR_REBUILD). Nenhum dado é perdido." + topoNote;
+            return;
+        }
+
         // 1b) Integridade LÓGICA comprometida (FK órfã / constraint) com os arquivos FÍSICOS
         //     íntegros → remover as linhas violadoras. O CHECKDB não conserta isso. Físico tem
         //     prioridade: só recomenda esta correção quando não há corrupção de dados/log.
@@ -695,7 +730,12 @@ public sealed class RepairService
         // 3) Corrupção de DADOS → restaurar de backup (ou restauração de página, se poucas páginas).
         if (d.DataCorruptionSuspected && !d.LogCorruptionSuspected)
         {
-            var fewPages = d.SuspectPages.Count(p => p.IsActiveCorruption) is > 0 and <= 100;
+            // A restauração de página exige o modelo FULL/BULK_LOGGED (em SIMPLE ela só aborta) e o banco ONLINE:
+            // num banco SUSPECT o SQL Server recusa ("only a file restore is currently possible", Msg 4309).
+            var simple = "SIMPLE".Equals(d.BackupPolicy?.RecoveryModel, StringComparison.OrdinalIgnoreCase)
+                         || "SIMPLE".Equals(d.Settings?.RecoveryModel, StringComparison.OrdinalIgnoreCase);
+            var online = d.StateDesc.Trim().Equals("ONLINE", StringComparison.OrdinalIgnoreCase);
+            var fewPages = !simple && online && d.SuspectPages.Count(p => p.IsActiveCorruption) is > 0 and <= 100;
             d.RecommendedAction = fewPages ? RecommendedActionKind.PageRestore : RecommendedActionKind.RestoreFromBackup;
             d.Summary = "Há corrupção nos arquivos de DADOS (.mdf/.ndf).";
             d.Recommendation = (fewPages
@@ -845,8 +885,11 @@ public sealed class RepairService
                     "Banco recuperado para ONLINE. Aplicando REPAIR_REBUILD (sem perda) e verificando...");
                 var rebuild = await RunStepAsync(s, db, p, "Reparo SEM perda de dados (REPAIR_REBUILD)",
                     Dbcc(db.Name, "REPAIR_REBUILD", noInfoMsgs: false), ct);
+                _deferredTransactions |= HitDeferredTransactions(rebuild);
                 var verify = await RunCheckDbStepAsync(s, db, p, "Verificação pós-reparo (DBCC CHECKDB)", db.Name, ct);
-                safeOk = rebuild.Success && verify.Success;
+                // O REPAIR_REBUILD relata como erro (severidade 16) cada problema que ENCONTROU, mesmo quando o
+                // conserta ("The error has been repaired"): quem diz se resolveu é a verificação logo depois.
+                safeOk = verify.Success;
             }
             else
             {
@@ -921,6 +964,7 @@ public sealed class RepairService
 
         var repairStep = await RunStepAsync(s, db, p, "Reparo COM possível PERDA DE DADOS (REPAIR_ALLOW_DATA_LOSS)",
             Dbcc(db.Name, "REPAIR_ALLOW_DATA_LOSS", noInfoMsgs: false), ct);
+        _deferredTransactions |= HitDeferredTransactions(repairStep);
 
         // Se o banco continuar em EMERGENCY (somente leitura) após o reparo, nada do que vem a seguir
         // (recuperar linhas, reconciliar FKs, reseed) conseguiria gravar: religa-o.
@@ -969,7 +1013,20 @@ public sealed class RepairService
     {
         Report(p, db.Name, RepairLogLevel.Info, "Banco ONLINE: verificando consistência física e lógica antes de decidir...");
         var report = await s.CheckDbWithResultsAsync(db.Name, repairOption: null, ct);
-        var hasPhysical = report is { Executed: true, HasErrors: true };
+        // Sem o CHECKDB não há como afirmar que o banco está íntegro (antes, isto virava "nada a reparar").
+        if (report.DeferredTransactions)
+        {
+            _deferredTransactions = true;
+            Report(p, db.Name, RepairLogLevel.Error, DeferredTransactionsHint);
+            return RepairStatus.Failed;
+        }
+        if (!report.Executed)
+        {
+            Report(p, db.Name, RepairLogLevel.Error,
+                "Não foi possível rodar o DBCC CHECKDB neste banco agora — sem ele não dá para afirmar que está íntegro. Nada foi alterado; veja o registro e diagnostique de novo.");
+            return RepairStatus.Failed;
+        }
+        var hasPhysical = report.HasErrors;
 
         // Com corrupção FÍSICA presente, o CHECKCONSTRAINTS é adiado: ele LÊ os dados pelos
         // índices corrompidos e um erro 824 (severidade 24) DERRUBA a conexão da sessão.
@@ -1028,8 +1085,10 @@ public sealed class RepairService
                 Report(p, db.Name, RepairLogLevel.Info, "Tentando reparo SEM perda de dados (REPAIR_REBUILD)...");
                 var rebuild = await RunStepAsync(s, db, p, "Reparo SEM perda (REPAIR_REBUILD)",
                     Dbcc(db.Name, "REPAIR_REBUILD", noInfoMsgs: false), ct);
+                _deferredTransactions |= HitDeferredTransactions(rebuild);
                 var verify = await RunCheckDbStepAsync(s, db, p, "Verificação pós-reparo (DBCC CHECKDB)", db.Name, ct);
-                if (rebuild.Success && verify.Success)
+                // O REPAIR_REBUILD relata como erro cada problema que encontrou, mesmo consertado: vale a verificação.
+                if (verify.Success)
                     return RepairStatus.Success;
 
                 // c) Precisa de REPAIR_ALLOW_DATA_LOSS.
@@ -1047,6 +1106,7 @@ public sealed class RepairService
                 var extraction = await TryPreRepairExtractionAsync(s, db, rowsBefore, corruptIds, recovery, p, ct);
                 var repairStep = await RunStepAsync(s, db, p, "Reparo COM possível PERDA DE DADOS (REPAIR_ALLOW_DATA_LOSS)",
                     Dbcc(db.Name, "REPAIR_ALLOW_DATA_LOSS", noInfoMsgs: false), ct);
+                _deferredTransactions |= HitDeferredTransactions(repairStep);
                 var verifyFinal = await RunCheckDbStepAsync(s, db, p, "Verificação final (DBCC CHECKDB)", db.Name, ct);
                 await TryRecoverRowsLostByRepairAsync(s, db, rowsBefore, repairStep, safety, connectionString, recovery, p, ct,
                     corruptObjectIds: corruptIds, extraction: extraction);
@@ -1243,6 +1303,9 @@ public sealed class RepairService
                 .Where(x => x.Rows > 0).OrderByDescending(x => x.Rows).ToList();
             if (lost.Count == 0)
             {
+                // Nada ficou faltando (ex.: o backup trouxe tudo): as linhas parciais da cópia de salvamento não têm mais
+                // o que revisar — mantê-la só deixaria um banco a mais no servidor.
+                keepSalvage = false;
                 _lossSummary = "Todas as linhas que o reparo descartou foram recuperadas.";
                 Report(p, db.Name, RepairLogLevel.Success, _lossSummary);
             }
@@ -2895,6 +2958,27 @@ public sealed class RepairService
         else
             Report(p, db.Name, RepairLogLevel.Warning,
                 "Não foi possível efetuar o backup (o banco pode estar inacessível). O reparo prosseguirá conforme autorizado.");
+    }
+
+    /// <summary>
+    /// Estado do banco depois que ele "assenta". Um ALTER DATABASE (SET ONLINE / SET MULTI_USER) num banco SUSPECT
+    /// o reinicia: ele aparece ONLINE por alguns segundos e a recuperação o devolve a SUSPECT. Ler o estado nesse
+    /// instante faria a tela mostrar ONLINE para um banco inacessível — espera o mesmo estado por 5 s (máx. 60 s).
+    /// </summary>
+    private static async Task<string> GetSettledStateAsync(SqlSession s, string dbName, CancellationToken ct)
+    {
+        var last = await s.GetDatabaseStateAsync(dbName, ct);
+        var since = DateTime.UtcNow;
+        var deadline = since.AddSeconds(60);
+        while (DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(500, ct);
+            var now = await s.GetDatabaseStateAsync(dbName, ct);
+            if (!now.Equals(last, StringComparison.OrdinalIgnoreCase)) { last = now; since = DateTime.UtcNow; }
+            else if (DateTime.UtcNow - since >= TimeSpan.FromSeconds(5)
+                     && !last.Equals("RECOVERING", StringComparison.OrdinalIgnoreCase)) break;
+        }
+        return last;
     }
 
     private async Task TrySetMultiUserAsync(SqlSession s, DatabaseInfo db, IProgress<RepairLogEntry> p, CancellationToken ct)

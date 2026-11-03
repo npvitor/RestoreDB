@@ -55,6 +55,38 @@ public class ConclusionHonestyTests
     }
 
     [Fact]
+    public void CorrupcaoQueORepairRebuildConserta_RecomendaReparoSeguro_ENaoRestaurarBackup()
+    {
+        // Chaves fora de ordem no índice clusterizado (Msg 2511/8933): nível mínimo REPAIR_REBUILD, sem perda.
+        var check = new CheckDbReport { Executed = true };
+        check.Details.Add(new CorruptionDetail { Error = 2511, Level = 16, ObjectId = 245575913, IndexId = 1, RepairLevel = "repair_rebuild" });
+        check.Details.Add(new CorruptionDetail { Error = 8933, Level = 16, ObjectId = 245575913, IndexId = 1, RepairLevel = "repair_rebuild" });
+        var d = new DiagnosisResult { DatabaseName = "X", StateDesc = "ONLINE", CheckDb = check, DataCorruptionSuspected = true };
+
+        RepairService.BuildConclusion(d);
+
+        Assert.Equal(RecommendedActionKind.SafeRepair, d.RecommendedAction);
+        Assert.Contains("Nenhum dado é perdido", d.Recommendation);
+    }
+
+    [Theory]
+    [InlineData("FULL", "ONLINE", RecommendedActionKind.PageRestore)]
+    [InlineData("SIMPLE", "ONLINE", RecommendedActionKind.RestoreFromBackup)]
+    [InlineData("FULL", "SUSPECT", RecommendedActionKind.RestoreFromBackup)]
+    public void PoucasPaginasCorrompidas_SoRecomendaRestaurarPaginasQuandoEhPossivel(string model, string state, RecommendedActionKind expected)
+    {
+        // Em SIMPLE a restauração de página não existe e num banco SUSPECT o SQL Server a recusa (Msg 4309):
+        // nesses casos ela não pode ser a ação recomendada.
+        var d = new DiagnosisResult { DatabaseName = "X", StateDesc = state, DataCorruptionSuspected = true,
+                                      BackupPolicy = new BackupPolicyAssessment { DatabaseName = "X", RecoveryModel = model } };
+        d.SuspectPages.Add(new SuspectPageInfo { FileId = 1, PageId = 254, EventType = 2, ErrorCount = 1 });
+
+        RepairService.BuildConclusion(d);
+
+        Assert.Equal(expected, d.RecommendedAction);
+    }
+
+    [Fact]
     public void LogCorrompido_ComecaPeloModoSeguro_ECitaAdministradorNoUltimoRecurso()
     {
         var d = new DiagnosisResult { DatabaseName = "X", StateDesc = "SUSPECT", LogCorruptionSuspected = true };

@@ -296,7 +296,7 @@ public sealed class NewRecoveryIntegrationTests
         await It.ExecAsync($"BACKUP DATABASE {It.Q(db.Name)} TO DISK = @f WITH INIT, FORMAT;", ("@f", gone)); // FULL 2
         var gonePath = await It.ScalarAsync(
             "SELECT TOP 1 bmf.physical_device_name FROM msdb.dbo.backupset bs JOIN msdb.dbo.backupmediafamily bmf ON bmf.media_set_id = bs.media_set_id " +
-            "WHERE bs.database_name = @n ORDER BY bs.backup_finish_date DESC;", ("@n", db.Name)) as string;
+            "WHERE bs.database_name = @n ORDER BY bs.backup_set_id DESC;", ("@n", db.Name)) as string;   // backup_finish_date empata no mesmo segundo
         await It.TryDeleteBackupFileAsync(gonePath!);                             // retenção apagou o arquivo; o msdb não sabe
 
         var r = await Restore().RestoreToPointInTimeAsync(db.Name, null, tailLogBackup: false, It.Conn, It.NoProgress);

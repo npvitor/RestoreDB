@@ -827,9 +827,9 @@ public sealed class RestoreService
 
     /// <summary>
     /// Restauração de PÁGINA montando a cadeia AUTOMATICAMENTE a partir do histórico (msdb): usa o
-    /// último FULL + toda a cadeia de LOGs e, por fim, captura um BACKUP LOG novo (aplicado WITH
-    /// RECOVERY) para concluir. Exige modelo FULL/BULK_LOGGED. <paramref name="pages"/> no formato
-    /// "fileId:pageId" separados por vírgula.
+    /// último FULL + toda a cadeia de LOGs e, por fim, captura um BACKUP LOG novo — DEPOIS de restaurar
+    /// as páginas — aplicado WITH RECOVERY para concluir. Exige modelo FULL/BULK_LOGGED.
+    /// <paramref name="pages"/> no formato "fileId:pageId" separados por vírgula.
     /// </summary>
     public async Task<RepairResult> RestorePagesFromHistoryAsync(
         string databaseName, string pages, string connectionString, IProgress<RepairLogEntry> progress, CancellationToken ct = default)
@@ -870,18 +870,14 @@ public sealed class RestoreService
         }
         Report(progress, databaseName, RepairLogLevel.Info, plan.Summary);
 
-        var pieces = new List<RestorePiece>(plan.Pieces);
-
-        // BACKUP LOG novo (não-NORECOVERY): captura o estado atual e será o último elo (WITH RECOVERY).
-        var tail = await BackupCurrentLogAsync(session, databaseName, progress, ct);
-        if (tail is not null) pieces.Add(tail);
-        else Report(progress, databaseName, RepairLogLevel.Warning,
-            "Não foi possível capturar um backup de log novo — a restauração de página pode não concluir (o último elo é obrigatório).");
-
-        return await RestorePagesAsync(databaseName, pages, pieces, connectionString, progress, ct);
+        return await RestorePagesAsync(databaseName, pages, plan.Pieces, connectionString, progress, ct);
     }
 
-    /// <summary>BACKUP LOG normal (sem NORECOVERY) para um arquivo novo — último elo da restauração de página.</summary>
+    /// <summary>
+    /// BACKUP LOG normal (sem NORECOVERY) para um arquivo novo — último elo da restauração de página. Precisa
+    /// ser tirado DEPOIS do RESTORE ... PAGE: só um log que cobre o instante da restauração leva as páginas
+    /// até o presente; um log anterior a ela deixa as páginas em RestorePending (Msg 829 ao lê-las).
+    /// </summary>
     private async Task<RestorePiece?> BackupCurrentLogAsync(SqlSession session, string db, IProgress<RepairLogEntry> p, CancellationToken ct)
     {
         var file = $"{AppConstants.SanitizeToken(db, "banco")}_pagelog_{DateTime.Now:yyyyMMdd_HHmmss}.trn";
@@ -898,8 +894,10 @@ public sealed class RestoreService
 
     /// <summary>
     /// Restauração de PÁGINA: recupera apenas as páginas corrompidas indicadas, preservando o
-    /// restante do banco. Exige a cadeia full + (diferencial) + logs até o presente e o modelo
-    /// de recuperação FULL. <paramref name="pages"/> no formato "fileId:pageId" separados por vírgula.
+    /// restante do banco. <paramref name="pieces"/> é a cadeia full + (diferencial) + logs, toda aplicada
+    /// WITH NORECOVERY; em seguida um BACKUP LOG novo é tirado e aplicado WITH RECOVERY (é ele que traz as
+    /// páginas até o presente). Exige o modelo de recuperação FULL. <paramref name="pages"/> no formato
+    /// "fileId:pageId" separados por vírgula.
     /// </summary>
     public async Task<RepairResult> RestorePagesAsync(
         string databaseName, string pages, IReadOnlyList<RestorePiece> pieces,
@@ -932,41 +930,55 @@ public sealed class RestoreService
         }
 
         // 2) Aplicar as peças subsequentes: diferencial com RESTORE DATABASE (o engine aplica só
-        //    as páginas em restauração), logs com RESTORE LOG; o último elo WITH RECOVERY.
+        //    as páginas em restauração), logs com RESTORE LOG — todas NORECOVERY.
         for (var i = 1; i < pieces.Count; i++)
         {
-            var isLast = i == pieces.Count - 1;
-            var p = pieces[i];
-            var withClause = isLast ? "RECOVERY" : "NORECOVERY";
-            var verb = p.IsLog ? "RESTORE LOG " : "RESTORE DATABASE ";
-            var (from, stepPrm) = DeviceFrom(p.AllDevices.Count > 0 ? p.AllDevices : new List<string> { p.DiskPath });
-            var paramDecl = "@f int" + string.Concat(Enumerable.Range(0, stepPrm.Count).Select(j => $", @p{j} nvarchar(4000)"));
-            var paramPass = "@f = @pos" + string.Concat(Enumerable.Range(0, stepPrm.Count).Select(j => $", @p{j} = @p{j}"));
-            stepPrm["@db"] = databaseName;
-            stepPrm["@pos"] = p.Position;
-            var stepSql =
-                "DECLARE @cmd nvarchar(max);\n" +
-                "SET @cmd = N'" + verb + "' + QUOTENAME(@db) + N' FROM " + from + " WITH FILE = @f, " + withClause + ";';\n" +
-                "EXEC sys.sp_executesql @cmd, N'" + paramDecl + "', " + paramPass + ";";
-            var lr = await RunStepAsync(session, databaseName, progress,
-                $"Aplicando {(p.IsLog ? "log" : "diferencial")} ({Path.GetFileName(p.DiskPath)}) {withClause}", stepSql, stepPrm, ct);
-            if (!lr.Success)
+            if (!(await ApplyPagePieceAsync(session, databaseName, pieces[i], recovery: false, progress, ct)).Success)
             {
                 result.Status = RepairStatus.Failed;
-                result.Message = $"Falha ao aplicar {(p.IsLog ? "o log" : "o diferencial")} na restauração de página.";
+                result.Message = $"Falha ao aplicar {(pieces[i].IsLog ? "o log" : "o diferencial")} na restauração de página.";
                 Report(progress, databaseName, RepairLogLevel.Error, result.Message);
                 return result;
             }
         }
 
+        // 3) Último elo: um BACKUP LOG tirado AGORA (depois do RESTORE ... PAGE), aplicado WITH RECOVERY.
+        var tail = await BackupCurrentLogAsync(session, databaseName, progress, ct);
+        var last = tail is null ? null : await ApplyPagePieceAsync(session, databaseName, tail, recovery: true, progress, ct);
+
+        // Msg 4303 ("additional roll forward ... is required"): o log não alcançou o presente e as páginas
+        // continuam RestorePending — o banco aparece ONLINE, mas ler essas páginas dá erro 829.
+        var incomplete = last is null || !last.Success || last.InfoMessages.Any(m => m.StartsWith("Msg 4303,", StringComparison.Ordinal));
         var finalState = await session.GetDatabaseStateAsync(databaseName, ct);
         result.FinalStateDesc = finalState;
-        result.Status = finalState.Equals("ONLINE", StringComparison.OrdinalIgnoreCase) ? RepairStatus.Success : RepairStatus.Failed;
+        result.Status = !incomplete && finalState.Equals("ONLINE", StringComparison.OrdinalIgnoreCase) ? RepairStatus.Success : RepairStatus.Failed;
         result.Message = result.Status == RepairStatus.Success
             ? "Restauração de página concluída. Banco ONLINE."
-            : $"Após a restauração de página, o banco está {finalState}.";
+            : incomplete
+                ? "A restauração de página NÃO foi concluída: as páginas ficaram aguardando o último backup de log (RestorePending). " +
+                  "Faça um BACKUP LOG e aplique-o WITH RECOVERY, ou acione o DBA."
+                : $"Após a restauração de página, o banco está {finalState}.";
         Report(progress, databaseName, result.Status == RepairStatus.Success ? RepairLogLevel.Success : RepairLogLevel.Warning, result.Message);
         return result;
+    }
+
+    /// <summary>Aplica um diferencial (RESTORE DATABASE) ou log (RESTORE LOG) de uma restauração de página.</summary>
+    private Task<CommandExecutionResult> ApplyPagePieceAsync(
+        SqlSession session, string databaseName, RestorePiece p, bool recovery, IProgress<RepairLogEntry> progress, CancellationToken ct)
+    {
+        var withClause = recovery ? "RECOVERY" : "NORECOVERY";
+        var verb = p.IsLog ? "RESTORE LOG " : "RESTORE DATABASE ";
+        var (from, stepPrm) = DeviceFrom(p.AllDevices.Count > 0 ? p.AllDevices : new List<string> { p.DiskPath });
+        var paramDecl = "@f int" + string.Concat(Enumerable.Range(0, stepPrm.Count).Select(j => $", @p{j} nvarchar(4000)"));
+        var paramPass = "@f = @pos" + string.Concat(Enumerable.Range(0, stepPrm.Count).Select(j => $", @p{j} = @p{j}"));
+        stepPrm["@db"] = databaseName;
+        stepPrm["@pos"] = p.Position;
+        var stepSql =
+            "DECLARE @cmd nvarchar(max);\n" +
+            "SET @cmd = N'" + verb + "' + QUOTENAME(@db) + N' FROM " + from + " WITH FILE = @f, " + withClause + ";';\n" +
+            "EXEC sys.sp_executesql @cmd, N'" + paramDecl + "', " + paramPass + ";";
+        return RunStepAsync(session, databaseName, progress,
+            $"Aplicando {(p.IsLog ? "log" : "diferencial")} ({Path.GetFileName(p.DiskPath)}) {withClause}", stepSql, stepPrm, ct);
     }
 
     /// <summary>
