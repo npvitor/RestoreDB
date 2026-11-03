@@ -72,6 +72,12 @@ public sealed class HistoryService
         if (current.SuspectPages > previous.SuspectPages)
             news.Add($"Mais páginas suspeitas: {current.SuspectPages} (antes {previous.SuspectPages}).");
 
+        // Banco que SAIU DO AR (SUSPECT/RECOVERY_PENDING/OFFLINE...) sem contador de corrupção novo — log cheio,
+        // arquivo ausente, disco cheio — é justamente o que o monitoramento agendado precisa avisar.
+        if (AppConstants.IsProblematic(current.StateDesc)
+            && !string.Equals(current.StateDesc, previous.StateDesc, StringComparison.OrdinalIgnoreCase))
+            news.Add($"O banco está {current.StateDesc} (antes {(previous.StateDesc.Length > 0 ? previous.StateDesc : "desconhecido")}) — indisponível para o sistema.");
+
         return news;
     }
 }

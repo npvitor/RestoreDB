@@ -6,10 +6,12 @@ namespace RestoreDB.Tests;
 
 public class HistoryServiceTests
 {
-    private static DiagnosisSnapshot Snap(int checkdb = 0, int fk = 0, bool physical = false, bool logical = false, int suspect = 0) => new()
+    private static DiagnosisSnapshot Snap(int checkdb = 0, int fk = 0, bool physical = false, bool logical = false, int suspect = 0,
+        string state = "ONLINE") => new()
     {
         DatabaseName = "DB",
         TimestampUtc = DateTime.UtcNow,
+        StateDesc = state,
         CheckDbErrors = checkdb,
         ForeignKeyViolations = fk,
         PhysicalCorruption = physical,
@@ -34,6 +36,29 @@ public class HistoryServiceTests
         var news = HistoryService.Compare(Snap(fk: 1), Snap(fk: 4));
         Assert.Contains(news, n => n.Contains("chave estrangeira"));
     }
+
+    [Theory]
+    [InlineData("RECOVERY_PENDING")]
+    [InlineData("SUSPECT")]
+    [InlineData("OFFLINE")]
+    public void Compare_BancoSaiuDoAr_SemCorrupcaoNova_EhNovidade(string state)
+    {
+        // Ex.: log cheio / arquivo ausente: nenhum contador de corrupção sobe, mas o banco está fora do ar.
+        var news = HistoryService.Compare(Snap(), Snap(state: state));
+        Assert.Contains(news, n => n.Contains(state) && n.Contains("indisponível"));
+    }
+
+    [Fact]
+    public void Compare_ContinuaForaDoAr_NaoRepeteOAlerta()
+        => Assert.Empty(HistoryService.Compare(Snap(state: "SUSPECT"), Snap(state: "SUSPECT")));
+
+    [Fact]
+    public void Compare_HistoricoAntigoSemEstado_BancoForaDoAr_EhNovidade()
+        => Assert.NotEmpty(HistoryService.Compare(Snap(state: ""), Snap(state: "RECOVERY_PENDING")));
+
+    [Fact]
+    public void Compare_VoltouAoAr_NaoEhNovidade()
+        => Assert.Empty(HistoryService.Compare(Snap(state: "RECOVERY_PENDING"), Snap()));
 
     [Fact]
     public void Compare_NothingWorse_ReturnsEmpty()
