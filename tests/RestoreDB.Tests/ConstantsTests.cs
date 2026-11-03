@@ -30,7 +30,11 @@ public class ConstantsTests
     {
         Assert.False(string.IsNullOrEmpty(StateInfo.Friendly("OFFLINE")));
         Assert.False(string.IsNullOrEmpty(StateInfo.RecommendedAction("SUSPECT")));
-        Assert.Equal("Nenhuma ação necessária.", StateInfo.RecommendedAction("ONLINE"));
+        // ONLINE não prova integridade (corrupção física/FK órfã não mudam o estado): o texto não pode dizer "saudável".
+        Assert.DoesNotContain("saudável", StateInfo.Friendly("ONLINE"));
+        Assert.Contains("Diagnosticar", StateInfo.RecommendedAction("ONLINE"));
+        // RECOVERING é a recuperação automática do SQL Server: a orientação é aguardar, não "finalizar".
+        Assert.Contains("Aguardar", StateInfo.RecommendedAction("RECOVERING"));
     }
 
     [Fact]

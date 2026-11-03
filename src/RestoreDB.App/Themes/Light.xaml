@@ -16,6 +16,8 @@
     <!-- Marca / ação primária -->
     <SolidColorBrush x:Key="PrimaryBrush" Color="#0B5A8A" />
     <SolidColorBrush x:Key="PrimaryDarkBrush" Color="#084466" />
+    <!-- Texto sobre PrimaryBrush (números dos passos). -->
+    <SolidColorBrush x:Key="OnPrimaryBrush" Color="#FFFFFF" />
     <SolidColorBrush x:Key="SecondaryHoverBrush" Color="#EAF2F8" />
     <SolidColorBrush x:Key="DisabledButtonBrush" Color="#AAB7C2" />
 

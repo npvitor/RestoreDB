@@ -147,7 +147,7 @@
                                     <ColumnDefinition Width="*" />
                                 </Grid.ColumnDefinitions>
                                 <Border Style="{StaticResource StepCircle}" Background="{DynamicResource PrimaryBrush}" VerticalAlignment="Top">
-                                    <TextBlock Text="1" Style="{StaticResource StepNumber}" Foreground="{DynamicResource CardBrush}" />
+                                    <TextBlock Text="1" Style="{StaticResource StepNumber}" Foreground="{DynamicResource OnPrimaryBrush}" />
                                 </Border>
                                 <StackPanel Grid.Column="1" Margin="12,2,0,0">
                                     <TextBlock Text="Diagnosticar" FontWeight="SemiBold" />
@@ -160,7 +160,7 @@
                                     <ColumnDefinition Width="*" />
                                 </Grid.ColumnDefinitions>
                                 <Border Style="{StaticResource StepCircle}" Background="{DynamicResource PrimaryBrush}" VerticalAlignment="Top">
-                                    <TextBlock Text="2" Style="{StaticResource StepNumber}" Foreground="{DynamicResource CardBrush}" />
+                                    <TextBlock Text="2" Style="{StaticResource StepNumber}" Foreground="{DynamicResource OnPrimaryBrush}" />
                                 </Border>
                                 <StackPanel Grid.Column="1" Margin="12,2,0,0">
                                     <TextBlock Text="Resolver" FontWeight="SemiBold" />
@@ -173,7 +173,7 @@
                                     <ColumnDefinition Width="*" />
                                 </Grid.ColumnDefinitions>
                                 <Border Style="{StaticResource StepCircle}" Background="{DynamicResource PrimaryBrush}" VerticalAlignment="Top">
-                                    <TextBlock Text="3" Style="{StaticResource StepNumber}" Foreground="{DynamicResource CardBrush}" />
+                                    <TextBlock Text="3" Style="{StaticResource StepNumber}" Foreground="{DynamicResource OnPrimaryBrush}" />
                                 </Border>
                                 <StackPanel Grid.Column="1" Margin="12,2,0,0">
                                     <TextBlock Text="Conferir" FontWeight="SemiBold" />
@@ -193,6 +193,10 @@
                                         <ColumnDefinition Width="*" />
                                         <ColumnDefinition Width="Auto" />
                                     </Grid.ColumnDefinitions>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                    </Grid.RowDefinitions>
                                     <StackPanel Grid.Column="0">
                                         <TextBlock x:Name="DbNameText" FontSize="20" FontWeight="Bold"
                                                    Foreground="{DynamicResource PrimaryDarkBrush}" TextWrapping="Wrap" />
@@ -211,8 +215,8 @@
                                         <TextBlock x:Name="RecommendedActionText" Style="{StaticResource HintText}" Margin="0,6,0,0" />
                                     </StackPanel>
 
-                                    <!-- Indicador de passos -->
-                                    <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top" Margin="20,2,0,0">
+                                    <!-- Indicador de passos (desce para baixo do nome em largura estreita: FlowGrid_SizeChanged) -->
+                                    <StackPanel x:Name="StepIndicator" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top" Margin="20,2,0,0">
                                         <Border x:Name="Step1Circle" Style="{StaticResource StepCircle}">
                                             <TextBlock x:Name="Step1Num" Text="1" Style="{StaticResource StepNumber}" />
                                         </Border>
@@ -249,7 +253,7 @@
                                         Background="{DynamicResource OkBackBrush}" BorderBrush="{DynamicResource OkForeBrush}"
                                         BorderThickness="1" CornerRadius="6" Padding="12,9">
                                     <TextBlock Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap"
-                                               Text="Banco ONLINE e aparentemente saudável. Corrupção física ou registros órfãos só aparecem numa verificação completa — use o Passo 1 para uma checagem profunda (CHECKDB + CHECKCONSTRAINTS + CHECKCATALOG)." />
+                                               Text="Banco ONLINE (no ar) — isso ainda não garante que esteja íntegro. Corrupção e registros órfãos só aparecem na verificação completa do Passo 1." />
                                 </Border>
 
                                 <!-- Banco de sistema -->
@@ -261,7 +265,7 @@
                                             <ColumnDefinition Width="*" />
                                             <ColumnDefinition Width="Auto" />
                                         </Grid.ColumnDefinitions>
-                                        <TextBlock Text="Banco de sistema: o reparo automático destrutivo não é permitido por esta ferramenta. Acione o DBA/suporte."
+                                        <TextBlock Text="Banco de sistema: esta ferramenta, no máximo, tenta religá-lo (modo seguro). Corrupção e restauração são tratadas manualmente — acione o DBA/suporte."
                                                    Foreground="{DynamicResource WarnForeBrush}" TextWrapping="Wrap" VerticalAlignment="Center" />
                                         <Button x:Name="RunbookButton" Grid.Column="1" Content="Ver procedimento manual"
                                                 Style="{StaticResource SecondaryButton}" Padding="12,6" FontSize="13" Margin="12,0,0,0"
@@ -301,7 +305,7 @@
                                             <ColumnDefinition Width="*" />
                                         </Grid.ColumnDefinitions>
                                         <Border Style="{StaticResource StepCircle}" Background="{DynamicResource PrimaryBrush}">
-                                            <TextBlock Text="1" Style="{StaticResource StepNumber}" Foreground="{DynamicResource CardBrush}" />
+                                            <TextBlock Text="1" Style="{StaticResource StepNumber}" Foreground="{DynamicResource OnPrimaryBrush}" />
                                         </Border>
                                         <StackPanel Grid.Column="1" Margin="10,0,0,0">
                                             <TextBlock Text="Diagnosticar" Style="{StaticResource SectionTitle}" />
@@ -318,7 +322,7 @@
                                         </CheckBox>
                                         <Expander Header="O que é verificado?" Margin="0,8,0,0" Foreground="{DynamicResource MutedTextBrush}" FontSize="12">
                                             <TextBlock Style="{StaticResource HintText}" Margin="18,4,0,0"
-                                                       Text="DBCC CHECKDB com DATA_PURITY (consistência física e valores inválidos), CHECKCONSTRAINTS (chaves estrangeiras/CHECK), CHECKCATALOG (metadados), páginas suspeitas, log de erros, arquivos do banco, uso do log, topologia, espaço em disco e política de backup. Se houver corrupção física, as checagens lógicas são adiadas até o reparo." />
+                                                       Text="DBCC CHECKDB com DATA_PURITY (consistência física e valores inválidos), CHECKCONSTRAINTS (chaves estrangeiras/CHECK), CHECKCATALOG (metadados), páginas suspeitas, log de erros, arquivos do banco, uso do log, topologia, espaço em disco e política de backup. Se houver corrupção física, as checagens lógicas são adiadas até o reparo. O banco não é alterado; só o histórico de páginas suspeitas do msdb é limpo quando o CHECKDB confirma que a corrupção antiga já foi resolvida." />
                                         </Expander>
                                     </StackPanel>
 
@@ -385,7 +389,7 @@
                                             <ColumnDefinition Width="*" />
                                         </Grid.ColumnDefinitions>
                                         <Border Style="{StaticResource StepCircle}" Background="{DynamicResource PrimaryBrush}">
-                                            <TextBlock Text="2" Style="{StaticResource StepNumber}" Foreground="{DynamicResource CardBrush}" />
+                                            <TextBlock Text="2" Style="{StaticResource StepNumber}" Foreground="{DynamicResource OnPrimaryBrush}" />
                                         </Border>
                                         <StackPanel Grid.Column="1" Margin="10,0,0,0">
                                             <TextBlock Text="Resolver" Style="{StaticResource SectionTitle}" />
@@ -407,15 +411,15 @@
                                             <TextBlock Text="SEM PERDA" Style="{StaticResource ChipText}" />
                                         </Border>
                                         <TextBlock Text="→" Style="{StaticResource HintText}" VerticalAlignment="Center" Margin="0,0,4,4" />
-                                        <Border Style="{StaticResource Chip}" Background="{DynamicResource WarnLineBrush}" Margin="0,0,4,4">
+                                        <Border Style="{StaticResource Chip}" Background="{DynamicResource WarnForeBrush}" Margin="0,0,4,4">
                                             <TextBlock Text="QUARENTENA" Style="{StaticResource ChipText}" />
                                         </Border>
                                         <TextBlock Text="→" Style="{StaticResource HintText}" VerticalAlignment="Center" Margin="0,0,4,4" />
-                                        <Border Style="{StaticResource Chip}" Background="{DynamicResource PrimaryBrush}" Margin="0,0,4,4">
+                                        <Border Style="{StaticResource Chip}" Background="{DynamicResource PrimaryDarkBrush}" Margin="0,0,4,4">
                                             <TextBlock Text="RESTAURA BACKUP" Style="{StaticResource ChipText}" />
                                         </Border>
                                         <TextBlock Text="→" Style="{StaticResource HintText}" VerticalAlignment="Center" Margin="0,0,4,4" />
-                                        <Border Style="{StaticResource Chip}" Background="{DynamicResource DangerBrush}" Margin="0,0,0,4">
+                                        <Border Style="{StaticResource Chip}" Background="{DynamicResource DangerDarkBrush}" Margin="0,0,0,4">
                                             <TextBlock Text="PODE PERDER DADOS" Style="{StaticResource ChipText}" />
                                         </Border>
                                     </WrapPanel>
@@ -447,7 +451,7 @@
                                                 <TextBlock Text="SEM PERDA DE DADOS" Style="{StaticResource ChipText}" />
                                             </Border>
                                             <TextBlock Text="Reconstruir índices" Style="{StaticResource OptionTitle}" Foreground="{DynamicResource OkForeBrush}" />
-                                            <TextBlock Text="A corrupção está restrita a índices não-clusterizados, que podem ser reconstruídos sem perder dados."
+                                            <TextBlock Text="A corrupção está só em índices (estruturas de busca), não nas tabelas: eles são reconstruídos a partir dos dados, sem perder nada. Quem estiver usando o banco é desconectado durante a operação."
                                                        Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" Margin="0,4,0,0" />
                                             <Button x:Name="RepairIndexesButton" Content="Reparar índices (sem perda de dados)"
                                                     Style="{StaticResource FlatButton}" MinHeight="42" Margin="0,10,0,0"
@@ -464,7 +468,7 @@
                                             </Border>
                                             <TextBlock Text="Log de transações cheio" Style="{StaticResource OptionTitle}" Foreground="{DynamicResource OkForeBrush}" />
                                             <TextBlock x:Name="LogFullText" Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" Margin="0,4,0,0"
-                                                       Text="Não é corrupção. A ferramenta identifica o que segura o log e libera espaço: backup de log, crescimento do arquivo ou um arquivo de log extra em outro disco — e religa o banco." />
+                                                       Text="Não é corrupção. A ferramenta identifica o que segura o log e libera espaço: backup de log, crescimento do arquivo ou um arquivo de log extra em outro disco — e religa o banco. Ela não desconecta ninguém: se uma transação aberta segura o log, o registro mostra qual é." />
                                             <Button x:Name="ResolveLogFullButton" Content="Resolver log cheio (sem perda de dados)"
                                                     Style="{StaticResource FlatButton}" MinHeight="42" Margin="0,10,0,0"
                                                     Click="ResolveLogFullButton_Click" />
@@ -499,7 +503,7 @@
                                                 <TextBlock Text="SEM PERDA DE DADOS" Style="{StaticResource ChipText}" />
                                             </Border>
                                             <TextBlock Text="Reparo no modo seguro" Style="{StaticResource OptionTitle}" Foreground="{DynamicResource OkForeBrush}" />
-                                            <TextBlock Text="Tenta primeiro a abordagem mais segura: religar / recuperar e, se necessário, DBCC CHECKDB com REPAIR_REBUILD. Se não for suficiente, a ferramenta avisa antes de qualquer passo com perda."
+                                            <TextBlock Text="Tenta o caminho mais seguro: religar o banco e, se preciso, o reparo do SQL Server que só reconstrói estruturas (REPAIR_REBUILD), sem apagar dados. Quem estiver usando o banco é desconectado durante o reparo. Se não bastar, nada é descartado: a ferramenta para e mostra as próximas opções, que pedem confirmação."
                                                        Foreground="{DynamicResource OkForeBrush}" TextWrapping="Wrap" Margin="0,4,0,0" />
                                             <Button x:Name="SafeRepairButton" Content="Reparar (modo seguro, sem perda de dados)"
                                                     Style="{StaticResource FlatButton}" MinHeight="42" Margin="0,10,0,0" Click="SafeRepairButton_Click" />
@@ -557,12 +561,12 @@
                                     <Border x:Name="ConstraintFixPanel" Visibility="Collapsed" Style="{StaticResource OptionCard}"
                                             Background="{DynamicResource WarnBackBrush}" BorderBrush="{DynamicResource WarnLineBrush}">
                                         <StackPanel>
-                                            <Border Style="{StaticResource Chip}" Background="{DynamicResource WarnLineBrush}">
+                                            <Border Style="{StaticResource Chip}" Background="{DynamicResource WarnForeBrush}">
                                                 <TextBlock Text="MOVE REGISTROS PARA A QUARENTENA" Style="{StaticResource ChipText}" />
                                             </Border>
                                             <TextBlock Text="Integridade lógica: registros órfãos" Style="{StaticResource OptionTitle}" Foreground="{DynamicResource WarnForeBrush}" />
                                             <TextBlock x:Name="ConstraintFixText" Margin="0,4,0,0" Foreground="{DynamicResource WarnForeBrush}" TextWrapping="Wrap"
-                                                       Text="Há linhas cuja chave estrangeira aponta para um registro inexistente (o DBCC CHECKDB não detecta isso). A correção primeiro tenta recuperar o registro-pai do backup; o que sobrar é retirado da tabela e guardado na QUARENTENA (banco RestoreDB_Quarentena), de onde pode ser devolvido depois. Há backup de segurança antes." />
+                                                       Text="Há linhas cuja chave estrangeira aponta para um registro inexistente (o DBCC CHECKDB não detecta isso). A correção primeiro tenta recuperar o registro-pai do backup; o que sobrar sai da tabela e fica guardado na QUARENTENA (banco RestoreDB_Quarentena), de onde pode ser devolvido depois. Antes, a ferramenta tenta um backup de segurança." />
                                             <TextBlock Text="BACKUP PARA RECUPERAR REGISTROS-PAI (OPCIONAL)" Style="{StaticResource FieldLabel}"
                                                        Foreground="{DynamicResource WarnForeBrush}" Margin="0,12,0,4" />
                                             <StackPanel Orientation="Horizontal">
@@ -575,9 +579,11 @@
                                                        Foreground="{DynamicResource WarnForeBrush}"
                                                        Text="Automático: usa o backup FULL mais recente do histórico. Escolha um .bak se o backup estiver em outra mídia (o SQL Server precisa conseguir lê-lo)." />
                                             <CheckBox x:Name="ConstraintFixConfirmCheck" Margin="0,12,0,0" Foreground="{DynamicResource WarnForeBrush}"
-                                                      Content="Entendo e autorizo a remoção dos registros órfãos."
-                                                      Checked="ConstraintFixConfirmCheck_Changed" Unchecked="ConstraintFixConfirmCheck_Changed" />
-                                            <Button x:Name="ConstraintFixButton" Content="Corrigir integridade (remover registros órfãos)"
+                                                      Checked="ConstraintFixConfirmCheck_Changed" Unchecked="ConstraintFixConfirmCheck_Changed">
+                                                <TextBlock TextWrapping="Wrap" Foreground="{DynamicResource WarnForeBrush}"
+                                                           Text="Entendo e autorizo retirar os registros órfãos das tabelas (ficam guardados na quarentena)." />
+                                            </CheckBox>
+                                            <Button x:Name="ConstraintFixButton" Content="Corrigir integridade (órfãos para a quarentena)"
                                                     Style="{StaticResource DangerButton}" MinHeight="40" Margin="0,10,0,0"
                                                     IsEnabled="False" Click="ConstraintFixButton_Click" />
                                         </StackPanel>
@@ -587,7 +593,7 @@
                                     <Border x:Name="RestorePanel" Visibility="Collapsed" Style="{StaticResource OptionCard}"
                                             Background="{DynamicResource CardBrush}" BorderBrush="{DynamicResource PrimaryBrush}">
                                         <StackPanel>
-                                            <Border Style="{StaticResource Chip}" Background="{DynamicResource PrimaryBrush}">
+                                            <Border Style="{StaticResource Chip}" Background="{DynamicResource PrimaryDarkBrush}">
                                                 <TextBlock Text="RESTAURA DO BACKUP — SUBSTITUI O BANCO" Style="{StaticResource ChipText}" />
                                             </Border>
                                             <TextBlock Text="Restaurar de backup" Style="{StaticResource OptionTitle}" Foreground="{DynamicResource PrimaryDarkBrush}" />
@@ -598,7 +604,7 @@
                                             <Button x:Name="RestoreChainButton" Content="Restaurar cadeia completa (mais recente)"
                                                     Style="{StaticResource FlatButton}" MinHeight="44" Margin="0,12,0,0"
                                                     Click="RestoreChainButton_Click" />
-                                            <TextBlock Text="Recomendado: monta FULL → diferencial → logs (com tail-log) e valida a continuidade antes de executar."
+                                            <TextBlock Text="Recomendado: junta automaticamente o backup completo, o diferencial e os backups de log, confere que a sequência não tem buracos e só então substitui o banco — antes, tenta salvar as transações mais recentes (tail-log) para não perdê-las."
                                                        Style="{StaticResource HintText}" Margin="0,6,0,0" />
 
                                             <!-- Alternativa: escolher um backup específico -->
@@ -614,9 +620,11 @@
                                             <Button x:Name="RestoreButton" Content="Restaurar o backup selecionado"
                                                     Style="{StaticResource SecondaryButton}" MinHeight="40" Margin="0,8,0,0"
                                                     Click="RestoreButton_Click" />
+                                            <TextBlock Text="Volta o banco exatamente ao momento desse backup: o que foi gravado depois dele se perde."
+                                                       Style="{StaticResource HintText}" Margin="0,6,0,0" />
 
                                             <!-- Opções avançadas de restauração -->
-                                            <Expander Header="Mais opções de restauração (avançado)" Margin="0,14,0,0"
+                                            <Expander x:Name="RestoreMoreExpander" Header="Mais opções de restauração (avançado)" Margin="0,14,0,0"
                                                       Foreground="{DynamicResource PrimaryDarkBrush}" FontWeight="SemiBold">
                                                 <StackPanel Margin="0,8,0,0" TextElement.FontWeight="Normal">
                                                     <TextBlock Text="SEM ALTERAR O BANCO" Style="{StaticResource FieldLabel}" Margin="0,0,0,4" />
@@ -639,8 +647,9 @@
                                                         <TextBox x:Name="StopAtTime" Width="96" Margin="6,0,0,0" Height="28" Padding="6,2" FontSize="13"
                                                                  VerticalContentAlignment="Center" Text="23:59:59" ToolTip="Hora no formato HH:mm:ss" />
                                                     </StackPanel>
-                                                    <TextBlock Text="Vale para a cadeia completa e para o STANDBY." Style="{StaticResource HintText}" Margin="0,4,0,0" />
-                                                    <Button x:Name="RestoreStandbyButton" Content="Restaurar em STANDBY (somente leitura, para inspecionar)"
+                                                    <TextBlock Text="Vale para a cadeia completa e para o STANDBY. O STANDBY substitui o banco e não salva as transações recentes; para só olhar os dados, prefira 'Recuperar para cópia'."
+                                                               Style="{StaticResource HintText}" Margin="0,4,0,0" />
+                                                    <Button x:Name="RestoreStandbyButton" Content="Restaurar em STANDBY (substitui o banco; fica só leitura para inspecionar)"
                                                             Style="{StaticResource SecondaryButton}" MinHeight="38" Margin="0,8,0,0"
                                                             Click="RestoreStandbyButton_Click" />
                                                     <Button x:Name="FinalizeRecoveryButton" Content="Finalizar recuperação (sair do STANDBY)"
@@ -681,12 +690,12 @@
                                     <Border x:Name="DataLossPanel" Visibility="Collapsed" Style="{StaticResource OptionCard}"
                                             Background="{DynamicResource ProblemBackBrush}" BorderBrush="{DynamicResource DangerBrush}">
                                         <StackPanel>
-                                            <Border Style="{StaticResource Chip}" Background="{DynamicResource DangerBrush}">
+                                            <Border Style="{StaticResource Chip}" Background="{DynamicResource DangerDarkBrush}">
                                                 <TextBlock Text="PODE PERDER DADOS" Style="{StaticResource ChipText}" />
                                             </Border>
                                             <TextBlock Text="Reparo com possível perda de dados" Style="{StaticResource OptionTitle}" Foreground="{DynamicResource DangerDarkBrush}" />
                                             <TextBlock Margin="0,4,0,0" Foreground="{DynamicResource DangerDarkBrush}" TextWrapping="Wrap"
-                                                       Text="O reparo seguro não foi suficiente. A próxima etapa usa DBCC CHECKDB com REPAIR_ALLOW_DATA_LOSS, que pode DESCARTAR dados corrompidos para tornar o banco consistente. Antes, a ferramenta preserva automaticamente o que for possível (tail-log + backup de segurança); ao final, cria um backup FULL novo. Se existir backup íntegro, RESTAURAR (acima) preserva 100% dos dados." />
+                                                       Text="O reparo seguro não foi suficiente. A próxima etapa usa DBCC CHECKDB com REPAIR_ALLOW_DATA_LOSS, que pode DESCARTAR dados corrompidos para tornar o banco consistente. Antes, a ferramenta tenta preservar o que puder (transações recentes do log + backup de segurança); se o reparo terminar bem, cria um backup FULL novo. Se existir backup íntegro, RESTAURAR (acima) costuma ser melhor: traz os dados sem corrupção, em vez de descartá-los." />
                                             <Button x:Name="SimulateRepairButton" Content="🔬  Simular antes (pré-visualizar a perda, sem tocar no banco)"
                                                     Style="{StaticResource SecondaryButton}" MinHeight="40" Margin="0,12,0,0"
                                                     Click="SimulateRepairButton_Click" />
@@ -708,8 +717,10 @@
                                                            Text="Salvar e devolver automaticamente as linhas que o reparo descartar (recomendado): antes do reparo, as linhas ainda legíveis das tabelas danificadas são copiadas para um banco de salvamento — funciona mesmo SEM backup; quando a cadeia de backups chega até o instante do reparo, ela também é usada." />
                                             </CheckBox>
                                             <CheckBox x:Name="DataLossConfirmCheck" Margin="0,10,0,0" Foreground="{DynamicResource DangerDarkBrush}"
-                                                      Content="Estou ciente e autorizo o reparo com possível perda de dados."
-                                                      Checked="DataLossConfirmCheck_Changed" Unchecked="DataLossConfirmCheck_Changed" />
+                                                      Checked="DataLossConfirmCheck_Changed" Unchecked="DataLossConfirmCheck_Changed">
+                                                <TextBlock TextWrapping="Wrap" Foreground="{DynamicResource DangerDarkBrush}"
+                                                           Text="Estou ciente e autorizo o reparo com possível perda de dados." />
+                                            </CheckBox>
                                             <Button x:Name="DataLossRepairButton" Content="Executar reparo COM perda de dados"
                                                     Style="{StaticResource DangerButton}" MinHeight="42" Margin="0,10,0,0"
                                                     IsEnabled="False" Click="DataLossRepairButton_Click" />
@@ -721,17 +732,19 @@
                                             Background="{DynamicResource DangerPanelBackBrush}" BorderBrush="{DynamicResource DangerBrush}"
                                             BorderThickness="2">
                                         <StackPanel>
-                                            <Border Style="{StaticResource Chip}" Background="{DynamicResource DangerBrush}">
+                                            <Border Style="{StaticResource Chip}" Background="{DynamicResource DangerDarkBrush}">
                                                 <TextBlock Text="⛔ ÚLTIMO RECURSO" Style="{StaticResource ChipText}" />
                                             </Border>
                                             <TextBlock Text="Reconstruir o log de transações" Style="{StaticResource OptionTitle}" Foreground="{DynamicResource DangerDarkBrush}" />
                                             <TextBlock Margin="0,4,0,0" Foreground="{DynamicResource DangerDarkBrush}" TextWrapping="Wrap"
                                                        Text="Indicado quando o problema está no LOG de transações (ex.: RECOVERY_PENDING ou SUSPECT por log corrompido/ausente) e o reparo não resolveu. Desanexa o banco, REMOVE o arquivo de log (.ldf) e o recria (FOR ATTACH_REBUILD_LOG) para forçar o retorno a ONLINE. Pode haver PERDA DE DADOS e inconsistências lógicas." />
                                             <TextBlock Margin="0,6,0,0" Foreground="{DynamicResource DangerDarkBrush}" TextWrapping="Wrap" FontSize="11"
-                                                       Text="Requer que os arquivos do banco estejam acessíveis nesta máquina (servidor local) e permissão na pasta de dados. O log antigo é preservado com a extensão .corrupt_AAAAMMDDHHMMSS." />
+                                                       Text="Requer executar a ferramenta como Administrador no próprio servidor (arquivos do banco acessíveis nesta máquina e permissão na pasta de dados) — sem isso, nada é alterado. Antes, a ferramenta tenta copiar os arquivos para o lado; o log antigo fica guardado com a extensão .corrupt_AAAAMMDDHHMMSS." />
                                             <CheckBox x:Name="LogRebuildConfirmCheck" Margin="0,12,0,0" Foreground="{DynamicResource DangerDarkBrush}"
-                                                      Content="Entendo os riscos e autorizo reconstruir o log."
-                                                      Checked="LogRebuildConfirmCheck_Changed" Unchecked="LogRebuildConfirmCheck_Changed" />
+                                                      Checked="LogRebuildConfirmCheck_Changed" Unchecked="LogRebuildConfirmCheck_Changed">
+                                                <TextBlock TextWrapping="Wrap" Foreground="{DynamicResource DangerDarkBrush}"
+                                                           Text="Entendo os riscos e autorizo reconstruir o log." />
+                                            </CheckBox>
                                             <Button x:Name="LogRebuildButton" Content="Reconstruir log (recriar .ldf)"
                                                     Style="{StaticResource DangerButton}" MinHeight="42" Margin="0,10,0,0"
                                                     IsEnabled="False" Click="LogRebuildButton_Click" />
@@ -750,7 +763,7 @@
                                 <TextBlock Text="Opcionais e independentes do fluxo acima. Escolha uma ferramenta à esquerda."
                                            Style="{StaticResource HintText}" Margin="0,2,0,0" />
 
-                                <Grid x:Name="ToolsGrid" Margin="0,12,0,0" SizeChanged="ToolsGrid_SizeChanged">
+                                <Grid Margin="0,12,0,0" SizeChanged="ToolsGrid_SizeChanged">
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="260" />
                                         <ColumnDefinition Width="Auto" />

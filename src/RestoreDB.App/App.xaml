@@ -256,6 +256,34 @@
                 <Setter Property="BorderBrush" Value="{DynamicResource LineBrush}" />
                 <Setter Property="BorderThickness" Value="1" />
             </Style>
+            <!-- Seletor de data (restauração até um momento): o modelo padrão fica branco com texto preto no tema escuro. -->
+            <Style TargetType="DatePicker">
+                <Setter Property="Background" Value="{DynamicResource CardBrush}" />
+                <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
+                <Setter Property="BorderBrush" Value="{DynamicResource LineBrush}" />
+                <Setter Property="FontSize" Value="13" />
+                <Setter Property="VerticalContentAlignment" Value="Center" />
+            </Style>
+            <Style TargetType="DatePickerTextBox">
+                <Setter Property="Background" Value="{DynamicResource CardBrush}" />
+                <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
+                <Setter Property="CaretBrush" Value="{DynamicResource TextBrush}" />
+                <Setter Property="VerticalContentAlignment" Value="Center" />
+                <!-- O modelo padrão desenha bordas brancas fixas por dentro do campo (visíveis no tema escuro).
+                     A marca d'água ("Selecionar data") fica oculta: o campo é validado ao restaurar. -->
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="DatePickerTextBox">
+                            <Border Background="{TemplateBinding Background}" Padding="4,0">
+                                <Grid>
+                                    <ContentControl x:Name="PART_Watermark" Opacity="0" IsHitTestVisible="False" Focusable="False" />
+                                    <ScrollViewer x:Name="PART_ContentHost" VerticalAlignment="Center" />
+                                </Grid>
+                            </Border>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
             <Style TargetType="PasswordBox">
                 <Setter Property="Padding" Value="8,6" />
                 <Setter Property="FontSize" Value="14" />

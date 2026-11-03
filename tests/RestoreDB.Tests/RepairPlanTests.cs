@@ -46,6 +46,38 @@ public class RepairPlanTests
     }
 
     [Fact]
+    public void Online_Safe_PlansCheckAndRebuild_NotNoAction()
+    {
+        // "Ver script planejado" aparece para bancos ONLINE corrompidos: não pode dizer "nenhuma ação planejada".
+        var script = RepairService.BuildPlannedScript(Db("Faturamento", "ONLINE"), allowDataLoss: false);
+        Assert.Contains("DBCC CHECKDB", script);
+        Assert.Contains("REPAIR_REBUILD", script);
+        Assert.Contains("SET MULTI_USER", script);
+        Assert.DoesNotContain("REPAIR_ALLOW_DATA_LOSS", script);
+        Assert.DoesNotContain("nenhuma ação planejada", script);
+    }
+
+    [Fact]
+    public void Online_WithDataLoss_IncludesSafetyNetBeforeRepair_AndNoEmergency()
+    {
+        var script = RepairService.BuildPlannedScript(Db("Faturamento", "ONLINE"), allowDataLoss: true);
+        var repair = script.IndexOf("REPAIR_ALLOW_DATA_LOSS", StringComparison.Ordinal);
+        Assert.True(repair > 0);
+        Assert.InRange(script.IndexOf("COPY_ONLY", StringComparison.Ordinal), 0, repair);
+        Assert.DoesNotContain("SET EMERGENCY", script); // ONLINE repara sem EMERGENCY (OnlineRepairFlowAsync)
+    }
+
+    [Fact]
+    public void Suspect_WithDataLoss_SafetyNetRunsAfterExclusiveAccess()
+    {
+        var script = RepairService.BuildPlannedScript(Db("Faturamento", "SUSPECT"), allowDataLoss: true);
+        var destructive = script.IndexOf("DESTRUTIVO", StringComparison.Ordinal);
+        var emergency = script.IndexOf("SET EMERGENCY", destructive, StringComparison.Ordinal);
+        var tail = script.IndexOf("NO_TRUNCATE", StringComparison.Ordinal);
+        Assert.True(destructive > 0 && emergency > destructive && tail > emergency);
+    }
+
+    [Fact]
     public void DatabaseNameWithBracket_IsEscaped()
     {
         var script = RepairService.BuildPlannedScript(Db("a]b", "OFFLINE"), allowDataLoss: false);

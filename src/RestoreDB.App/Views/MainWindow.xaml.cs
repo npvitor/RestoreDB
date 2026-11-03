@@ -50,6 +50,12 @@ public partial class MainWindow : Window
     /// <summary>A última operação de correção terminou com sucesso — o fluxo pede o Passo 3 (re-diagnosticar).</summary>
     private bool _repairSucceeded;
 
+    /// <summary>O reparo sem perda não bastou: o usuário escolhe entre restaurar de backup e o reparo com perda.</summary>
+    private bool _needsDataLossDecision;
+
+    /// <summary>O último diagnóstico não terminou (erro ou cancelamento): não há conclusão em que basear as opções.</summary>
+    private bool _diagnosisFailed;
+
     /// <summary>Novos caminhos escolhidos pelo usuário para arquivos ausentes (nome lógico → caminho).</summary>
     private readonly Dictionary<string, string> _fileRelocations = new(StringComparer.OrdinalIgnoreCase);
 
@@ -144,10 +150,11 @@ public partial class MainWindow : Window
                 _databases.Add(db);
 
             var problemCount = list.Count(d => d.IsProblematic);
+            // "Saudável" exige diagnóstico: um banco ONLINE pode ter corrupção que o estado não mostra.
             StatusText.Text = $"{list.Count} banco(s) encontrado(s)" +
                               (problemCount > 0
                                   ? $" — {problemCount} em estado problemático."
-                                  : " — todos saudáveis.");
+                                  : " — nenhum em estado problemático.");
             UpdateDbCountText(list);
 
             if (previousSelection is not null)
@@ -257,6 +264,10 @@ public partial class MainWindow : Window
             ConstraintFixPanel.Visibility = Visibility.Collapsed;
             ConstraintFixConfirmCheck.IsChecked = false;
             ConstraintFixButton.IsEnabled = false;
+            // Textos preenchidos pelo diagnóstico do banco ANTERIOR (contagem de órfãos, uso do log).
+            ConstraintFixText.Text = DefaultConstraintFixText;
+            LogFullText.Text = DefaultLogFullText;
+            RestoreMoreExpander.IsExpanded = false;
             _recoveryBackupPath = null; // a escolha de backup não vaza entre bancos
             UpdateRecoveryBackupLabels();
             RestorePanel.Visibility = Visibility.Collapsed;
@@ -289,18 +300,29 @@ public partial class MainWindow : Window
             // integridade (FK órfã) nem sempre se reflete no estado do banco.
             DiagnosePanel.Visibility = Visibility.Visible;
             DiagnoseButton.IsEnabled = !_busy;
-            HealthyPanel.Visibility = db.IsHealthy && !db.HasAccessRestriction ? Visibility.Visible : Visibility.Collapsed;
             SystemDbPanel.Visibility = db is { IsProblematic: true, IsSystemDatabase: true }
                 ? Visibility.Visible : Visibility.Collapsed;
             // As opções de reparo só são liberadas DEPOIS do diagnóstico.
             RepairOptionsTitle.Visibility = Visibility.Collapsed;
             SafeRepairPanel.Visibility = Visibility.Collapsed;
-            SafeRepairButton.IsEnabled = false;
+            SafeRepairButton.IsEnabled = !_busy;
             _repairSucceeded = false;
+            _needsDataLossDecision = false;
+            _diagnosisFailed = false;
+            RefreshStateLabels(db); // agora sem o diagnóstico do banco anterior
         }
 
         UpdateFlowState();
     }
+
+    private const string DefaultConstraintFixText =
+        "Há linhas cuja chave estrangeira aponta para um registro inexistente (o DBCC CHECKDB não detecta isso). A correção primeiro tenta " +
+        "recuperar o registro-pai do backup; o que sobrar sai da tabela e fica guardado na QUARENTENA (banco RestoreDB_Quarentena), de onde " +
+        "pode ser devolvido depois. Antes, a ferramenta tenta um backup de segurança.";
+
+    private const string DefaultLogFullText =
+        "Não é corrupção. A ferramenta identifica o que segura o log e libera espaço: backup de log, crescimento do arquivo ou um arquivo " +
+        "de log extra em outro disco — e religa o banco. Ela não desconecta ninguém: se uma transação aberta segura o log, o registro mostra qual é.";
 
     private void RefreshStateLabels(DatabaseInfo db)
     {
@@ -308,14 +330,42 @@ public partial class MainWindow : Window
         StateText.Text = db.StateDisplay;
         // ONLINE, mas travado (acesso restrito / somente leitura): não é "saudável" para quem usa o sistema.
         var stuck = db.IsHealthy && db.HasAccessRestriction;
-        StateFriendlyText.Text = stuck
-            ? (db.IsReadOnly && !db.UserAccess.Equals("SINGLE_USER", StringComparison.OrdinalIgnoreCase) && !db.UserAccess.Equals("RESTRICTED_USER", StringComparison.OrdinalIgnoreCase)
-                ? "Disponível, mas SOMENTE LEITURA: o sistema não consegue gravar."
-                : $"Disponível, mas TRAVADO ({db.UserAccess}): o sistema não consegue usar o banco normalmente.")
-            : db.StateFriendly;
-        RecommendedActionText.Text = stuck ? "Diagnostique: a ferramenta mostra quem está segurando o acesso e libera sem perda de dados." : db.RecommendedAction;
+        var readOnlyOnly = db.IsReadOnly && !db.UserAccess.Equals("SINGLE_USER", StringComparison.OrdinalIgnoreCase)
+                                         && !db.UserAccess.Equals("RESTRICTED_USER", StringComparison.OrdinalIgnoreCase);
+        // ONLINE com problema encontrado pelo diagnóstico (corrupção, órfãos, log cheio): o estado sozinho
+        // diria "disponível" — o rótulo precisa refletir a conclusão. Depois de uma correção, o diagnóstico
+        // anterior não vale mais (Passo 3).
+        var diag = _repairSucceeded ? null : _lastDiagnosis;
+        var problemFound = db.IsHealthy && !stuck && diag is not null
+                           && diag.RecommendedAction is not (RecommendedActionKind.NoAction or RecommendedActionKind.Unknown);
 
-        var (back, fore) = stuck ? ("WarnBackBrush", "WarnForeBrush") : db.IsHealthy ? ("OkBackBrush", "OkForeBrush") : ("ProblemBackBrush", "ProblemForeBrush");
+        if (stuck)
+        {
+            StateFriendlyText.Text = readOnlyOnly
+                ? "Disponível, mas SOMENTE LEITURA: o sistema não consegue gravar."
+                : $"Disponível, mas TRAVADO ({db.UserAccess}): o sistema não consegue usar o banco normalmente.";
+            RecommendedActionText.Text = readOnlyOnly
+                ? "Diagnostique: se o modo somente leitura não for proposital, os 'Ajustes recomendados' liberam a gravação, sem perda de dados."
+                : "Diagnostique: a ferramenta mostra quem está segurando o acesso e libera sem perda de dados.";
+        }
+        else if (problemFound)
+        {
+            StateFriendlyText.Text = "Disponível (no ar), mas o diagnóstico encontrou um problema.";
+            RecommendedActionText.Text = RecommendedActionLabel(diag!, db);
+        }
+        else if (diag is { RecommendedAction: RecommendedActionKind.NoAction } && db.IsHealthy)
+        {
+            StateFriendlyText.Text = "Disponível e íntegro na última verificação.";
+            RecommendedActionText.Text = "Nenhuma correção necessária.";
+        }
+        else
+        {
+            StateFriendlyText.Text = db.StateFriendly;
+            RecommendedActionText.Text = db.RecommendedAction;
+        }
+
+        var (back, fore) = stuck || problemFound ? ("WarnBackBrush", "WarnForeBrush")
+            : db.IsHealthy ? ("OkBackBrush", "OkForeBrush") : ("ProblemBackBrush", "ProblemForeBrush");
         StateBadge.SetResourceReference(Border.BackgroundProperty, back);
         StateText.SetResourceReference(TextBlock.ForegroundProperty, fore);
     }
@@ -338,25 +388,41 @@ public partial class MainWindow : Window
         {
             var physicalOnly = PhysicalOnlyCheck.IsChecked == true;
             var diag = await _repairService.DiagnoseAsync(db, _connectionString, _progress, _cts!.Token, physicalOnly);
-            _lastDiagnosis = diag;
 
-            DiagnosisSummaryText.Text = diag.Summary;
-            RecoActionNameText.Text = RecommendedActionLabel(diag.RecommendedAction);
-            DiagnosisRecoText.Text = diag.Recommendation;
-            DiagnosisRecoText.Visibility = string.IsNullOrEmpty(diag.Recommendation)
-                ? Visibility.Collapsed : Visibility.Visible;
+            // O serviço não lança: erro (ou cancelamento) volta como diagnóstico SEM conclusão (Unknown). Sem
+            // conclusão não há "ação recomendada" — mostrar opções aqui seria chutar (antes virava "reparo seguro").
+            if (diag.RecommendedAction == RecommendedActionKind.Unknown)
+            {
+                var cancelled = _cts.IsCancellationRequested;
+                _lastDiagnosis = null;
+                _diagnosisFailed = true;
+                HideOptionPanels();
+                ShowDiagnosisPanel(
+                    cancelled ? "Diagnóstico cancelado — nada foi alterado no banco." : diag.Summary,
+                    cancelled ? "Rode o diagnóstico de novo quando puder." : "Sem um diagnóstico completo, a ferramenta não indica correções. Veja o motivo no registro abaixo e tente de novo.",
+                    string.Empty, "WarnBackBrush", "WarnForeBrush");
+                NoveltyPanel.Visibility = Visibility.Collapsed;
+                PolicyHeader.Visibility = Visibility.Collapsed;
+                FindingsList.ItemsSource = null;
+                StatusText.Text = cancelled ? "Diagnóstico cancelado." : "Falha no diagnóstico.";
+                return;
+            }
+
+            _lastDiagnosis = diag;
+            _diagnosisFailed = false;
+            _needsDataLossDecision = false;
+            db.StateDesc = diag.StateDesc; // o estado lido agora (a lista pode estar desatualizada)
 
             // Novidades, causa-raiz e política de backup no painel (os ajustes ficam no passo 2).
             PopulateDiagnosisFindings(diag);
 
             // Cor conforme a severidade da conclusão.
             var (backKey, foreKey) = SeverityKeys(diag.RecommendedAction);
-            DiagnosisResultPanel.SetResourceReference(Border.BackgroundProperty, backKey);
-            DiagnosisResultPanel.SetResourceReference(Border.BorderBrushProperty, foreKey);
-            DiagnosisSummaryText.SetResourceReference(TextBlock.ForegroundProperty, foreKey);
-            RecoActionNameText.SetResourceReference(TextBlock.ForegroundProperty, foreKey);
-            DiagnosisRecoText.SetResourceReference(TextBlock.ForegroundProperty, foreKey);
-            DiagnosisResultPanel.Visibility = Visibility.Visible;
+            // Banco de sistema: a recomendação genérica ("restaure / reparo com perda") não vale — a ferramenta não faz isso nele.
+            var recommendation = db.IsSystemDatabase && diag.RecommendedAction != RecommendedActionKind.NoAction
+                ? "Bancos de sistema não são restaurados nem reparados com perda por esta ferramenta. Clique em 'Ver procedimento manual' e acione o DBA/suporte."
+                : diag.Recommendation;
+            ShowDiagnosisPanel(diag.Summary, RecommendedActionLabel(diag, db), recommendation, backKey, foreKey);
 
             // Limita as opções exibidas ÀS aplicáveis para a situação diagnosticada.
             await ApplyDiagnosisGatingAsync(db, diag);
@@ -375,7 +441,22 @@ public partial class MainWindow : Window
         finally
         {
             SetBusy(false);
+            RefreshStateLabels(db);
         }
+    }
+
+    private void ShowDiagnosisPanel(string summary, string actionLabel, string recommendation, string backKey, string foreKey)
+    {
+        DiagnosisSummaryText.Text = summary;
+        RecoActionNameText.Text = actionLabel;
+        DiagnosisRecoText.Text = recommendation;
+        DiagnosisRecoText.Visibility = string.IsNullOrEmpty(recommendation) ? Visibility.Collapsed : Visibility.Visible;
+        DiagnosisResultPanel.SetResourceReference(Border.BackgroundProperty, backKey);
+        DiagnosisResultPanel.SetResourceReference(Border.BorderBrushProperty, foreKey);
+        DiagnosisSummaryText.SetResourceReference(TextBlock.ForegroundProperty, foreKey);
+        RecoActionNameText.SetResourceReference(TextBlock.ForegroundProperty, foreKey);
+        DiagnosisRecoText.SetResourceReference(TextBlock.ForegroundProperty, foreKey);
+        DiagnosisResultPanel.Visibility = Visibility.Visible;
     }
 
     /// <summary>
@@ -385,18 +466,9 @@ public partial class MainWindow : Window
     private async Task ApplyDiagnosisGatingAsync(DatabaseInfo db, DiagnosisResult diag)
     {
         // Estado inicial: tudo oculto; cada caso revela o que faz sentido.
-        AccessPanel.Visibility = Visibility.Collapsed;
-        AdjustmentsPanel.Visibility = Visibility.Collapsed;
-        LogFullPanel.Visibility = Visibility.Collapsed;
-        FileAccessPanel.Visibility = Visibility.Collapsed;
-        IndexRepairPanel.Visibility = Visibility.Collapsed;
-        ConstraintFixPanel.Visibility = Visibility.Collapsed;
-        SafeRepairPanel.Visibility = Visibility.Collapsed;
-        ViewScriptButton.Visibility = Visibility.Collapsed;
-        RestorePanel.Visibility = Visibility.Collapsed;
-        DataLossPanel.Visibility = Visibility.Collapsed;
-        LogRebuildPanel.Visibility = Visibility.Collapsed;
-        RepairOptionsTitle.Visibility = Visibility.Collapsed;
+        HideOptionPanels();
+        RestoreMoreExpander.IsExpanded = false;
+        TopologyWarnPanel.Visibility = Visibility.Collapsed;
 
         // Aviso de topologia: independente da ação, alerta quando há alta disponibilidade/replicação.
         if (diag.Topology is { IsRisky: true })
@@ -409,19 +481,21 @@ public partial class MainWindow : Window
         // num banco íntegro — como opção à parte da correção principal.
         ShowAdjustments(diag);
 
-        // Banco de sistema: somente o reparo NÃO destrutivo (modo seguro) é permitido.
+        // Banco de sistema: somente o reparo NÃO destrutivo (modo seguro) é permitido; o resto é manual
+        // (procedimento no SystemDbPanel) — inclusive corrupção num banco de sistema ONLINE.
         if (db.IsSystemDatabase)
         {
+            SystemDbPanel.Visibility = db.IsProblematic || diag.RecommendedAction != RecommendedActionKind.NoAction
+                ? Visibility.Visible : Visibility.Collapsed;
             if (db.IsProblematic)
             {
-                RepairOptionsTitle.Visibility = Visibility.Visible;
                 SafeRepairPanel.Visibility = Visibility.Visible;
                 ViewScriptButton.Visibility = Visibility.Visible;
             }
+            UpdateFlowState();
             return;
         }
 
-        var showOptions = true;
         switch (diag.RecommendedAction)
         {
             // Corrupção restrita a índices não-clusterizados → reconstrução SEM perda.
@@ -429,16 +503,20 @@ public partial class MainWindow : Window
                 IndexRepairPanel.Visibility = Visibility.Visible;
                 break;
 
-            // Corrupção LÓGICA (FK órfã) com físico íntegro → remover registros órfãos.
+            // Corrupção LÓGICA (FK órfã) com físico íntegro → mover os órfãos para a quarentena. Só violação de
+            // CHECK/catálogo não tem correção automática (FixConstraintViolationsAsync só trata FK): sem o painel.
             case RecommendedActionKind.FixConstraints:
-                ConstraintFixPanel.Visibility = Visibility.Visible;
                 ConstraintFixConfirmCheck.IsChecked = false;
                 ConstraintFixButton.IsEnabled = false;
                 if (diag.ForeignKeyViolations.Count > 0)
+                {
+                    ConstraintFixPanel.Visibility = Visibility.Visible;
                     ConstraintFixText.Text =
                         $"Foram encontrados {diag.ForeignKeyViolations.Count} registro(s) órfão(s) (chave estrangeira apontando para um registro inexistente) — o DBCC CHECKDB não detecta isso. " +
-                        "A correção REMOVE essas linhas para restaurar a integridade (operação destrutiva, com backup de segurança antes). Para preservar 100% dos registros, prefira restaurar de backup.";
-                // Restaurar de backup também é uma alternativa que preserva os dados.
+                        "A correção primeiro tenta recuperar o registro-pai do backup; o que sobrar sai da tabela e fica guardado na QUARENTENA " +
+                        "(banco RestoreDB_Quarentena), de onde pode ser devolvido. Antes, a ferramenta tenta um backup de segurança.";
+                }
+                // Restaurar de backup também é uma alternativa (desfaz o que veio depois do backup).
                 await ShowRestoreOptionAsync(db);
                 break;
 
@@ -449,17 +527,21 @@ public partial class MainWindow : Window
                 await ShowRestoreOptionAsync(db);
                 SafeRepairPanel.Visibility = Visibility.Visible;
                 ViewScriptButton.Visibility = Visibility.Visible;
-                // O suporte não tem como descobrir fileId:pageId sozinho — o diagnóstico já sabe.
+                // O suporte não tem como descobrir fileId:pageId sozinho — o diagnóstico já sabe. A opção
+                // recomendada fica em "Mais opções": abre o grupo para ela não ficar escondida.
                 if (diag.RecommendedAction == RecommendedActionKind.PageRestore)
+                {
                     PagesBox.Text = string.Join(",", diag.SuspectPages
                         .Where(p => p.IsActiveCorruption)
                         .Select(p => $"{p.FileId}:{p.PageId}")
                         .Distinct()
                         .Take(100));
+                    RestoreMoreExpander.IsExpanded = true;
+                }
                 break;
 
-            // Problema de LOG → reparo seguro (reconstrói o log sem Administrador) e, como
-            // alternativa explícita, a reconstrução do log (último recurso).
+            // Problema de LOG → reparo seguro primeiro (se não bastar, ele oferece o reparo com perda, que
+            // reconstrói o log no servidor) e, como alternativa explícita, a reconstrução do log (último recurso).
             case RecommendedActionKind.RebuildLog:
                 SafeRepairPanel.Visibility = Visibility.Visible;
                 ViewScriptButton.Visibility = Visibility.Visible;
@@ -469,9 +551,11 @@ public partial class MainWindow : Window
             // Log de transações cheio (9002): resolução dedicada, sem perda de dados.
             case RecommendedActionKind.ResolveLogFull:
                 LogFullPanel.Visibility = Visibility.Visible;
-                if (diag.LogSpace is { } ls)
-                    LogFullText.Text = "Não é corrupção. " + ls.Summary + " A ferramenta libera o espaço (backup de log, crescimento do " +
-                                       "arquivo ou um arquivo de log extra em outro disco) e religa o banco.";
+                LogFullText.Text = diag.LogSpace is { } ls
+                    ? "Não é corrupção. " + ls.Summary + " A ferramenta libera o espaço (backup de log, crescimento do " +
+                      "arquivo ou um arquivo de log extra em outro disco) e religa o banco. Ela não desconecta ninguém: " +
+                      "se uma transação aberta segura o log, o registro mostra qual é."
+                    : DefaultLogFullText;
                 break;
 
             // Arquivo ausente / sem permissão / preso por outro processo: apontar, conceder acesso, religar.
@@ -508,10 +592,6 @@ public partial class MainWindow : Window
                     SafeRepairPanel.Visibility = Visibility.Visible;
                     ViewScriptButton.Visibility = Visibility.Visible;
                 }
-                else
-                {
-                    showOptions = false;
-                }
                 break;
 
             // Reparo seguro (OFFLINE/RESTORING/RECOVERY genéricos) e fallback.
@@ -522,24 +602,38 @@ public partial class MainWindow : Window
                 break;
         }
 
-        RepairOptionsTitle.Visibility = showOptions ? Visibility.Visible : Visibility.Collapsed;
+        // A legenda de risco e o aviso do Passo 2 acompanham os painéis visíveis.
+        UpdateFlowState();
     }
 
-    private static string RecommendedActionLabel(RecommendedActionKind action) => action switch
+    private static string RecommendedActionLabel(DiagnosisResult diag, DatabaseInfo db)
     {
-        RecommendedActionKind.NoAction => "✔ Nenhuma ação necessária — banco íntegro.",
-        RecommendedActionKind.RebuildIndexesOnly => "→ Ação recomendada: reparar índices (sem perda de dados).",
-        RecommendedActionKind.SafeRepair => "→ Ação recomendada: reparo no modo seguro (sem perda de dados).",
-        RecommendedActionKind.RestoreFromBackup => "→ Ação recomendada: restaurar de backup.",
-        RecommendedActionKind.PageRestore => "→ Ação recomendada: restaurar as páginas afetadas (ou de backup).",
-        RecommendedActionKind.RebuildLog => "→ Ação recomendada: reconstruir o log de transações.",
-        RecommendedActionKind.FixConstraints => "→ Ação recomendada: corrigir integridade lógica (remover registros órfãos).",
-        RecommendedActionKind.FreeDiskSpace => "→ Ação recomendada: liberar espaço em disco e religar o banco.",
-        RecommendedActionKind.ResolveLogFull => "→ Ação recomendada: resolver o log de transações cheio (sem perda de dados).",
-        RecommendedActionKind.FixFileAccess => "→ Ação recomendada: corrigir o acesso aos arquivos do banco e religar (sem perda de dados).",
-        RecommendedActionKind.FixAccess => "→ Ação recomendada: liberar o acesso ao banco (sem perda de dados).",
-        _ => "→ Ação recomendada: reparo no modo seguro."
-    };
+        // Banco de sistema: fora do NoAction, a ferramenta só oferece religar (modo seguro) — o resto é manual.
+        if (db.IsSystemDatabase && diag.RecommendedAction != RecommendedActionKind.NoAction)
+            return db.IsProblematic
+                ? "→ Banco de sistema: tente o reparo no modo seguro; se não bastar, siga o procedimento manual com o DBA."
+                : "→ Banco de sistema: sem correção automática — siga o procedimento manual com o DBA.";
+
+        return diag.RecommendedAction switch
+        {
+            RecommendedActionKind.NoAction => "✔ Nenhuma ação necessária — banco íntegro.",
+            RecommendedActionKind.RebuildIndexesOnly => "→ Ação recomendada: reparar índices (sem perda de dados).",
+            RecommendedActionKind.SafeRepair when db.StateDesc.Trim().Equals("RECOVERING", StringComparison.OrdinalIgnoreCase)
+                => "→ Ação recomendada: aguardar a recuperação automática terminar.",
+            RecommendedActionKind.SafeRepair => "→ Ação recomendada: reparo no modo seguro (sem perda de dados).",
+            RecommendedActionKind.RestoreFromBackup => "→ Ação recomendada: restaurar de backup.",
+            RecommendedActionKind.PageRestore => "→ Ação recomendada: restaurar só as páginas afetadas (em 'Mais opções de restauração').",
+            RecommendedActionKind.RebuildLog => "→ Ação recomendada: recuperar o log de transações — comece pelo reparo no modo seguro.",
+            RecommendedActionKind.FixConstraints when diag.ForeignKeyViolations.Count == 0
+                => "→ Sem correção automática: revise os dados com o fornecedor/DBA ou restaure de backup.",
+            RecommendedActionKind.FixConstraints => "→ Ação recomendada: corrigir a integridade (registros órfãos vão para a quarentena).",
+            RecommendedActionKind.FreeDiskSpace => "→ Ação recomendada: liberar espaço em disco e religar o banco.",
+            RecommendedActionKind.ResolveLogFull => "→ Ação recomendada: resolver o log de transações cheio (sem perda de dados).",
+            RecommendedActionKind.FixFileAccess => "→ Ação recomendada: corrigir o acesso aos arquivos do banco e religar (sem perda de dados).",
+            RecommendedActionKind.FixAccess => "→ Ação recomendada: liberar o acesso ao banco (sem perda de dados).",
+            _ => "→ Ação recomendada: reparo no modo seguro."
+        };
+    }
 
     /// <summary>Cor (chaves de recurso) do painel de diagnóstico conforme a severidade da ação.</summary>
     private static (string back, string fore) SeverityKeys(RecommendedActionKind action) => action switch
@@ -615,8 +709,12 @@ public partial class MainWindow : Window
             "Não foi possível corrigir o acesso aos arquivos.");
     }
 
-    /// <summary>Executa uma ação de serviço NÃO destrutiva com o mesmo ciclo das demais (busy, resultado, estado).</summary>
-    private async Task RunSimpleActionAsync(DatabaseInfo db, string status, Func<CancellationToken, Task<RepairResult>> action, string errorTitle)
+    /// <summary>
+    /// Executa uma ação de serviço NÃO destrutiva com o mesmo ciclo das demais (busy, resultado, estado).
+    /// <paramref name="onResult"/> decide o que o resultado faz com o fluxo (padrão: correção do Passo 2).
+    /// </summary>
+    private async Task RunSimpleActionAsync(DatabaseInfo db, string status, Func<CancellationToken, Task<RepairResult>> action, string errorTitle,
+        Action<RepairResult>? onResult = null)
     {
         if (_busy) return;
         SetBusy(true);
@@ -625,7 +723,7 @@ public partial class MainWindow : Window
         try
         {
             var result = await action(_cts!.Token);
-            HandleRepairResult(db, result);
+            (onResult ?? (r => HandleRepairResult(db, r)))(result);
             StatusText.Text = result.Message;
         }
         catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
@@ -711,7 +809,26 @@ public partial class MainWindow : Window
         var kinds = rows.Select(r => r.Issue.Kind).ToList();
         _ = RunSimpleActionAsync(db, $"Aplicando ajustes em \"{db.Name}\"...",
             ct => _adjustmentService.ApplyAsync(db, kinds, _connectionString, _progress, ct),
-            "Não foi possível aplicar os ajustes.");
+            "Não foi possível aplicar os ajustes.",
+            r =>
+            {
+                // Ajustes não corrigem corrupção/órfãos/log: se há outra correção na tela, ela continua
+                // pendente — só os ajustes saem. Sozinhos, eles concluem o Passo 2 como qualquer correção.
+                var otherFix = new UIElement[]
+                {
+                    AccessPanel, IndexRepairPanel, LogFullPanel, FileAccessPanel, SafeRepairPanel,
+                    ConstraintFixPanel, RestorePanel, DataLossPanel, LogRebuildPanel
+                }.Any(p => p.Visibility == Visibility.Visible);
+                if (otherFix && r.Status == RepairStatus.Success)
+                {
+                    ShowResult(r.Message + " A correção principal continua pendente no Passo 2.", ResultTone.Ok);
+                    AdjustmentsPanel.Visibility = Visibility.Collapsed;
+                }
+                else
+                {
+                    HandleRepairResult(db, r);
+                }
+            });
     }
 
     // ------------------------------------------------------------------ Contadores de espaço / verificação em partes
@@ -721,7 +838,7 @@ public partial class MainWindow : Window
         if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
         _ = RunSimpleActionAsync(db, $"Corrigindo os contadores de espaço de \"{db.Name}\"...",
             ct => _maintenanceService.UpdateUsageAsync(db, _connectionString, _progress, ct),
-            "Não foi possível corrigir os contadores de espaço.");
+            "Não foi possível corrigir os contadores de espaço.", ShowToolResult);
     }
 
     private void UpdateIncrementalStatus(DatabaseInfo db)
@@ -751,12 +868,7 @@ public partial class MainWindow : Window
         try
         {
             var o = await _incrementalService.RunAsync(db, _connectionString, budget, _progress, _cts!.Token);
-            ResultPanel.Visibility = Visibility.Visible;
-            ResultText.Text = o.Message;
-            var ok = o.Errors.Count == 0;
-            ResultPanel.SetResourceReference(Border.BackgroundProperty, ok ? "OkBackBrush" : "WarnBackBrush");
-            ResultPanel.SetResourceReference(Border.BorderBrushProperty, ok ? "OkForeBrush" : "WarnLineBrush");
-            ResultText.SetResourceReference(TextBlock.ForegroundProperty, ok ? "OkForeBrush" : "WarnForeBrush");
+            ShowResult(o.Message, o.Errors.Count == 0 ? ResultTone.Ok : ResultTone.Warn);
             StatusText.Text = o.Message;
         }
         catch (OperationCanceledException) { StatusText.Text = "Verificação em partes interrompida — o progresso foi guardado."; }
@@ -794,14 +906,11 @@ public partial class MainWindow : Window
         try
         {
             var rep = await _repairService.CheckTableAsync(db, table, _connectionString, _progress, _cts!.Token);
-            ResultPanel.Visibility = Visibility.Visible;
             var ok = rep.Executed && !rep.HasErrors;
-            ResultText.Text = !rep.Executed
-                ? $"Não foi possível verificar {table} (banco/objeto inacessível)."
-                : ok ? $"{table}: sem erros de consistência." : $"{table}: {rep.ErrorCount} erro(s) — veja o registro.";
-            ResultPanel.SetResourceReference(Border.BackgroundProperty, ok ? "OkBackBrush" : "WarnBackBrush");
-            ResultPanel.SetResourceReference(Border.BorderBrushProperty, ok ? "OkForeBrush" : "WarnLineBrush");
-            ResultText.SetResourceReference(TextBlock.ForegroundProperty, ok ? "OkForeBrush" : "WarnForeBrush");
+            ShowResult(!rep.Executed
+                    ? $"Não foi possível verificar {table} (banco/objeto inacessível)."
+                    : ok ? $"{table}: sem erros de consistência." : $"{table}: {rep.ErrorCount} erro(s) — veja o registro e rode o diagnóstico completo (Passo 1).",
+                ok ? ResultTone.Ok : ResultTone.Warn);
             StatusText.Text = ResultText.Text;
         }
         catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
@@ -823,11 +932,7 @@ public partial class MainWindow : Window
         try
         {
             var n = await _repairService.ReseedIdentitiesAsync(db, _connectionString, _progress, _cts!.Token);
-            ResultPanel.Visibility = Visibility.Visible;
-            ResultText.Text = $"{n} tabela(s) com IDENTITY reajustada(s).";
-            ResultPanel.SetResourceReference(Border.BackgroundProperty, "OkBackBrush");
-            ResultPanel.SetResourceReference(Border.BorderBrushProperty, "OkForeBrush");
-            ResultText.SetResourceReference(TextBlock.ForegroundProperty, "OkForeBrush");
+            ShowResult($"{n} tabela(s) com IDENTITY reajustada(s).", ResultTone.Ok);
             StatusText.Text = ResultText.Text;
         }
         catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
@@ -852,6 +957,12 @@ public partial class MainWindow : Window
         {
             var result = await _repairService.RebuildIndexesAsync(db, _connectionString, _progress, _cts!.Token);
             HandleRepairResult(db, result);
+            // Índices não bastaram: o próximo degrau é o modo seguro (sem perda) — nunca direto o reparo com perda.
+            if (result.Status != RepairStatus.Success && !db.IsSystemDatabase)
+            {
+                SafeRepairPanel.Visibility = Visibility.Visible;
+                ViewScriptButton.Visibility = Visibility.Visible;
+            }
             StatusText.Text = result.Message;
         }
         catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
@@ -923,7 +1034,7 @@ public partial class MainWindow : Window
                 $"• Órfãos ainda SEM pai: {prompt.RemainingOrphans}\n\n" +
                 "Deseja escolher OUTRO arquivo .bak (ex.: em outra mídia) para tentar recuperar os pais restantes?\n\n" +
                 "Sim = escolher outro backup e tentar de novo.\n" +
-                "Não = prosseguir REMOVENDO os órfãos remanescentes (irreversível).";
+                "Não = prosseguir: os órfãos remanescentes saem da tabela e vão para a quarentena (RestoreDB_Quarentena).";
             var choice = MessageBox.Show(msg, "Recuperação de registros-pai incompleta",
                 MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.Yes);
             if (choice != MessageBoxResult.Yes) return (string?)null;
@@ -940,14 +1051,17 @@ public partial class MainWindow : Window
     {
         if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
 
+        // Fiel a ReconcileForeignKeyOrphansAsync: recupera o pai do backup e MOVE o resto para a quarentena;
+        // só exclui de vez se a quarentena não puder ser usada naquela tabela.
         var confirm = MessageBox.Show(
-            $"Corrigir a integridade do banco \"{db.Name}\" REMOVENDO os registros órfãos?\n\n" +
-            "As linhas cuja chave estrangeira aponta para um registro inexistente serão EXCLUÍDAS " +
-            "de forma irreversível. Será feito um backup de segurança antes.\n\n" +
-            "Se houver um backup completo disponível, a ferramenta tentará primeiro recuperar " +
-            "automaticamente os registros-pai a partir dele para evitar excluir os registros filhos " +
-            "(melhor esforço — pode não encontrar tudo, ou não haver backup disponível).\n\n" +
-            "Para preservar 100% dos registros, prefira restaurar de backup. Deseja continuar?",
+            $"Corrigir a integridade do banco \"{db.Name}\" retirando os registros órfãos?\n\n" +
+            "1) Se houver um backup completo, a ferramenta tenta primeiro recuperar dele os registros-pai que " +
+            "faltam (melhor esforço — pode não encontrar todos).\n" +
+            "2) Os órfãos que sobrarem SAEM da tabela e ficam guardados na QUARENTENA (banco RestoreDB_Quarentena), " +
+            "de onde podem ser devolvidos depois. Se a quarentena não puder ser usada numa tabela, as linhas dela " +
+            "são excluídas (o registro avisa).\n\n" +
+            "Antes, a ferramenta tenta um backup de segurança. Quem estiver usando o banco é desconectado durante a correção.\n\n" +
+            "Restaurar de backup é a alternativa, mas desfaz o que foi gravado depois do backup. Deseja continuar?",
             "Confirmar correção de integridade",
             MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
 
@@ -1056,11 +1170,14 @@ public partial class MainWindow : Window
             if (proceed != MessageBoxResult.Yes) return;
         }
 
+        // RestoreDatabaseAsync com UMA peça: sem tail-log — o que veio depois desse backup não volta.
         var confirm = MessageBox.Show(
             $"Restaurar o banco \"{db.Name}\" a partir do backup selecionado?\n\n" +
             $"{set.Display}\n\n" +
             (RestoreReplaceCheck.IsChecked == true
-                ? "O banco atual será SUBSTITUÍDO (REPLACE) pelos dados do backup."
+                ? "O banco atual será SUBSTITUÍDO (REPLACE) pelos dados do backup. Tudo o que foi gravado DEPOIS desse " +
+                  "backup será PERDIDO (este modo não salva as transações recentes). Para preservá-las, use " +
+                  "'Restaurar cadeia completa'. Quem estiver usando o banco é desconectado."
                 : "A restauração falhará se o banco já existir (REPLACE desmarcado).") +
             "\n\nDeseja continuar?",
             "Confirmar restauração", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
@@ -1150,12 +1267,7 @@ public partial class MainWindow : Window
             };
             var result = await _restoreService.TestRestoreAsync(db.Name, pieces, _connectionString, _progress, _cts!.Token);
             // É um teste: não altera o estado do banco real; mostra só o resultado.
-            ResultPanel.Visibility = Visibility.Visible;
-            ResultText.Text = result.Message;
-            var okKeys = result.Status == RepairStatus.Success;
-            ResultPanel.SetResourceReference(Border.BackgroundProperty, okKeys ? "OkBackBrush" : "WarnBackBrush");
-            ResultPanel.SetResourceReference(Border.BorderBrushProperty, okKeys ? "OkForeBrush" : "WarnLineBrush");
-            ResultText.SetResourceReference(TextBlock.ForegroundProperty, okKeys ? "OkForeBrush" : "WarnForeBrush");
+            ShowResult(result.Message, result.Status == RepairStatus.Success ? ResultTone.Ok : ResultTone.Warn);
             StatusText.Text = result.Message;
         }
         catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
@@ -1170,7 +1282,14 @@ public partial class MainWindow : Window
     // ------------------------------------------------------------------ Ponto-no-tempo (STOPAT)
 
     private void PointInTimeCheck_Changed(object sender, RoutedEventArgs e)
-        => PointInTimeRow.Visibility = PointInTimeCheck.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
+    {
+        var on = PointInTimeCheck.IsChecked == true;
+        PointInTimeRow.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+        // A marcação fica dentro de "Mais opções", mas muda o botão principal: o rótulo não pode dizer "mais recente".
+        RestoreChainButton.Content = on
+            ? "Restaurar cadeia completa (até o ponto escolhido em 'Mais opções')"
+            : "Restaurar cadeia completa (mais recente)";
+    }
 
     /// <summary>
     /// Alvo de ponto-no-tempo (STOPAT). Devolve false quando a opção está marcada mas incompleta —
@@ -1197,11 +1316,17 @@ public partial class MainWindow : Window
         if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
 
         if (!TryGetPointInTimeTarget(out var target)) return;
-        var alvo = target.HasValue ? $"até {target.Value:yyyy-MM-dd HH:mm:ss}" : "até o ponto mais recente";
+        var alvo = target.HasValue ? $"até {target.Value:dd/MM/yyyy HH:mm:ss}" : "até o ponto mais recente";
+        // RestoreToPointInTimeAsync: tail-log é tentativa (SIMPLE/log ilegível = sem ele) e, com alvo, o que veio
+        // depois dele sai do banco (fica só no arquivo de tail-log).
         var confirm = MessageBox.Show(
             $"Restaurar o banco \"{db.Name}\" pela CADEIA COMPLETA {alvo}?\n\n" +
-            "A ferramenta monta automaticamente FULL → diferencial → logs do histórico (msdb), captura o " +
-            "tail-log das transações mais recentes e SUBSTITUI o banco atual. A cadeia é validada antes de executar.\n\n" +
+            "A ferramenta monta automaticamente backup completo → diferencial → backups de log do histórico (msdb) e " +
+            "confere que a sequência não tem buracos ANTES de mexer no banco. Em seguida tenta salvar as transações " +
+            "mais recentes (tail-log) e SUBSTITUI o banco atual. Quem estiver usando o banco é desconectado.\n\n" +
+            (target.HasValue
+                ? "Tudo o que foi gravado depois desse instante deixa de existir no banco (fica guardado só no arquivo de tail-log).\n\n"
+                : "Se o tail-log não puder ser salvo (modelo SIMPLE ou log danificado), o que foi gravado depois do último backup se perde.\n\n") +
             "Deseja continuar?",
             "Confirmar restauração da cadeia completa",
             MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
@@ -1263,12 +1388,8 @@ public partial class MainWindow : Window
         {
             var result = await _restoreService.RestoreAsCopyAsync(db.Name, copyName: null, _connectionString, _progress, _cts!.Token);
             // É uma cópia: o estado do banco original não muda. Mostra só o resultado.
-            ResultPanel.Visibility = Visibility.Visible;
-            ResultText.Text = result.Message;
             var ok = result.Status == RepairStatus.Success;
-            ResultPanel.SetResourceReference(Border.BackgroundProperty, ok ? "OkBackBrush" : "ProblemBackBrush");
-            ResultPanel.SetResourceReference(Border.BorderBrushProperty, ok ? "OkForeBrush" : "ProblemForeBrush");
-            ResultText.SetResourceReference(TextBlock.ForegroundProperty, ok ? "OkForeBrush" : "ProblemForeBrush");
+            ShowResult(result.Message, ok ? ResultTone.Ok : ResultTone.Problem);
             StatusText.Text = result.Message;
             if (ok)
             {
@@ -1326,12 +1447,7 @@ public partial class MainWindow : Window
         try
         {
             var result = await _restoreService.SalvageTableAsync(_salvageCopyName!, db.Name, table, _connectionString, _progress, _cts!.Token);
-            ResultPanel.Visibility = Visibility.Visible;
-            ResultText.Text = result.Message;
-            var ok = result.Status == RepairStatus.Success;
-            ResultPanel.SetResourceReference(Border.BackgroundProperty, ok ? "OkBackBrush" : "ProblemBackBrush");
-            ResultPanel.SetResourceReference(Border.BorderBrushProperty, ok ? "OkForeBrush" : "ProblemForeBrush");
-            ResultText.SetResourceReference(TextBlock.ForegroundProperty, ok ? "OkForeBrush" : "ProblemForeBrush");
+            ShowResult(result.Message, result.Status == RepairStatus.Success ? ResultTone.Ok : ResultTone.Problem);
             StatusText.Text = result.Message;
         }
         catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
@@ -1393,14 +1509,11 @@ public partial class MainWindow : Window
         {
             var items = await _restoreService.VerifyBackupHealthAsync(db.Name, _connectionString, _progress, _cts!.Token);
             var ok = items.Count(i => i.Verified);
-            ResultPanel.Visibility = Visibility.Visible;
-            ResultText.Text = items.Count == 0
-                ? "Sem histórico de backups para verificar."
-                : $"Saúde dos backups: {ok}/{items.Count} verificado(s) com sucesso (detalhes no registro abaixo).";
             var allOk = items.Count > 0 && ok == items.Count;
-            ResultPanel.SetResourceReference(Border.BackgroundProperty, allOk ? "OkBackBrush" : "WarnBackBrush");
-            ResultPanel.SetResourceReference(Border.BorderBrushProperty, allOk ? "OkForeBrush" : "WarnLineBrush");
-            ResultText.SetResourceReference(TextBlock.ForegroundProperty, allOk ? "OkForeBrush" : "WarnForeBrush");
+            ShowResult(items.Count == 0
+                    ? "Sem histórico de backups para verificar."
+                    : $"Saúde dos backups: {ok}/{items.Count} verificado(s) com sucesso (detalhes no registro abaixo).",
+                allOk ? ResultTone.Ok : ResultTone.Warn);
             StatusText.Text = ResultText.Text;
         }
         catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
@@ -1419,10 +1532,15 @@ public partial class MainWindow : Window
         if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
         if (!TryGetPointInTimeTarget(out var standbyTarget)) return;
 
+        // RestoreToStandbyAsync não captura tail-log: avisar sem rodeios o que se perde.
         var confirm = MessageBox.Show(
-            $"Restaurar \"{db.Name}\" em modo STANDBY (somente leitura)?\n\n" +
-            "O banco fica CONSULTÁVEL entre os logs, para você inspecionar os dados e achar o ponto certo. " +
-            "O banco atual é SUBSTITUÍDO. Finalize depois com 'Finalizar recuperação'.\n\nDeseja continuar?",
+            $"Restaurar \"{db.Name}\" em modo STANDBY (somente leitura) " +
+            (standbyTarget.HasValue ? $"até {standbyTarget.Value:dd/MM/yyyy HH:mm:ss}" : "até o backup de log mais recente") + "?\n\n" +
+            "O banco fica CONSULTÁVEL (só leitura) para você inspecionar os dados e achar o ponto certo; o sistema " +
+            "não consegue gravar nele até 'Finalizar recuperação'.\n\n" +
+            "ATENÇÃO: o banco atual é SUBSTITUÍDO pelo conteúdo dos backups e este modo NÃO salva as transações " +
+            "recentes (tail-log): o que foi gravado depois do último backup de log é PERDIDO. Para inspecionar sem " +
+            "perder nada, prefira 'Recuperar para cópia'.\n\nDeseja continuar?",
             "Confirmar restauração em STANDBY",
             MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
 
@@ -1538,7 +1656,7 @@ public partial class MainWindow : Window
         try
         {
             var r = await _maintenanceService.RunMaintenanceAsync(db, _connectionString, _progress, _cts!.Token);
-            HandleRepairResult(db, r);
+            ShowToolResult(r); // ferramenta: não conclui o fluxo de correção
             StatusText.Text = r.Message;
         }
         catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
@@ -1599,8 +1717,10 @@ public partial class MainWindow : Window
 
         var target = begin.AddSeconds(-1);
         var confirm = MessageBox.Show(
-            $"Restaurar \"{db.Name}\" até {target:yyyy-MM-dd HH:mm:ss} (logo ANTES da {tx.Kind} de {begin:HH:mm:ss})?\n\n" +
-            "O banco será SUBSTITUÍDO pela cadeia de backups até esse instante. Exige modelo FULL e a cadeia disponível.\n\nContinuar?",
+            $"Restaurar \"{db.Name}\" até {target:dd/MM/yyyy HH:mm:ss} (logo ANTES da {tx.Kind} de {begin:HH:mm:ss})?\n\n" +
+            "O banco será SUBSTITUÍDO pela cadeia de backups até esse instante: TUDO o que foi gravado depois dele " +
+            "deixa de existir no banco (fica guardado só no arquivo de tail-log). Exige modelo FULL e a cadeia disponível. " +
+            "Para devolver só as linhas excluídas, sem desfazer o resto, use 'Devolver só as linhas excluídas'.\n\nContinuar?",
             "Confirmar recuperação ponto-no-tempo", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
         if (confirm == MessageBoxResult.Yes)
             _ = RunRestoreChainAsync(db, target);
@@ -1620,7 +1740,7 @@ public partial class MainWindow : Window
 
         var target = begin.AddSeconds(-1);
         var confirm = MessageBox.Show(
-            $"Devolver à tabela {tx.Table} de \"{db.Name}\" as linhas que existiam em {target:yyyy-MM-dd HH:mm:ss} (logo ANTES do DELETE de {begin:HH:mm:ss})?\n\n" +
+            $"Devolver à tabela {tx.Table} de \"{db.Name}\" as linhas que existiam em {target:dd/MM/yyyy HH:mm:ss} (logo ANTES do DELETE de {begin:HH:mm:ss})?\n\n" +
             "O banco NÃO é sobrescrito: uma cópia temporária é restaurada até esse instante e só as linhas que faltam voltam " +
             "(por chave primária, sem duplicar). Tudo o que foi feito depois continua no banco.\n\n" +
             "Atenção: linhas dessa tabela excluídas DE PROPÓSITO depois desse instante também voltariam.\n\nContinuar?",
@@ -1712,12 +1832,8 @@ public partial class MainWindow : Window
         try
         {
             var r = await _restoreService.AttachDatabaseAsync(name, mdf, ldf, rebuild, _connectionString, _progress, _cts!.Token);
-            ResultPanel.Visibility = Visibility.Visible;
-            ResultText.Text = r.Message;
             var ok = r.Status == RepairStatus.Success;
-            ResultPanel.SetResourceReference(Border.BackgroundProperty, ok ? "OkBackBrush" : "ProblemBackBrush");
-            ResultPanel.SetResourceReference(Border.BorderBrushProperty, ok ? "OkForeBrush" : "ProblemForeBrush");
-            ResultText.SetResourceReference(TextBlock.ForegroundProperty, ok ? "OkForeBrush" : "ProblemForeBrush");
+            ShowResult(r.Message, ok ? ResultTone.Ok : ResultTone.Problem);
             StatusText.Text = r.Message;
             if (ok) await MergeDatabaseListAsync(); // o banco anexado aparece na lista
         }
@@ -1827,16 +1943,16 @@ public partial class MainWindow : Window
         var confirm = MessageBox.Show(
             $"Você está prestes a executar o reparo COM POSSÍVEL PERDA DE DADOS no banco \"{db.Name}\".\n\n" +
             "Esta operação pode descartar dados corrompidos. Antes de executar, a ferramenta tentará " +
-            "preservar as transações mais recentes (tail-log) e criar um backup de segurança; ao final, " +
-            "um backup FULL novo é gerado. Os arquivos ficam na pasta padrão de backups do servidor.\n\n" +
+            "preservar as transações mais recentes (tail-log) e criar um backup de segurança; se o reparo " +
+            "terminar bem, um backup FULL novo é gerado. Os arquivos ficam na pasta padrão de backups do servidor. " +
+            "Quem estiver usando o banco é desconectado.\n\n" +
             (RecoverLostRowsCheck.IsChecked == true
-                ? "Se a cadeia de backups chegar até o instante do reparo, as linhas que ele descartar serão " +
-                  "DEVOLVIDAS automaticamente a partir dos backups.\n\n"
-                : string.Empty) +
-            "Se o reparo deixar chaves estrangeiras órfãs e houver um backup completo disponível, a " +
-            "ferramenta tentará primeiro recuperar automaticamente os registros-pai a partir dele para " +
-            "evitar excluir os registros filhos (melhor esforço — pode não encontrar tudo, ou não haver " +
-            "backup disponível).\n\n" +
+                ? "Antes do reparo, as linhas ainda legíveis das tabelas danificadas são copiadas para um banco de " +
+                  "salvamento e, depois, as que o reparo descartar são DEVOLVIDAS (também a partir dos backups, se a " +
+                  "cadeia chegar até o instante do reparo). O que não puder ser lido nem estiver em backup fica perdido.\n\n"
+                : "Você DESMARCOU 'Salvar e devolver as linhas': o que o reparo descartar não será devolvido.\n\n") +
+            "Se o reparo deixar registros órfãos (chave estrangeira sem o registro-pai), a ferramenta tenta " +
+            "recuperar o pai do backup e move o que sobrar para a quarentena (RestoreDB_Quarentena).\n\n" +
             "Deseja continuar?",
             "Confirmar reparo com perda de dados",
             MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
@@ -1881,11 +1997,7 @@ public partial class MainWindow : Window
         {
             StatusText.Text = "Falha no reparo.";
             // Mesmo em falha inesperada, oferecer o último recurso (reconstruir o log) p/ bancos de usuário.
-            ResultPanel.Visibility = Visibility.Visible;
-            ResultPanel.SetResourceReference(Border.BackgroundProperty, "ProblemBackBrush");
-            ResultPanel.SetResourceReference(Border.BorderBrushProperty, "ProblemForeBrush");
-            ResultText.SetResourceReference(TextBlock.ForegroundProperty, "ProblemForeBrush");
-            ResultText.Text = "Ocorreu uma falha durante o reparo: " + ex.Message;
+            ShowResult("Ocorreu uma falha durante o reparo: " + ex.Message, ResultTone.Problem);
             ShowLogRebuildOption(db);
         }
         finally
@@ -1905,7 +2017,9 @@ public partial class MainWindow : Window
     private void ShowLogRebuildOption(DatabaseInfo db, bool force = false)
     {
         var state = db.StateDesc.Trim().ToUpperInvariant();
-        var applies = force || state is "SUSPECT" or "RECOVERY_PENDING" or "EMERGENCY";
+        // Se o diagnóstico culpou só os DADOS (log íntegro), recriar o log não resolve — e destrói o log bom.
+        var onlyDataBlamed = _lastDiagnosis is { DataCorruptionSuspected: true, LogCorruptionSuspected: false };
+        var applies = force || (state is "SUSPECT" or "RECOVERY_PENDING" or "EMERGENCY" && !onlyDataBlamed);
         if (db.IsSystemDatabase || !applies)
         {
             LogRebuildPanel.Visibility = Visibility.Collapsed;
@@ -1916,47 +2030,62 @@ public partial class MainWindow : Window
         LogRebuildButton.IsEnabled = false;
     }
 
+    private enum ResultTone { Ok, Warn, Problem }
+
+    /// <summary>Mostra o "Resultado da última operação" com a cor do desfecho (sem mexer no fluxo).</summary>
+    private void ShowResult(string text, ResultTone tone)
+    {
+        var (back, line, fore) = tone switch
+        {
+            ResultTone.Ok => ("OkBackBrush", "OkForeBrush", "OkForeBrush"),
+            ResultTone.Warn => ("WarnBackBrush", "WarnLineBrush", "WarnForeBrush"),
+            _ => ("ProblemBackBrush", "ProblemForeBrush", "ProblemForeBrush")
+        };
+        ResultPanel.Visibility = Visibility.Visible;
+        ResultText.Text = text;
+        ResultPanel.SetResourceReference(Border.BackgroundProperty, back);
+        ResultPanel.SetResourceReference(Border.BorderBrushProperty, line);
+        ResultText.SetResourceReference(TextBlock.ForegroundProperty, fore);
+    }
+
+    private static ResultTone ToneOf(RepairResult r) => r.Status switch
+    {
+        RepairStatus.Success or RepairStatus.NoActionNeeded => ResultTone.Ok,
+        RepairStatus.NeedsDataLossConfirmation => ResultTone.Warn,
+        _ => ResultTone.Problem
+    };
+
+    /// <summary>
+    /// Resultado de uma FERRAMENTA ADICIONAL (manutenção, contadores...): só informa. Não conclui os
+    /// passos nem esconde as opções de correção — ela não resolve o problema que o diagnóstico encontrou.
+    /// </summary>
+    private void ShowToolResult(RepairResult result) => ShowResult(result.Message, ToneOf(result));
+
+    /// <summary>Resultado de uma correção do fluxo (Passo 2): atualiza as opções e o indicador de passos.</summary>
     private void HandleRepairResult(DatabaseInfo db, RepairResult result)
     {
-        ResultPanel.Visibility = Visibility.Visible;
-        ResultText.Text = result.Message;
+        ShowResult(result.Message, ToneOf(result));
 
         switch (result.Status)
         {
             case RepairStatus.Success:
             case RepairStatus.NoActionNeeded:
-                ResultPanel.SetResourceReference(Border.BackgroundProperty, "OkBackBrush");
-                ResultPanel.SetResourceReference(Border.BorderBrushProperty, "OkForeBrush");
-                ResultText.SetResourceReference(TextBlock.ForegroundProperty, "OkForeBrush");
                 // O diagnóstico permanece disponível: recomenda-se re-verificar após o reparo (Passo 3).
                 _repairSucceeded = true;
+                _needsDataLossDecision = false;
                 DiagnosePanel.Visibility = Visibility.Visible;
                 DiagnosisResultPanel.Visibility = Visibility.Collapsed;
-                RepairOptionsTitle.Visibility = Visibility.Collapsed;
-                SafeRepairPanel.Visibility = Visibility.Collapsed;
-                DataLossPanel.Visibility = Visibility.Collapsed;
-                LogRebuildPanel.Visibility = Visibility.Collapsed;
-                IndexRepairPanel.Visibility = Visibility.Collapsed;
-                LogFullPanel.Visibility = Visibility.Collapsed;
-                FileAccessPanel.Visibility = Visibility.Collapsed;
-                AccessPanel.Visibility = Visibility.Collapsed;
-                AdjustmentsPanel.Visibility = Visibility.Collapsed;
-                ConstraintFixPanel.Visibility = Visibility.Collapsed;
-                RestorePanel.Visibility = Visibility.Collapsed;
+                HideOptionPanels();
                 TopologyWarnPanel.Visibility = Visibility.Collapsed;
-                ViewScriptButton.Visibility = Visibility.Collapsed;
-                HealthyPanel.Visibility = db.IsHealthy && !db.HasAccessRestriction ? Visibility.Visible : Visibility.Collapsed;
                 break;
 
             case RepairStatus.NeedsDataLossConfirmation:
-                ResultPanel.SetResourceReference(Border.BackgroundProperty, "WarnBackBrush");
-                ResultPanel.SetResourceReference(Border.BorderBrushProperty, "WarnLineBrush");
-                ResultText.SetResourceReference(TextBlock.ForegroundProperty, "WarnForeBrush");
+                _needsDataLossDecision = true;
                 // Oferece o reparo destrutivo, exigindo confirmação explícita.
                 DataLossPanel.Visibility = Visibility.Visible;
                 DataLossConfirmCheck.IsChecked = false;
                 DataLossRepairButton.IsEnabled = false;
-                // A alternativa que preserva 100% dos dados (restaurar de backup) fica visível
+                // A alternativa sem descartar dados corrompidos (restaurar de backup) fica visível
                 // LADO A LADO com a confirmação de perda — o usuário decide vendo as duas.
                 _ = ShowRestoreOptionAsync(db);
                 // E o último recurso (reconstruir o log) quando o estado indicar problema de log.
@@ -1964,13 +2093,26 @@ public partial class MainWindow : Window
                 break;
 
             default: // Failed
-                ResultPanel.SetResourceReference(Border.BackgroundProperty, "ProblemBackBrush");
-                ResultPanel.SetResourceReference(Border.BorderBrushProperty, "ProblemForeBrush");
-                ResultText.SetResourceReference(TextBlock.ForegroundProperty, "ProblemForeBrush");
-                // Irreparável: oferecer o último recurso (reconstruir o log).
+                // Irreparável: oferecer o último recurso (reconstruir o log), quando se aplica.
                 ShowLogRebuildOption(db);
                 break;
         }
+    }
+
+    /// <summary>
+    /// Esconde as opções de correção do Passo 2 (o indicador de passos é recalculado em UpdateFlowState).
+    /// O assistente de salvamento fica: a cópia recuperada continua útil depois de um reparo.
+    /// </summary>
+    private void HideOptionPanels()
+    {
+        foreach (var p in new UIElement[]
+                 {
+                     AccessPanel, IndexRepairPanel, LogFullPanel, FileAccessPanel, SafeRepairPanel, AdjustmentsPanel,
+                     ConstraintFixPanel, RestorePanel, DataLossPanel, LogRebuildPanel
+                 })
+            p.Visibility = Visibility.Collapsed;
+        ViewScriptButton.Visibility = Visibility.Collapsed;
+        RepairOptionsTitle.Visibility = Visibility.Collapsed;
     }
 
     // ------------------------------------------------------------------ Último recurso: reconstruir log
@@ -1984,9 +2126,11 @@ public partial class MainWindow : Window
 
         var confirm = MessageBox.Show(
             $"ÚLTIMO RECURSO para o banco \"{db.Name}\".\n\n" +
-            "O banco será desanexado, o arquivo de log (.ldf) será removido e um novo log será criado " +
-            "para forçar o retorno a ONLINE.\n\n" +
-            "Pode haver PERDA DE DADOS e inconsistências. Continuar?",
+            "O banco será desanexado, o arquivo de log (.ldf) sai do lugar (fica guardado com a extensão " +
+            ".corrupt_DATA) e um log novo é criado para forçar o retorno a ONLINE. Antes, a ferramenta tenta " +
+            "copiar os arquivos para o lado.\n\n" +
+            "Pode haver PERDA DE DADOS (o que estava só no log) e inconsistências. Exige executar a ferramenta " +
+            "como Administrador no próprio servidor — sem isso, nada é alterado. Continuar?",
             "Confirmar reconstrução do log",
             MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
 
@@ -2113,7 +2257,7 @@ public partial class MainWindow : Window
     /// </summary>
     private void UpdateFlowState()
     {
-        if (DatabasesGrid.SelectedItem is not DatabaseInfo) return;
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
 
         var anyOption = new UIElement[]
         {
@@ -2125,13 +2269,17 @@ public partial class MainWindow : Window
             AccessPanel, IndexRepairPanel, LogFullPanel, FileAccessPanel, SafeRepairPanel,
             ConstraintFixPanel, RestorePanel, SalvagePanel, DataLossPanel, LogRebuildPanel
         }.All(p => p.Visibility != Visibility.Visible);
-        var diagnosed = _lastDiagnosis is not null;
+        var diag = _lastDiagnosis;
+        var diagnosed = diag is not null;
 
         RepairOptionsTitle.Visibility = anyOption ? Visibility.Visible : Visibility.Collapsed;
         Step2LockedPanel.Visibility = anyOption ? Visibility.Collapsed : Visibility.Visible;
-        DiagnoseButton.Content = diagnosed || _repairSucceeded
+        DiagnoseButton.Content = diagnosed || _repairSucceeded || _diagnosisFailed
             ? "🔍  Diagnosticar novamente (sem alterar o banco)"
             : "🔍  Diagnosticar (sem alterar o banco)";
+        // "Aparentemente saudável" só faz sentido ANTES de qualquer verificação: depois, quem fala é o diagnóstico.
+        HealthyPanel.Visibility = db.IsHealthy && !db.HasAccessRestriction && !diagnosed && !_repairSucceeded && !_diagnosisFailed
+            ? Visibility.Visible : Visibility.Collapsed;
 
         StepState s1, s2, s3;
         string hint;
@@ -2140,6 +2288,12 @@ public partial class MainWindow : Window
             (s1, s2, s3) = (StepState.Done, StepState.Done, StepState.Active);
             hint = "Operação concluída. Rode o diagnóstico de novo (Passo 1) para confirmar que o banco ficou íntegro.";
             Step2LockedText.Text = "✔  Operação concluída. Diagnostique novamente para confirmar o resultado.";
+        }
+        else if (_diagnosisFailed && !diagnosed)
+        {
+            (s1, s2, s3) = (StepState.Active, StepState.Pending, StepState.Pending);
+            hint = "O diagnóstico não terminou — veja o motivo no registro abaixo e clique em \"Diagnosticar novamente\".";
+            Step2LockedText.Text = "🔒  Sem um diagnóstico completo, a ferramenta não indica correções.";
         }
         else if (!diagnosed)
         {
@@ -2150,15 +2304,25 @@ public partial class MainWindow : Window
         else if (anyOption)
         {
             (s1, s2, s3) = (StepState.Done, StepState.Active, StepState.Pending);
-            hint = onlyAdjustments
+            hint = onlyAdjustments && diag!.RecommendedAction == RecommendedActionKind.NoAction
                 ? "Nenhum problema grave. Há ajustes recomendados no Passo 2 — opcionais e sem perda de dados."
-                : "Escolha uma opção no Passo 2. Elas estão em ordem de risco: comece pela primeira. As que podem perder dados pedem confirmação.";
+                : NextStepHint(diag!, db);
         }
-        else
+        else if (diag!.RecommendedAction == RecommendedActionKind.NoAction)
         {
             (s1, s2, s3) = (StepState.Done, StepState.Done, StepState.Done);
             hint = "Nenhuma ação necessária: o diagnóstico não encontrou nada a corrigir.";
             Step2LockedText.Text = "✔  Nada a corrigir neste banco.";
+        }
+        else
+        {
+            // Problema encontrado, mas sem correção automática nesta ferramenta (banco de sistema, só
+            // violação de CHECK...): o Passo 2 NÃO está concluído — depende de alguém.
+            (s1, s2, s3) = (StepState.Done, StepState.Active, StepState.Pending);
+            hint = db.IsSystemDatabase
+                ? "Banco de sistema com problema: a correção é manual. Clique em \"Ver procedimento manual\" e acione o DBA/suporte."
+                : "O diagnóstico encontrou um problema sem correção automática nesta ferramenta. Leia o resultado no Passo 1 e acione o DBA/suporte.";
+            Step2LockedText.Text = "⚠  Sem correção automática para este caso — veja o resultado do diagnóstico e acione o DBA/suporte.";
         }
 
         if (_busy)
@@ -2170,6 +2334,46 @@ public partial class MainWindow : Window
         RenderStep(Step3Circle, Step3Num, Step3Label, 3, s3);
     }
 
+    /// <summary>
+    /// "Próximo passo" com o NOME da opção recomendada: com vários cartões na tela (inclusive ajustes
+    /// opcionais), "comece pela primeira" levava ao cartão errado.
+    /// </summary>
+    private string NextStepHint(DiagnosisResult diag, DatabaseInfo db)
+    {
+        const string riskNote = " As opções estão em ordem de risco; as que podem perder dados pedem confirmação.";
+        if (_needsDataLossDecision)
+            return "O reparo sem perda não bastou. Se houver backup, prefira \"Restaurar de backup\". Sem backup, use " +
+                   "\"Simular antes\" e depois o \"Reparo com possível perda de dados\" (pede confirmação).";
+        // O modo seguro só aparece junto da reconstrução de índices depois que ela falhou (RunRebuildIndexesAsync).
+        if (SafeRepairPanel.Visibility == Visibility.Visible && diag.RecommendedAction == RecommendedActionKind.RebuildIndexesOnly)
+            return "A reconstrução de índices não bastou: o próximo passo é \"Reparo no modo seguro\" (sem perda de dados).";
+
+        return diag.RecommendedAction switch
+        {
+            RecommendedActionKind.FixAccess => "Comece por \"Acesso ao banco travado\": libera o acesso sem perda de dados.",
+            RecommendedActionKind.RebuildIndexesOnly => "Comece por \"Reconstruir índices\" (sem perda de dados)." + riskNote,
+            RecommendedActionKind.ResolveLogFull => "Comece por \"Log de transações cheio\" (sem perda de dados)." + riskNote,
+            RecommendedActionKind.FixFileAccess => "Comece por \"Arquivos do banco inacessíveis\" (sem perda de dados)." + riskNote,
+            RecommendedActionKind.FixConstraints when diag.ForeignKeyViolations.Count > 0
+                => "Recomendado: \"Integridade lógica: registros órfãos\" (os órfãos vão para a quarentena). Restaurar de backup é a alternativa.",
+            RecommendedActionKind.FixConstraints
+                => "Não há correção automática para violação de CHECK: revise os dados com o fornecedor/DBA ou use \"Restaurar de backup\".",
+            RecommendedActionKind.RestoreFromBackup
+                => "Recomendado: \"Restaurar de backup\". \"Reparo no modo seguro\" pode ser tentado antes (sem perda), mas raramente resolve corrupção de dados." + riskNote,
+            RecommendedActionKind.PageRestore
+                => "Recomendado: \"Restaurar de backup\" → \"Mais opções\" → \"Só as páginas afetadas\" (as páginas já vêm preenchidas)." + riskNote,
+            RecommendedActionKind.RebuildLog
+                => "Comece por \"Reparo no modo seguro\". \"Reconstruir o log\" é o último recurso." + riskNote,
+            RecommendedActionKind.FreeDiskSpace
+                => "Primeiro libere espaço no disco do banco (arquivos antigos, backups velhos); depois use \"Reparo no modo seguro\".",
+            RecommendedActionKind.SafeRepair when db.StateDesc.Trim().Equals("RECOVERING", StringComparison.OrdinalIgnoreCase)
+                => "O SQL Server está recuperando o banco sozinho: aguarde e diagnostique de novo. Use o reparo só se o andamento parar.",
+            _ when db.IsSystemDatabase
+                => "Banco de sistema: tente \"Reparo no modo seguro\"; se não bastar, siga o procedimento manual com o DBA.",
+            _ => "Comece por \"Reparo no modo seguro\" (sem perda de dados)." + riskNote
+        };
+    }
+
     private static void RenderStep(Border circle, TextBlock number, TextBlock label, int n, StepState state)
     {
         circle.SetResourceReference(Border.BackgroundProperty, state switch
@@ -2179,7 +2383,12 @@ public partial class MainWindow : Window
             _ => "LineBrush"
         });
         number.Text = state == StepState.Done ? "✓" : n.ToString();
-        number.SetResourceReference(TextBlock.ForegroundProperty, state == StepState.Pending ? "MutedTextBrush" : "CardBrush");
+        number.SetResourceReference(TextBlock.ForegroundProperty, state switch
+        {
+            StepState.Pending => "MutedTextBrush",
+            StepState.Active => "OnPrimaryBrush", // branco sobre o azul (contraste nos dois temas)
+            _ => "CardBrush"                       // sobre o verde OkForeBrush
+        });
         label.SetResourceReference(TextBlock.ForegroundProperty, state == StepState.Pending ? "MutedTextBrush" : "TextBrush");
         label.FontWeight = state == StepState.Active ? FontWeights.Bold : FontWeights.Normal;
     }
@@ -2195,6 +2404,11 @@ public partial class MainWindow : Window
         Grid.SetColumn(ResolveCard, narrow ? 0 : 2);
         Grid.SetColumnSpan(ResolveCard, narrow ? 3 : 1);
         ResolveCard.Margin = new Thickness(0, narrow ? 12 : 0, 0, 0);
+        // No cabeçalho, o indicador de passos (~330 px) espremia o estado do banco numa coluna estreita.
+        Grid.SetRow(StepIndicator, narrow ? 1 : 0);
+        Grid.SetColumn(StepIndicator, narrow ? 0 : 1);
+        StepIndicator.HorizontalAlignment = narrow ? HorizontalAlignment.Left : HorizontalAlignment.Stretch;
+        StepIndicator.Margin = narrow ? new Thickness(0, 12, 0, 0) : new Thickness(20, 2, 0, 0);
     }
 
     /// <summary>Ferramentas: lista e detalhe lado a lado; em painel estreito o detalhe desce para baixo da lista.</summary>

@@ -105,7 +105,7 @@ public sealed class RepairService
         result.Message = status switch
         {
             RepairStatus.Success => $"Reparo concluído com sucesso. Estado final: {finalState}.",
-            RepairStatus.NoActionNeeded => "O banco já está ONLINE; nenhuma ação foi necessária.",
+            RepairStatus.NoActionNeeded => "Nada a reparar: o DBCC CHECKDB e as chaves estrangeiras não acusaram erros. Nenhuma alteração foi feita.",
             RepairStatus.NeedsDataLossConfirmation =>
                 "O reparo SEM perda de dados não foi suficiente. É possível tentar o reparo COM possível perda de dados (requer confirmação).",
             _ => $"Não foi possível reparar automaticamente. Estado atual: {finalState}."
@@ -625,6 +625,18 @@ public sealed class RepairService
             ? " ATENÇÃO: " + d.Topology.Summary + " Reparos destrutivos/restore podem afetar essa configuração."
             : string.Empty;
 
+        // RECOVERING: é a recuperação AUTOMÁTICA do SQL Server em andamento (o CHECKDB nem roda). Sem
+        // evidência de corrupção, a orientação é esperar — não "sem evidências, a causa pode ser outra".
+        if (d.StateDesc.Trim().Equals("RECOVERING", StringComparison.OrdinalIgnoreCase)
+            && !d.DataCorruptionSuspected && !d.LogCorruptionSuspected)
+        {
+            d.RecommendedAction = RecommendedActionKind.SafeRepair;
+            d.Summary = "O SQL Server está recuperando o banco automaticamente (RECOVERING).";
+            d.Recommendation = "Aguarde a recuperação terminar" + (d.Recovery is not null ? $" (andamento: {d.Recovery.Display})" : string.Empty)
+                + " e diagnostique de novo. Só use 'Reparar (modo seguro)' se o andamento não mudar por muito tempo." + topoNote;
+            return;
+        }
+
         // 0) O SQL Server não consegue ABRIR arquivos do banco (ausente/sem permissão/preso) — não é
         //    corrupção, e nenhum reparo de DBCC resolveria. Tem prioridade: com os arquivos inacessíveis
         //    o CHECKDB nem roda, e as demais evidências ficam enviesadas.
@@ -637,7 +649,7 @@ public sealed class RepairService
             d.Summary = "O SQL Server não consegue abrir arquivo(s) do banco — isso NÃO é corrupção.";
             d.Recommendation =
                 (missing > 0 ? $"{missing} arquivo(s) ausente(s): use 'Localizar arquivo' para apontar onde ele está agora (ex.: disco/letra trocados). " : "") +
-                (denied > 0 ? $"{denied} arquivo(s) sem permissão: 'Corrigir acesso e religar' concede acesso à conta do SQL Server. " : "") +
+                (denied > 0 ? $"{denied} arquivo(s) sem permissão: 'Corrigir acesso e religar' concede acesso à conta do SQL Server (exige executar a ferramenta como Administrador no servidor; sem isso, os comandos aparecem no registro). " : "") +
                 (locked > 0 ? $"{locked} arquivo(s) preso(s) por outro processo: feche antivírus/backup de arquivos/cópias e religue. " : "") +
                 "Nenhum dado é perdido." + topoNote;
             return;
@@ -660,10 +672,12 @@ public sealed class RepairService
             var fk = d.ForeignKeyViolations.Count;
             d.RecommendedAction = RecommendedActionKind.FixConstraints;
             d.Summary = "Integridade LÓGICA comprometida: há violações de constraint (arquivos físicos íntegros).";
+            // A correção tenta recuperar o pai do backup e MOVE o que sobrar para a quarentena (reversível) —
+            // ver ReconcileForeignKeyOrphansAsync. Restaurar de backup desfaz o que foi gravado depois dele.
             d.Recommendation = (fk > 0
-                ? $"Há {fk} violação(ões) de chave estrangeira (registros órfãos). Use 'Corrigir integridade (remover registros órfãos)' — operação destrutiva, com backup de segurança antes. "
-                : "Há violações de CHECK e/ou inconsistências de catálogo; revise os dados. ")
-                + "Para preservar 100% dos registros, prefira RESTAURAR de backup." + topoNote;
+                ? $"Há {fk} violação(ões) de chave estrangeira (registros órfãos). Use 'Corrigir integridade': tenta recuperar o registro-pai do backup e o que sobrar sai da tabela para a QUARENTENA (banco {AppConstants.QuarantineDatabaseName}), de onde pode ser devolvido. "
+                : "Há violações de CHECK e/ou inconsistências de catálogo: não há correção automática — revise os dados com o fornecedor do sistema/DBA. ")
+                + "Alternativa: RESTAURAR de backup (desfaz o que foi gravado depois do backup, se a cadeia de logs não cobrir)." + topoNote;
             return;
         }
 
@@ -696,7 +710,11 @@ public sealed class RepairService
         {
             d.RecommendedAction = RecommendedActionKind.RebuildLog;
             d.Summary = "Os arquivos de DADOS parecem íntegros e o LOG de transações (.ldf) apresenta corrupção.";
-            d.Recommendation = "Reconstruir o log: 'reparo COM perda de dados' (reconstrói o log no servidor, sem Administrador) ou a opção 'Reconstruir log'. Os dados devem ser preservados." + topoNote;
+            // O modo seguro (SET ONLINE / REPAIR_REBUILD) não recria log; quem o recria é o REPAIR_ALLOW_DATA_LOSS
+            // em EMERGENCY, oferecido depois que o modo seguro não basta, ou o detach/attach do último recurso.
+            d.Recommendation = "Comece por 'Reparar (modo seguro)'. Se não bastar, a ferramenta oferece o reparo COM possível perda de dados, que reconstrói o log no próprio servidor; " +
+                "'Reconstruir o log' (último recurso) exige Administrador no servidor. Os dados já gravados nos arquivos de dados costumam ser preservados, " +
+                "mas as transações que estavam em andamento no log se perdem." + topoNote;
             return;
         }
 
@@ -2204,8 +2222,10 @@ public sealed class RepairService
             }
             if (!report.AllErrorsAreNonClusteredIndex)
             {
-                result.Status = RepairStatus.NeedsDataLossConfirmation;
-                result.Message = "A corrupção NÃO está restrita a índices não-clusterizados. Use o reparo padrão (e, se necessário, RESTAURAR de backup).";
+                // Failed, não NeedsDataLossConfirmation: o modo seguro (REPAIR_REBUILD) ainda nem foi tentado — a UI
+                // não pode saltar direto para a confirmação do reparo COM perda.
+                result.Status = RepairStatus.Failed;
+                result.Message = "A corrupção NÃO está restrita a índices não-clusterizados: reconstruir índices não resolve. Use 'Reparar (modo seguro)' e, se não bastar, RESTAURE de backup.";
                 Report(progress, db.Name, RepairLogLevel.Warning, result.Message);
                 return result;
             }
@@ -2222,7 +2242,7 @@ public sealed class RepairService
             }
             else
             {
-                result.Message = "A reconstrução de índices não eliminou todas as inconsistências. Considere o reparo padrão.";
+                result.Message = "A reconstrução de índices não eliminou todas as inconsistências. Use 'Reparar (modo seguro)'.";
                 Report(progress, db.Name, RepairLogLevel.Warning, result.Message);
             }
             return result;
@@ -2785,6 +2805,17 @@ public sealed class RepairService
 
         switch (db.StateDesc.Trim().ToUpperInvariant())
         {
+            case "ONLINE":
+                // Espelha OnlineRepairFlowAsync: um banco ONLINE pode ter corrupção que o estado não mostra.
+                sb.AppendLine($"DBCC CHECKDB ({n}) WITH NO_INFOMSGS, ALL_ERRORMSGS;   -- decide: sem erros = nada a fazer");
+                sb.AppendLine($"ALTER DATABASE {n} SET SINGLE_USER WITH ROLLBACK IMMEDIATE; -- desconecta quem estiver usando");
+                sb.AppendLine("-- Se a corrupção estiver só em índices não-clusterizados: ALTER INDEX <índice> ON <tabela> REBUILD;");
+                sb.AppendLine($"DBCC CHECKDB ({n}, REPAIR_REBUILD) WITH ALL_ERRORMSGS;  -- SEM perda de dados");
+                sb.AppendLine($"DBCC CHECKDB ({n}) WITH NO_INFOMSGS, ALL_ERRORMSGS;     -- verificação");
+                if (allowDataLoss)
+                    AppendDataLossSteps(sb, db, n, emergency: false);
+                sb.AppendLine($"ALTER DATABASE {n} SET MULTI_USER;");
+                break;
             case "OFFLINE":
                 sb.AppendLine($"ALTER DATABASE {n} SET ONLINE;");
                 sb.AppendLine($"ALTER DATABASE {n} SET MULTI_USER;");
@@ -2806,24 +2837,33 @@ public sealed class RepairService
                 sb.AppendLine($"DBCC CHECKDB ({n}, REPAIR_REBUILD) WITH ALL_ERRORMSGS;  -- SEM perda de dados");
                 sb.AppendLine($"DBCC CHECKDB ({n}) WITH NO_INFOMSGS, ALL_ERRORMSGS;     -- verificação");
                 if (allowDataLoss)
-                {
-                    sb.AppendLine();
-                    sb.AppendLine("/* DESTRUTIVO — somente com confirmação explícita: */");
-                    sb.AppendLine($"BACKUP LOG {n} TO DISK = N'{AppConstants.SanitizeToken(db.Name, "banco")}_tail.trn' WITH NO_TRUNCATE, CONTINUE_AFTER_ERROR, INIT; -- preserva o tail-log (modelo FULL)");
-                    sb.AppendLine($"ALTER DATABASE {n} SET EMERGENCY;");
-                    sb.AppendLine($"ALTER DATABASE {n} SET SINGLE_USER WITH ROLLBACK IMMEDIATE;");
-                    sb.AppendLine($"DBCC CHECKDB ({n}, REPAIR_ALLOW_DATA_LOSS) WITH ALL_ERRORMSGS;");
-                    sb.AppendLine($"DBCC CHECKDB ({n}) WITH NO_INFOMSGS, ALL_ERRORMSGS;");
-                    sb.AppendLine($"/* Após o reparo destrutivo, a cadeia de backups anterior deixa de ser confiável: */");
-                    sb.AppendLine($"BACKUP DATABASE {n} TO DISK = N'{AppConstants.SanitizeToken(db.Name, "banco")}_PosReparo.bak' WITH INIT;");
-                }
+                    AppendDataLossSteps(sb, db, n, emergency: true);
                 sb.AppendLine($"ALTER DATABASE {n} SET MULTI_USER;");
                 break;
             default:
-                sb.AppendLine("-- Estado saudável ou não problemático: nenhuma ação planejada.");
+                sb.AppendLine("-- Estado sem reparo automático planejado (ex.: desconhecido): avalie manualmente.");
                 break;
         }
         return sb.ToString();
+    }
+
+    /// <summary>Parte destrutiva do script planejado: rede de segurança (TrySafetyNetAsync) + REPAIR_ALLOW_DATA_LOSS.</summary>
+    private static void AppendDataLossSteps(StringBuilder sb, DatabaseInfo db, string n, bool emergency)
+    {
+        var token = AppConstants.SanitizeToken(db.Name, "banco");
+        sb.AppendLine();
+        sb.AppendLine("/* DESTRUTIVO — somente com confirmação explícita: */");
+        if (emergency)
+        {
+            sb.AppendLine($"ALTER DATABASE {n} SET EMERGENCY;");
+            sb.AppendLine($"ALTER DATABASE {n} SET SINGLE_USER WITH ROLLBACK IMMEDIATE;");
+        }
+        sb.AppendLine($"BACKUP LOG {n} TO DISK = N'{token}_tail.trn' WITH NO_TRUNCATE, CONTINUE_AFTER_ERROR, INIT; -- preserva o tail-log (modelo FULL)");
+        sb.AppendLine($"BACKUP DATABASE {n} TO DISK = N'{token}_RestoreDB.bak' WITH COPY_ONLY, INIT, CONTINUE_AFTER_ERROR; -- backup de segurança (tentativa)");
+        sb.AppendLine($"DBCC CHECKDB ({n}, REPAIR_ALLOW_DATA_LOSS) WITH ALL_ERRORMSGS;");
+        sb.AppendLine($"DBCC CHECKDB ({n}) WITH NO_INFOMSGS, ALL_ERRORMSGS;");
+        sb.AppendLine("/* Se a verificação ficar limpa: a cadeia de backups anterior deixa de ser confiável — backup FULL novo: */");
+        sb.AppendLine($"BACKUP DATABASE {n} TO DISK = N'{token}_PosReparo.bak' WITH INIT;");
     }
 
     private async Task TryBackupAsync(SqlSession s, DatabaseInfo db, IProgress<RepairLogEntry> p, CancellationToken ct)
