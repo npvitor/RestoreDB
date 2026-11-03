@@ -299,4 +299,6 @@ problemáticos, bancos de sistema) ficam em
 
 ## Licença
 
-Ainda não definida. Até um arquivo `LICENSE` ser adicionado, todos os direitos são reservados ao autor.
+[MIT](LICENSE) — uso, modificação e redistribuição livres, inclusive comercial, mantendo o aviso de
+copyright. O software é fornecido **sem garantia** (*"AS IS"*): leia [Segurança e limites](#segurança-e-limites)
+antes de usá-lo em bancos de produção.

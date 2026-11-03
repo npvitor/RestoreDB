@@ -17,6 +17,7 @@
     <Version>1.0.0</Version>
     <Product>RestoreDB</Product>
     <Company>RestoreDB</Company>
+    <Copyright>Copyright (c) 2026 Antonio Vitor — Licença MIT</Copyright>
     <AssemblyTitle>RestoreDB — Diagnóstico e reparo de bancos SQL Server</AssemblyTitle>
     <Description>Diagnóstico e reparo guiado de bancos SQL Server (2008 R2 a 2025) para equipes de suporte.</Description>
   </PropertyGroup>
