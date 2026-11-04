@@ -124,6 +124,89 @@
                     </Setter.Value>
                 </Setter>
             </Style>
+            <!-- Abas do fluxo (1 Diagnosticar, 2 Resolver, 3 Conferir, Ferramentas): só uma selecionada.
+                 A cor do círculo (feito/atual/pendente) vem do código (RenderStep); aqui só a aba vista
+                 (fundo destacado) e a bloqueada (esmaecida, sem mãozinha). -->
+            <!-- Contorno de foco das abas: o WPF só o mostra na navegação por teclado (Tab/setas), não no clique -->
+            <Style x:Key="FlowTabFocusVisual">
+                <Setter Property="Control.Template">
+                    <Setter.Value>
+                        <ControlTemplate>
+                            <Border CornerRadius="6" BorderThickness="2" BorderBrush="{DynamicResource PrimaryBrush}" />
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+            <Style x:Key="FlowTab" TargetType="RadioButton">
+                <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
+                <Setter Property="Cursor" Value="Hand" />
+                <Setter Property="FocusVisualStyle" Value="{StaticResource FlowTabFocusVisual}" />
+                <Setter Property="ToolTipService.ShowOnDisabled" Value="True" />
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="RadioButton">
+                            <Grid x:Name="root">
+                                <Border x:Name="bd" Background="Transparent" CornerRadius="6" Padding="12,9,14,9">
+                                    <ContentPresenter VerticalAlignment="Center" />
+                                </Border>
+                            </Grid>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter TargetName="bd" Property="Background" Value="{DynamicResource SecondaryHoverBrush}" />
+                                </Trigger>
+                                <Trigger Property="IsChecked" Value="True">
+                                    <Setter TargetName="bd" Property="Background" Value="{DynamicResource SelectionBrush}" />
+                                </Trigger>
+                                <MultiTrigger>
+                                    <MultiTrigger.Conditions>
+                                        <Condition Property="IsEnabled" Value="False" />
+                                        <Condition Property="IsChecked" Value="False" />
+                                    </MultiTrigger.Conditions>
+                                    <Setter TargetName="root" Property="Opacity" Value="0.55" />
+                                </MultiTrigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+                <Style.Triggers>
+                    <Trigger Property="IsEnabled" Value="False">
+                        <Setter Property="Cursor" Value="Arrow" />
+                    </Trigger>
+                </Style.Triggers>
+            </Style>
+            <!-- Botão só com ícone (fechar, etc.): sem moldura, destaca ao passar o mouse -->
+            <Style x:Key="IconButton" TargetType="Button">
+                <Setter Property="Foreground" Value="{DynamicResource MutedTextBrush}" />
+                <Setter Property="FontSize" Value="12" />
+                <Setter Property="Cursor" Value="Hand" />
+                <Setter Property="Width" Value="26" />
+                <Setter Property="Height" Value="26" />
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="Button">
+                            <Border x:Name="bd" Background="Transparent" CornerRadius="4">
+                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                            </Border>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter TargetName="bd" Property="Background" Value="{DynamicResource SecondaryHoverBrush}" />
+                                    <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+
+            <!-- Ligação entre as abas do fluxo (fica verde quando o passo anterior termina) -->
+            <Style x:Key="StepConnector" TargetType="Rectangle">
+                <Setter Property="Height" Value="2" />
+                <Setter Property="MinWidth" Value="12" />
+                <Setter Property="Margin" Value="4,0" />
+                <Setter Property="VerticalAlignment" Value="Center" />
+                <Setter Property="Fill" Value="{DynamicResource LineBrush}" />
+            </Style>
+
             <Style x:Key="ToolTitle" TargetType="TextBlock">
                 <Setter Property="FontSize" Value="14" />
                 <Setter Property="FontWeight" Value="SemiBold" />

@@ -50,29 +50,46 @@ principal tem cinco áreas:
 │ RestoreDB · Servidor / versão / sysadmin     [⟳ Atualizar lista] [📎 Anexar .mdf]    │
 │                                              [Trocar conexão] [🌙 Tema escuro]       │
 ├───────────────────┬──────────────────────────────────────────────────────────────────┤
-│ Bancos de dados   │  Banco selecionado · estado · ① Diagnosticar ② Resolver ③ Conferir│
-│ 🔍 Filtrar...     │  PRÓXIMO PASSO: o que fazer agora                                 │
-│ ─────────────     │ ┌──── 1 Diagnosticar ─────┐ ┌──── 2 Resolver ──────────────────┐ │
-│ Banco    Estado   │ │ 🔍 Diagnosticar (sem    │ │ Risco: SEM PERDA → QUARENTENA →  │ │
-│ (vermelho =       │ │    alterar o banco)     │ │  RESTAURA BACKUP → PODE PERDER   │ │
-│  problema,        │ │ Resultado do diagnóstico│ │ Cartões das opções que se aplicam│ │
-│  amarelo =        │ └─────────────────────────┘ └──────────────────────────────────┘ │
-│  travado)         │ Ferramentas adicionais: lista à esquerda, detalhe à direita       │
+│ Bancos de dados   │ Banco selecionado  [ESTADO]  situação em uma frase               │
+│ 🔍 Filtrar...     │ PRÓXIMO PASSO: o que fazer agora                                 │
+│ ─────────────     │ ──────────────────────────────────────────────────────────────── │
+│ Banco    Estado   │ (✔ Diagnosticar)──(2 Resolver)──(3 Conferir) │ Ferramentas adic. │
+│                   │ ✔ Resultado da última operação                               [✕] │
+│                   │ ┌──────────────────────────────────────────────────────────────┐ │
+│                   │ │ Conteúdo da aba selecionada (uma aba por vez)                │ │
+│ ■ Problema        │ │                                                              │ │
+│ ■ Travado         │ └──────────────────────────────────────────────────────────────┘ │
 ├───────────────────┴──────────────────────────────────────────────────────────────────┤
-│ Registro de operações — cada comando executado        [Exportar relatório] [Limpar] │
+│ Registro de operações — cada comando executado         [Exportar relatório] [Limpar] │
 ├──────────────────────────────────────────────────────────────────────────────────────┤
-│ Barra de status · [■ Cancelar operação] · caminho do arquivo de log                  │
+│ Barra de status · [■ Cancelar operação] · Log: repair-AAAAMMDD.log (abre a pasta)    │
 └──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 - **Lista de bancos** (esquerda): todos os bancos da instância com o estado. Linhas em vermelho
   estão em estado problemático; em amarelo, estão `ONLINE` mas travados (acesso restrito ou
-  somente leitura). Um banco `ONLINE` também pode ter corrupção — só o diagnóstico revela.
-- **Passo 1 — Diagnosticar**: verificação completa e somente leitura.
-- **Passo 2 — Resolver**: só aparece depois do diagnóstico, com as opções aplicáveis.
-- **Passo 3 — Conferir**: depois de uma correção, a ferramenta pede um novo diagnóstico.
-- **Ferramentas adicionais**: verificar uma tabela, manutenção preventiva, verificação em partes
-  e recuperação de exclusão acidental — independentes do fluxo de reparo.
+  somente leitura) — a legenda fica embaixo da lista. Um banco `ONLINE` também pode ter
+  corrupção — só o diagnóstico revela.
+- **Cabeçalho do banco**: estado, a situação em uma frase e a faixa **PRÓXIMO PASSO**, que diz o
+  que fazer agora. Fica visível em qualquer aba.
+- **Abas do fluxo**, liberadas em sequência como um rastreio de entrega (✔ verde = concluída,
+  azul = etapa atual, cinza = ainda bloqueada; a linha entre elas fica verde conforme o fluxo
+  avança):
+  - **1 — Diagnosticar**: verificação completa e somente leitura. Liberada ao selecionar um banco.
+  - **2 — Resolver**: liberada depois do diagnóstico, com as opções aplicáveis. Ao fim do
+    diagnóstico a ferramenta abre essa aba sozinha (com aviso de topologia, fica na aba 1 para ele
+    ser lido).
+  - **3 — Conferir**: liberada depois de uma correção bem-sucedida (ou quando não há nada a
+    corrigir); a ferramenta abre essa aba sozinha e pede um novo diagnóstico.
+  - Abas já liberadas podem ser revisitadas a qualquer momento. Trocar de banco volta à aba 1;
+    durante uma operação não dá para trocar de aba nem de banco.
+- **Ferramentas adicionais** (aba à direita, fora da sequência): verificar uma tabela, manutenção
+  preventiva, verificação em partes e recuperação de exclusão acidental — independentes do fluxo de
+  reparo e liberadas sempre que houver um banco selecionado.
+- **Resultado da última operação**: faixa acima do conteúdo, com a cor do desfecho; o **✕** fecha.
+  Some sozinha quando um novo diagnóstico começa.
+- **Barra de status**: andamento, **■ Cancelar operação** (só durante uma operação) e o nome do
+  arquivo de log — clique nele para abrir a pasta.
 - **Tema claro/escuro**: segue o tema do Windows ao abrir; alterna pelo botão do cabeçalho.
 
 ## O que a ferramenta faz

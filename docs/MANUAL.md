@@ -7,7 +7,7 @@ cada situação, o que cada botão faz e qual o risco. Os nomes entre aspas são
 aparecem na tela.
 
 > **Regra de ouro:** comece sempre pelo **Diagnosticar** (não altera nada) e siga as opções **de
-> cima para baixo** no Passo 2 — elas estão em ordem de risco. Se ficar em dúvida diante de uma
+> cima para baixo** na aba **Resolver** (Passo 2) — elas estão em ordem de risco. Se ficar em dúvida diante de uma
 > opção vermelha, **pare e chame o DBA**: esperar não piora o banco; uma decisão errada pode piorar.
 
 ---
@@ -70,17 +70,29 @@ a cada abertura.
   **"⟳ Atualizar lista"**, **"📎 Anexar .mdf"**, **"Trocar conexão"** e **"🌙 Tema escuro"** /
   **"☀ Tema claro"**.
 - **Bancos de dados (esquerda):** a lista de bancos com o **Estado**. Use **"🔍 Filtrar por
-  nome..."** para achar um banco.
-  - **Vermelho** = estado problemático (fora do ar ou em recuperação).
-  - **Amarelo** = `ONLINE`, mas travado (acesso restrito ou somente leitura).
+  nome..."** para achar um banco. A legenda fica embaixo da lista (passe o mouse para ver a
+  explicação):
+  - **Problema** (linha vermelha) = estado problemático (fora do ar ou em recuperação).
+  - **Travado** (linha amarela) = `ONLINE`, mas com acesso restrito ou somente leitura.
   - Um banco sem cor pode, mesmo assim, ter corrupção — **só o diagnóstico mostra**.
-- **Centro:** o banco selecionado, o indicador **Diagnosticar → Resolver → Conferir** e a faixa
-  **"PRÓXIMO PASSO"**, que diz o que fazer agora. Abaixo, **"RESULTADO DA ÚLTIMA OPERAÇÃO"** (verde
-  = deu certo, amarelo = atenção, vermelho = falhou), os cartões do **Passo 1** e do **Passo 2** e as
-  **Ferramentas adicionais**.
+- **Cabeçalho do banco (direita, em cima):** o nome do banco, o **estado**, a situação em uma frase
+  e a faixa **"PRÓXIMO PASSO"**, que diz o que fazer agora. Aparece igual em todas as abas.
+- **Abas:** logo abaixo do cabeçalho ficam as abas **"1 Diagnosticar"**, **"2 Resolver"** e
+  **"3 Conferir"**, ligadas por uma linha, e, separada à direita, **"Ferramentas adicionais"**. Só o
+  conteúdo da aba escolhida aparece embaixo. Funcionam como um rastreio de entrega:
+  - círculo **verde com ✔** = passo concluído (a linha até o próximo também fica verde);
+  - círculo **azul** = o passo em que você está;
+  - aba **apagada** = ainda bloqueada. Passe o mouse para ver quando ela é liberada.
+
+  As abas do fluxo são liberadas uma de cada vez (veja a seção 5). **"Ferramentas adicionais"**
+  fica liberada sempre que houver um banco selecionado. Você pode voltar a uma aba já liberada a
+  qualquer momento — por exemplo, para reler o diagnóstico.
+- **Resultado da última operação:** uma faixa acima do conteúdo das abas, com ✔ (verde, deu certo),
+  ⚠ (amarelo, atenção) ou ✖ (vermelho, falhou). O **✕** à direita fecha a faixa; ela também some
+  quando um novo diagnóstico começa.
 - **Registro de operações (embaixo):** cada comando executado, em tempo real.
 - **Barra de status:** o que está acontecendo, o botão **"■ Cancelar operação"** (só durante uma
-  operação) e o caminho do arquivo de log.
+  operação) e o nome do arquivo de log — clique nele (ou use Tab + Enter) para abrir a pasta do log.
 
 ## 4. O que significam os estados
 
@@ -99,30 +111,39 @@ sistema fica de fora), `RESTRICTED_USER` (só administradores) e somente leitura
 
 ## 5. O fluxo em três passos
 
+Cada passo tem a sua aba. A ferramenta libera a próxima aba quando faz sentido e **muda de aba
+sozinha** ao fim de cada etapa. Ao trocar de banco na lista, o fluxo recomeça na aba 1. Durante uma
+operação, não dá para trocar de aba nem de banco — espere terminar ou use **"■ Cancelar operação"**.
+
 ### Passo 1 — Diagnosticar
 
-1. Selecione o banco na lista.
+1. Selecione o banco na lista. A aba **"1 Diagnosticar"** abre.
 2. Clique em **"🔍 Diagnosticar (sem alterar o banco)"**. Em bancos muito grandes, você pode marcar
-   **"Verificação rápida (PHYSICAL_ONLY) — para bancos muito grandes"**: é mais rápida, mas não
-   confere os valores das colunas.
+   **"Verificação rápida (PHYSICAL_ONLY) — para bancos muito grandes"**: é mais rápida, mas faz só a
+   checagem física das páginas (sem as checagens lógicas do `CHECKDB` e sem conferir os valores das
+   colunas). A checagem de registros órfãos roda mesmo assim.
 3. Acompanhe no **Registro de operações**. Bancos grandes podem levar muitos minutos.
-4. Leia o **"RESULTADO DO DIAGNÓSTICO"**: o resumo, a ação recomendada (linha que começa com `→` ou
-   `✔`) e a explicação. Se houver **"⚠ NOVO desde a última verificação"**, é algo que não existia no
-   diagnóstico anterior. **"POLÍTICA DE BACKUP / SAÚDE LÓGICA"** lista riscos de backup e sinais de
-   problema de hardware.
+4. Ao terminar, a ferramenta marca ✔ no Passo 1 e **abre a aba "2 Resolver"**. O resultado continua
+   na aba **"1 Diagnosticar"** — clique nela para ler o **"RESULTADO DO DIAGNÓSTICO"**: o resumo, a
+   ação recomendada (linha que começa com `→` ou `✔`) e a explicação. Se houver **"⚠ NOVO desde a
+   última verificação"**, é algo que não existia no diagnóstico anterior. **"POLÍTICA DE BACKUP /
+   SAÚDE LÓGICA"** lista riscos de backup e sinais de problema de hardware.
 
 O diagnóstico não altera o banco. A única coisa que ele limpa é o histórico antigo de páginas
 suspeitas do `msdb`, quando confirma que aquela corrupção já foi resolvida.
 
 Se aparecer **"⚠ TOPOLOGIA DE ALTA DISPONIBILIDADE / REPLICAÇÃO"**, o banco participa de
-espelhamento, Always On, log shipping ou replicação: os reparos ficam bloqueados. **Chame o DBA.**
+espelhamento, Always On, log shipping ou replicação: os reparos ficam bloqueados. Nesse caso a
+ferramenta **fica na aba 1** para você ler o aviso. **Chame o DBA.**
 
-Se o diagnóstico **não terminar** (erro ou cancelamento), a ferramenta não mostra correções.
-Veja o motivo no registro e clique em **"Diagnosticar novamente (sem alterar o banco)"**.
+Se o diagnóstico **não terminar** (erro ou cancelamento), a ferramenta não mostra correções e fica
+na aba 1. Veja o motivo no registro e clique em **"Diagnosticar novamente (sem alterar o banco)"**.
 
 ### Passo 2 — Resolver
 
-Só aparecem as opções que se aplicam. Cada cartão tem uma etiqueta de risco:
+A aba **"2 Resolver"** é liberada depois do diagnóstico. Só aparecem as opções que se aplicam. Se
+não houver nada a corrigir, ela mostra **"✔ Nada a corrigir neste banco."** e o fluxo já fica todo
+concluído. Cada cartão tem uma etiqueta de risco:
 
 - **SEM PERDA DE DADOS** (verde) — pode usar.
 - **MOVE REGISTROS PARA A QUARENTENA** (amarelo) — tira linhas da tabela, mas guarda.
@@ -134,9 +155,20 @@ Siga a faixa **"PRÓXIMO PASSO"**: ela diz o nome do cartão por onde começar.
 
 ### Passo 3 — Conferir
 
-Depois de uma correção que deu certo, o indicador marca os passos 1 e 2 como concluídos e pede o
-Passo 3: clique de novo em **"Diagnosticar novamente (sem alterar o banco)"**. Só o novo diagnóstico
-confirma que o banco ficou íntegro. Se aparecer outro problema, siga as novas opções.
+Depois de uma correção que deu certo, a ferramenta marca ✔ nos passos 1 e 2 e **abre a aba
+"3 Conferir"**. Clique em **"🔍 Diagnosticar novamente (sem alterar o banco)"** ali mesmo: só o novo
+diagnóstico confirma que o banco ficou íntegro.
+
+- Se estiver tudo certo, a aba continua aberta e mostra **"✔ Conferido"**, com os três passos em
+  verde.
+- Se aparecer outro problema, a ferramenta volta para a aba **"2 Resolver"** com as novas opções.
+- Se a **verificação rápida** estiver marcada na aba 1, a conferência também será parcial: a aba
+  avisa em amarelo. Para a conferência completa, desmarque a verificação rápida e diagnostique de
+  novo.
+- Se a correção deixou uma cópia de salvamento com linhas a devolver, a ferramenta abre a aba
+  **"2 Resolver"** no **Assistente de salvamento** em vez da aba Conferir.
+
+A aba Conferir também é liberada quando o primeiro diagnóstico já não encontra nada a corrigir.
 
 ## 6. As opções do Passo 2, uma a uma
 
@@ -371,9 +403,14 @@ restauração são manuais: clique em **"Ver procedimento manual"** e acione o D
 
 ## 8. Ferramentas adicionais
 
-Ficam embaixo do fluxo, com a lista à esquerda e a ferramenta escolhida à direita (em janelas
-estreitas, o detalhe desce para baixo da lista). São independentes do Passo 2: usar uma delas não
-conclui o fluxo de correção.
+Ficam na aba **"Ferramentas adicionais"**, à direita das abas do fluxo, liberada sempre que houver
+um banco selecionado — não depende do diagnóstico. Dentro dela, a lista de ferramentas fica à
+esquerda e a ferramenta escolhida à direita (em janelas estreitas, o detalhe desce para baixo da
+lista). São independentes do Passo 2: usar uma delas não conclui o fluxo de correção.
+
+Quando uma ferramenta altera o banco (por exemplo, devolver linhas excluídas), você **continua nesta
+aba** e os círculos dos passos se atualizam. A exceção é quando sobra uma cópia com linhas a
+devolver: aí a ferramenta abre a aba **"2 Resolver"** no **Assistente de salvamento**.
 
 ### 8.1. Verificar uma tabela
 
@@ -440,6 +477,7 @@ Depois, diagnostique o banco anexado.
 - **"Exportar relatório":** salva o registro da sessão num arquivo HTML — anexe ao chamado.
 - **"■ Cancelar operação":** interrompe a operação em andamento. A ferramenta tenta deixar o banco
   em modo normal ao parar. Espere a mensagem "Operação cancelada." antes de fazer outra coisa.
+  Enquanto uma operação roda, as abas e a lista de bancos ficam bloqueadas.
 - **Não feche a janela no meio de uma operação.** A ferramenta pergunta antes; fechar pode deixar o
   banco travado em `SINGLE_USER` ou num estado intermediário. Se isso acontecer, diagnostique de
   novo e use **Acesso ao banco travado**.
@@ -502,7 +540,7 @@ Seja transparente com o cliente:
 
 | Onde | O quê |
 |---|---|
-| `%LOCALAPPDATA%\RestoreDB\Logs\repair-AAAAMMDD.log` | Log de cada comando (o caminho aparece na barra de status). |
+| `%LOCALAPPDATA%\RestoreDB\Logs\repair-AAAAMMDD.log` | Log de cada comando (o nome aparece na barra de status; clique nele para abrir a pasta). |
 | `%LOCALAPPDATA%\RestoreDB\History\` | Histórico dos diagnósticos (para mostrar o que é novo). |
 | `%LOCALAPPDATA%\RestoreDB\IncrementalCheck\` | Progresso da verificação em partes. |
 | `%LOCALAPPDATA%\RestoreDB\Alerts\` | Alertas da verificação agendada. |

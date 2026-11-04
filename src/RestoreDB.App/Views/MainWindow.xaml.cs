@@ -56,6 +56,31 @@ public partial class MainWindow : Window
     /// <summary>O último diagnóstico não terminou (erro ou cancelamento): não há conclusão em que basear as opções.</summary>
     private bool _diagnosisFailed;
 
+    /// <summary>Abas da área direita: as três do fluxo (liberadas em sequência) e as ferramentas adicionais.</summary>
+    private enum FlowTab { Diagnose, Resolve, Confirm, Tools }
+
+    /// <summary>
+    /// Aba para onde o fluxo avança quando a operação em andamento terminar (diagnóstico → Resolver,
+    /// correção → Conferir). Aplicada em <see cref="UpdateFlowState"/> assim que a tela sai do modo ocupado.
+    /// Definida só por <see cref="RequestTab"/>.
+    /// </summary>
+    private FlowTab? _pendingTab;
+
+    /// <summary>
+    /// O avanço vale mesmo para quem está nas Ferramentas (por padrão, quem lançou uma operação de lá
+    /// continua lá). Ex.: sobrou uma cópia de salvamento — o próximo passo é o assistente, na aba Resolver.
+    /// </summary>
+    private bool _pendingTabEvenFromTools;
+
+    /// <summary>As abas na ordem de <see cref="FlowTab"/> (índice = valor do enum).</summary>
+    private readonly RadioButton[] _flowTabs;
+
+    /// <summary>Tooltips originais das abas (explicam quando cada uma libera); trocados durante uma operação.</summary>
+    private readonly Dictionary<RadioButton, object> _flowTabTips;
+
+    /// <summary>O último diagnóstico concluído foi a verificação rápida (só estrutura física).</summary>
+    private bool _lastCheckPhysicalOnly;
+
     /// <summary>Novos caminhos escolhidos pelo usuário para arquivos ausentes (nome lógico → caminho).</summary>
     private readonly Dictionary<string, string> _fileRelocations = new(StringComparer.OrdinalIgnoreCase);
 
@@ -88,7 +113,12 @@ public partial class MainWindow : Window
             ? $"   •   {_serverInfo.Edition} {_serverInfo.ProductVersion}   •   {(_serverInfo.IsSysadmin ? "sysadmin" : "SEM sysadmin")}"
             : string.Empty;
         ServerInfoText.Text = $"Servidor: {serverName}   •   Catálogo: master{caps}";
-        LogPathText.Text = "Log: " + _logService.LogFilePath;
+        // Só o nome do arquivo na barra; o caminho completo no tooltip (clique abre a pasta).
+        LogPathRun.Text = "Log: " + Path.GetFileName(_logService.LogFilePath);
+        LogPathLink.ToolTip = _logService.LogFilePath + "\nClique (ou Enter) para abrir a pasta do log.";
+
+        _flowTabs = new[] { TabDiagnose, TabResolve, TabConfirm, TabTools };
+        _flowTabTips = _flowTabs.ToDictionary(t => t, t => t.ToolTip);
 
         Loaded += async (_, _) => await LoadDatabasesAsync();
     }
@@ -241,16 +271,24 @@ public partial class MainWindow : Window
         {
             NoSelectionPanel.Visibility = Visibility.Visible;
             DetailsPanel.Visibility = Visibility.Collapsed;
+            DbHeaderPanel.Visibility = Visibility.Collapsed;
+            _pendingTab = null;
+            UpdateFlowState(); // sem banco: todas as abas bloqueadas
             return;
         }
 
         NoSelectionPanel.Visibility = Visibility.Collapsed;
         DetailsPanel.Visibility = Visibility.Visible;
+        DbHeaderPanel.Visibility = Visibility.Visible;
 
         RefreshStateLabels(db);
 
         if (resetActions)
         {
+            // Outro banco: o fluxo recomeça na aba 1 (diagnóstico e opções valem para um banco só).
+            _pendingTab = null;
+            _lastCheckPhysicalOnly = false;
+            TabDiagnose.IsChecked = true;
             ResultPanel.Visibility = Visibility.Collapsed;
             DataLossPanel.Visibility = Visibility.Collapsed;
             DataLossConfirmCheck.IsChecked = false;
@@ -344,28 +382,14 @@ public partial class MainWindow : Window
             StateFriendlyText.Text = readOnlyOnly
                 ? "Disponível, mas SOMENTE LEITURA: o sistema não consegue gravar."
                 : $"Disponível, mas TRAVADO ({db.UserAccess}): o sistema não consegue usar o banco normalmente.";
-            // Já diagnosticado: o rótulo aponta a ação concluída (ex.: liberar acesso), não "diagnostique" de novo.
-            RecommendedActionText.Text = diag is not null && diag.RecommendedAction is not (RecommendedActionKind.NoAction or RecommendedActionKind.Unknown)
-                ? RecommendedActionLabel(diag, db)
-                : readOnlyOnly
-                    ? "Diagnostique: se o modo somente leitura não for proposital, os 'Ajustes recomendados' liberam a gravação, sem perda de dados."
-                    : "Diagnostique: a ferramenta mostra quem está segurando o acesso e libera sem perda de dados.";
         }
         else if (problemFound)
-        {
             StateFriendlyText.Text = "Disponível (no ar), mas o diagnóstico encontrou um problema.";
-            RecommendedActionText.Text = RecommendedActionLabel(diag!, db);
-        }
         else if (diag is { RecommendedAction: RecommendedActionKind.NoAction } && db.IsHealthy)
-        {
             StateFriendlyText.Text = "Disponível e íntegro na última verificação.";
-            RecommendedActionText.Text = "Nenhuma correção necessária.";
-        }
         else
-        {
             StateFriendlyText.Text = db.StateFriendly;
-            RecommendedActionText.Text = db.RecommendedAction;
-        }
+        // O que fazer fica só no "Próximo passo" (UpdateFlowState): repetir a ação aqui poluía o cabeçalho.
 
         var (back, fore) = stuck || problemFound ? ("WarnBackBrush", "WarnForeBrush")
             : db.IsHealthy ? ("OkBackBrush", "OkForeBrush") : ("ProblemBackBrush", "ProblemForeBrush");
@@ -384,7 +408,13 @@ public partial class MainWindow : Window
 
         SetBusy(true);
         DiagnosisResultPanel.Visibility = Visibility.Collapsed;
+        // O diagnóstico novo substitui o resultado da operação anterior (que ficaria velho na tela).
+        ResultPanel.Visibility = Visibility.Collapsed;
         _repairSucceeded = false;
+        // Lançado da aba Conferir: se o banco estiver íntegro, a conferência termina ali mesmo.
+        var fromConfirm = SelectedTab() == FlowTab.Confirm;
+        // Sem conclusão (erro/cancelamento), o motivo aparece na aba 1; com conclusão, o caminho é decidido abaixo.
+        RequestTab(FlowTab.Diagnose);
         StatusText.Text = $"Diagnosticando \"{db.Name}\"...";
 
         try
@@ -412,6 +442,7 @@ public partial class MainWindow : Window
             }
 
             _lastDiagnosis = diag;
+            _lastCheckPhysicalOnly = physicalOnly;
             _diagnosisFailed = false;
             _needsDataLossDecision = false;
             db.StateDesc = diag.StateDesc; // o estado lido agora (a lista pode estar desatualizada)
@@ -429,6 +460,13 @@ public partial class MainWindow : Window
 
             // Limita as opções exibidas ÀS aplicáveis para a situação diagnosticada.
             await ApplyDiagnosisGatingAsync(db, diag);
+
+            // Avança para Resolver — exceto com aviso de topologia (precisa ser lido antes, na aba 1) e na
+            // conferência que confirmou o banco íntegro (fica em Conferir; se sobrar ajuste, UpdateFlowState
+            // cai para Resolver porque Conferir deixa de estar liberada).
+            RequestTab(TopologyWarnPanel.Visibility == Visibility.Visible ? FlowTab.Diagnose
+                : fromConfirm && diag.RecommendedAction == RecommendedActionKind.NoAction ? FlowTab.Confirm
+                : FlowTab.Resolve);
 
             StatusText.Text = diag.Summary;
         }
@@ -1772,6 +1810,7 @@ public partial class MainWindow : Window
                 SalvageHintText.Text = $"Cópia [{result.BackupFile}] (estado de antes da exclusão) mantida. Selecione uma tabela e traga de volta ao banco \"{db.Name}\" as linhas que faltam.";
                 await PopulateSalvageTablesAsync(result.BackupFile);
                 SalvagePanel.Visibility = Visibility.Visible;
+                ShowSalvageAssistant();
             }
         }
         catch (OperationCanceledException) { StatusText.Text = "Operação cancelada."; }
@@ -1990,6 +2029,7 @@ public partial class MainWindow : Window
                                        "Tabelas sem chave primária e as linhas parciais (tabela__parcial) precisam de revisão do DBA.";
                 await PopulateSalvageTablesAsync(result.SalvageDatabase);
                 SalvagePanel.Visibility = Visibility.Visible;
+                ShowSalvageAssistant();
             }
         }
         catch (OperationCanceledException)
@@ -2038,18 +2078,22 @@ public partial class MainWindow : Window
     /// <summary>Mostra o "Resultado da última operação" com a cor do desfecho (sem mexer no fluxo).</summary>
     private void ShowResult(string text, ResultTone tone)
     {
-        var (back, line, fore) = tone switch
+        var (back, line, fore, icon) = tone switch
         {
-            ResultTone.Ok => ("OkBackBrush", "OkForeBrush", "OkForeBrush"),
-            ResultTone.Warn => ("WarnBackBrush", "WarnLineBrush", "WarnForeBrush"),
-            _ => ("ProblemBackBrush", "ProblemForeBrush", "ProblemForeBrush")
+            ResultTone.Ok => ("OkBackBrush", "OkForeBrush", "OkForeBrush", "✔"),
+            ResultTone.Warn => ("WarnBackBrush", "WarnLineBrush", "WarnForeBrush", "⚠"),
+            _ => ("ProblemBackBrush", "ProblemForeBrush", "ProblemForeBrush", "✖")
         };
         ResultPanel.Visibility = Visibility.Visible;
         ResultText.Text = text;
+        ResultIcon.Text = icon;
         ResultPanel.SetResourceReference(Border.BackgroundProperty, back);
         ResultPanel.SetResourceReference(Border.BorderBrushProperty, line);
         ResultText.SetResourceReference(TextBlock.ForegroundProperty, fore);
+        ResultIcon.SetResourceReference(TextBlock.ForegroundProperty, fore);
     }
+
+    private void ResultCloseButton_Click(object sender, RoutedEventArgs e) => ResultPanel.Visibility = Visibility.Collapsed;
 
     private static ResultTone ToneOf(RepairResult r) => r.Status switch
     {
@@ -2076,6 +2120,7 @@ public partial class MainWindow : Window
                 // O diagnóstico permanece disponível: recomenda-se re-verificar após o reparo (Passo 3).
                 _repairSucceeded = true;
                 _needsDataLossDecision = false;
+                RequestTab(FlowTab.Confirm);
                 DiagnosePanel.Visibility = Visibility.Visible;
                 DiagnosisResultPanel.Visibility = Visibility.Collapsed;
                 HideOptionPanels();
@@ -2183,6 +2228,21 @@ public partial class MainWindow : Window
 
     private void ClearLogButton_Click(object sender, RoutedEventArgs e) => _logEntries.Clear();
 
+    /// <summary>Abre o Explorer na pasta do log, com o arquivo do dia selecionado (se já existir).</summary>
+    private void LogPathLink_Click(object sender, RoutedEventArgs e)
+    {
+        var path = _logService.LogFilePath;
+        try
+        {
+            var args = File.Exists(path) ? $"/select,\"{path}\"" : $"\"{Path.GetDirectoryName(path)}\"";
+            System.Diagnostics.Process.Start("explorer.exe", args);
+        }
+        catch (Exception ex)
+        {
+            ShowError("Não foi possível abrir a pasta do log.", ex);
+        }
+    }
+
     private void SetBusy(bool busy)
     {
         _busy = busy;
@@ -2206,6 +2266,7 @@ public partial class MainWindow : Window
         var db = DatabasesGrid.SelectedItem as DatabaseInfo;
         // Qualquer banco selecionado pode ser diagnosticado (mesmo ONLINE aparentemente saudável).
         DiagnoseButton.IsEnabled = !busy && db is not null;
+        ConfirmDiagnoseButton.IsEnabled = !busy && db is not null;
         SafeRepairButton.IsEnabled = !busy && db is not null;
         DataLossRepairButton.IsEnabled = !busy && DataLossConfirmCheck.IsChecked == true;
         LogRebuildButton.IsEnabled = !busy && LogRebuildConfirmCheck.IsChecked == true;
@@ -2260,7 +2321,22 @@ public partial class MainWindow : Window
     /// </summary>
     private void UpdateFlowState()
     {
-        if (DatabasesGrid.SelectedItem is not DatabaseInfo db) return;
+        if (DatabasesGrid.SelectedItem is not DatabaseInfo db)
+        {
+            // Sem banco: nada a diagnosticar nem ferramenta em que aplicar — tudo bloqueado.
+            foreach (var tab in _flowTabs)
+            {
+                tab.IsEnabled = false;
+                tab.ToolTip = _flowTabTips[tab];
+            }
+            TabDiagnose.IsChecked = true;
+            RenderStep(Step1Circle, Step1Num, Step1Label, 1, StepState.Pending);
+            RenderStep(Step2Circle, Step2Num, Step2Label, 2, StepState.Pending);
+            RenderStep(Step3Circle, Step3Num, Step3Label, 3, StepState.Pending);
+            RenderConnector(StepLine1, done: false);
+            RenderConnector(StepLine2, done: false);
+            return;
+        }
 
         var anyOption = new UIElement[]
         {
@@ -2280,17 +2356,14 @@ public partial class MainWindow : Window
         DiagnoseButton.Content = diagnosed || _repairSucceeded || _diagnosisFailed
             ? "🔍  Diagnosticar novamente (sem alterar o banco)"
             : "🔍  Diagnosticar (sem alterar o banco)";
-        // "Aparentemente saudável" só faz sentido ANTES de qualquer verificação: depois, quem fala é o diagnóstico.
-        HealthyPanel.Visibility = db.IsHealthy && !db.HasAccessRestriction && !diagnosed && !_repairSucceeded && !_diagnosisFailed
-            ? Visibility.Visible : Visibility.Collapsed;
 
         StepState s1, s2, s3;
         string hint;
         if (_repairSucceeded)
         {
             (s1, s2, s3) = (StepState.Done, StepState.Done, StepState.Active);
-            hint = "Operação concluída. Rode o diagnóstico de novo (Passo 1) para confirmar que o banco ficou íntegro.";
-            Step2LockedText.Text = "✔  Operação concluída. Diagnostique novamente para confirmar o resultado.";
+            hint = "Operação concluída. Na aba \"Conferir\", rode o diagnóstico de novo para confirmar que o banco ficou íntegro.";
+            Step2LockedText.Text = "✔  Operação concluída. Confira o resultado na aba \"Conferir\".";
         }
         else if (_diagnosisFailed && !diagnosed)
         {
@@ -2301,14 +2374,19 @@ public partial class MainWindow : Window
         else if (!diagnosed)
         {
             (s1, s2, s3) = (StepState.Active, StepState.Pending, StepState.Pending);
-            hint = "Clique em \"Diagnosticar\" no Passo 1. É somente leitura — nada é alterado no banco.";
+            // Antes do diagnóstico, o que ele vai resolver depende do estado (o cabeçalho já diz qual é).
+            hint = db.IsHealthy && db.HasAccessRestriction
+                ? "Clique em \"Diagnosticar\" na aba 1: ele mostra a causa do travamento e a correção sem perda de dados. É somente leitura."
+                : db.IsProblematic
+                    ? $"Clique em \"Diagnosticar\" na aba 1 (somente leitura). Caminho provável: {char.ToLower(db.RecommendedAction[0])}{db.RecommendedAction[1..]}"
+                    : "Clique em \"Diagnosticar\" na aba 1. É somente leitura — nada é alterado no banco.";
             Step2LockedText.Text = "🔒  As opções de correção aparecem aqui depois do diagnóstico — só as que se aplicam ao problema encontrado.";
         }
         else if (anyOption)
         {
             (s1, s2, s3) = (StepState.Done, StepState.Active, StepState.Pending);
             hint = onlyAdjustments && diag!.RecommendedAction == RecommendedActionKind.NoAction
-                ? "Nenhum problema grave. Há ajustes recomendados no Passo 2 — opcionais e sem perda de dados."
+                ? "Nenhum problema grave. Há ajustes recomendados na aba \"Resolver\" — opcionais e sem perda de dados."
                 : NextStepHint(diag!, db);
         }
         else if (diag!.RecommendedAction == RecommendedActionKind.NoAction)
@@ -2324,7 +2402,7 @@ public partial class MainWindow : Window
             (s1, s2, s3) = (StepState.Done, StepState.Active, StepState.Pending);
             hint = db.IsSystemDatabase
                 ? "Banco de sistema com problema: a correção é manual. Clique em \"Ver procedimento manual\" e acione o DBA/suporte."
-                : "O diagnóstico encontrou um problema sem correção automática nesta ferramenta. Leia o resultado no Passo 1 e acione o DBA/suporte.";
+                : "O diagnóstico encontrou um problema sem correção automática nesta ferramenta. Leia o resultado na aba \"Diagnosticar\" e acione o DBA/suporte.";
             Step2LockedText.Text = "⚠  Sem correção automática para este caso — veja o resultado do diagnóstico e acione o DBA/suporte.";
         }
 
@@ -2335,7 +2413,91 @@ public partial class MainWindow : Window
         RenderStep(Step1Circle, Step1Num, Step1Label, 1, s1);
         RenderStep(Step2Circle, Step2Num, Step2Label, 2, s2);
         RenderStep(Step3Circle, Step3Num, Step3Label, 3, s3);
+        RenderConnector(StepLine1, s1 == StepState.Done);
+        RenderConnector(StepLine2, s2 == StepState.Done);
+        UpdateConfirmPanel();
+
+        // Abas: 1 sempre; 2 depois do diagnóstico; 3 depois de uma correção (ou quando não há nada a
+        // corrigir); Ferramentas sempre. Durante uma operação nenhuma troca de aba (nem de banco: SetBusy).
+        var unlockResolve = s1 == StepState.Done;
+        var unlockConfirm = s3 != StepState.Pending;
+        TabDiagnose.IsEnabled = !_busy;
+        TabResolve.IsEnabled = !_busy && unlockResolve;
+        TabConfirm.IsEnabled = !_busy && unlockConfirm;
+        TabTools.IsEnabled = !_busy;
+        // Bloqueadas pela operação em andamento, o tooltip diz isso — não a regra de liberação.
+        foreach (var tab in _flowTabs)
+            tab.ToolTip = _busy
+                ? "Aguarde a operação em andamento terminar (ou use \"Cancelar operação\" na barra inferior)."
+                : _flowTabTips[tab];
+
+        if (_busy) return; // o avanço automático espera a operação terminar
+
+        var target = SelectedTab();
+        if (_pendingTab is { } pending)
+        {
+            _pendingTab = null;
+            // Operação lançada das Ferramentas: o usuário continua lá (os passos se atualizam mesmo assim),
+            // a não ser que o pedido valha também para quem está lá.
+            if (target != FlowTab.Tools || _pendingTabEvenFromTools)
+                target = pending;
+        }
+        // Aba que deixou de estar liberada (ex.: a conferência encontrou problema): volta para a última liberada.
+        if (target == FlowTab.Confirm && !unlockConfirm) target = FlowTab.Resolve;
+        if (target == FlowTab.Resolve && !unlockResolve) target = FlowTab.Diagnose;
+        SelectTab(target);
     }
+
+    /// <summary>Aba Conferir: o que falta (conferir a correção) ou a confirmação de que está tudo certo.</summary>
+    private void UpdateConfirmPanel()
+    {
+        var (text, back, line, fore) = _repairSucceeded
+            ? ("A correção terminou. Falta conferir: rode o diagnóstico de novo para confirmar que o banco ficou íntegro.",
+               "SelectionBrush", "PrimaryBrush", "PrimaryDarkBrush")
+            : _lastCheckPhysicalOnly
+                // PHYSICAL_ONLY pula as checagens lógicas do CHECKDB e o DATA_PURITY (a checagem de chaves
+                // estrangeiras roda à parte e continua valendo): não dá para chamar de "conferido".
+                ? ("✔  Estrutura física íntegra — mas foi a verificação rápida (PHYSICAL_ONLY), que não faz as checagens lógicas do CHECKDB nem confere os valores das colunas. Diagnostique de novo sem ela para a conferência completa.",
+                   "WarnBackBrush", "WarnLineBrush", "WarnForeBrush")
+                : ("✔  Conferido: o diagnóstico não encontrou nada a corrigir neste banco. Os detalhes estão na aba \"Diagnosticar\".",
+                   "OkBackBrush", "OkForeBrush", "OkForeBrush");
+        ConfirmStatusText.Text = text;
+        ConfirmStatusPanel.SetResourceReference(Border.BackgroundProperty, back);
+        ConfirmStatusPanel.SetResourceReference(Border.BorderBrushProperty, line);
+        ConfirmStatusText.SetResourceReference(TextBlock.ForegroundProperty, fore);
+        ConfirmSalvageText.Visibility = SalvagePanel.Visibility;
+    }
+
+    /// <summary>
+    /// Ficou uma cópia com linhas a devolver: o próximo passo é o assistente de salvamento (aba Resolver),
+    /// não a conferência — mesmo que a operação tenha sido lançada das Ferramentas.
+    /// </summary>
+    private void ShowSalvageAssistant() => RequestTab(FlowTab.Resolve, evenFromTools: true);
+
+    /// <summary>
+    /// Pede que o fluxo vá para <paramref name="tab"/> quando a operação atual terminar. Por padrão quem está
+    /// nas Ferramentas continua lá; <paramref name="evenFromTools"/> faz o pedido valer também para essa aba.
+    /// </summary>
+    private void RequestTab(FlowTab tab, bool evenFromTools = false)
+    {
+        _pendingTab = tab;
+        _pendingTabEvenFromTools = evenFromTools;
+    }
+
+    private FlowTab SelectedTab()
+    {
+        var i = Array.FindIndex(_flowTabs, t => t.IsChecked == true);
+        return i < 0 ? FlowTab.Diagnose : (FlowTab)i;
+    }
+
+    private void SelectTab(FlowTab tab) => _flowTabs[(int)tab].IsChecked = true;
+
+    /// <summary>Trocar de aba mostra o conteúdo novo desde o início.</summary>
+    private void FlowTab_Checked(object sender, RoutedEventArgs e) => TabContentScroll?.ScrollToTop();
+
+    /// <summary>Ligação entre os passos: verde quando o passo anterior está concluído.</summary>
+    private static void RenderConnector(System.Windows.Shapes.Rectangle line, bool done)
+        => line.SetResourceReference(System.Windows.Shapes.Shape.FillProperty, done ? "OkForeBrush" : "LineBrush");
 
     /// <summary>
     /// "Próximo passo" com o NOME da opção recomendada: com vários cartões na tela (inclusive ajustes
@@ -2396,22 +2558,23 @@ public partial class MainWindow : Window
         label.FontWeight = state == StepState.Active ? FontWeights.Bold : FontWeights.Normal;
     }
 
-    /// <summary>Passos 1 e 2 lado a lado em telas largas; empilhados quando o painel fica estreito.</summary>
-    private void FlowGrid_SizeChanged(object sender, SizeChangedEventArgs e)
+    /// <summary>
+    /// Abas numa linha só quando cabem; senão "Ferramentas adicionais" desce para uma segunda linha e as
+    /// três do fluxo continuam ligadas na primeira. A largura necessária vem da medida real das abas
+    /// (colunas Auto medem sem limite, então DesiredSize é a largura natural), não de um número fixo.
+    /// </summary>
+    private void TabStrip_SizeChanged(object sender, SizeChangedEventArgs e)
     {
-        // Histerese: a barra de rolagem que aparece/some ao reorganizar não pode fazer o layout oscilar.
-        var w = e.NewSize.Width;
-        var narrow = w < 800 || (w <= 840 && Grid.GetRow(ResolveCard) == 1);
-        Grid.SetColumnSpan(DiagnoseCard, narrow ? 3 : 1);
-        Grid.SetRow(ResolveCard, narrow ? 1 : 0);
-        Grid.SetColumn(ResolveCard, narrow ? 0 : 2);
-        Grid.SetColumnSpan(ResolveCard, narrow ? 3 : 1);
-        ResolveCard.Margin = new Thickness(0, narrow ? 12 : 0, 0, 0);
-        // No cabeçalho, o indicador de passos (~330 px) espremia o estado do banco numa coluna estreita.
-        Grid.SetRow(StepIndicator, narrow ? 1 : 0);
-        Grid.SetColumn(StepIndicator, narrow ? 0 : 1);
-        StepIndicator.HorizontalAlignment = narrow ? HorizontalAlignment.Left : HorizontalAlignment.Stretch;
-        StepIndicator.Margin = narrow ? new Thickness(0, 12, 0, 0) : new Thickness(20, 2, 0, 0);
+        static double Outer(FrameworkElement el, double width) => width + el.Margin.Left + el.Margin.Right;
+        var needed = _flowTabs.Sum(t => t.DesiredSize.Width)
+                     + Outer(StepLine1, StepLine1.MinWidth) + Outer(StepLine2, StepLine2.MinWidth)
+                     + Outer(TabsSeparator, TabsSeparator.Width);
+        var narrow = e.NewSize.Width < needed;
+        TabsSeparator.Visibility = narrow ? Visibility.Collapsed : Visibility.Visible;
+        Grid.SetRow(TabTools, narrow ? 1 : 0);
+        Grid.SetColumn(TabTools, narrow ? 0 : 6);
+        Grid.SetColumnSpan(TabTools, narrow ? 7 : 1);
+        TabTools.HorizontalAlignment = narrow ? HorizontalAlignment.Left : HorizontalAlignment.Stretch;
     }
 
     /// <summary>Ferramentas: lista e detalhe lado a lado; em painel estreito o detalhe desce para baixo da lista.</summary>
