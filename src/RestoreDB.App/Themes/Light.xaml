@@ -9,6 +9,10 @@
     <SolidColorBrush x:Key="LogHeaderBackBrush" Color="#EEF3F7" />
     <SolidColorBrush x:Key="SelectionBrush" Color="#D7E8F4" />
 
+    <!-- Cursor da barra de rolagem: ≥ 3:1 sobre CardBrush e WindowBackBrush (pressionado = MutedTextBrush). -->
+    <SolidColorBrush x:Key="ScrollThumbBrush" Color="#84909C" />
+    <SolidColorBrush x:Key="ScrollThumbHoverBrush" Color="#6C7A87" />
+
     <!-- Texto -->
     <SolidColorBrush x:Key="TextBrush" Color="#1B2A36" />
     <SolidColorBrush x:Key="MutedTextBrush" Color="#5A6B7B" />

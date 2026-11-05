@@ -286,7 +286,7 @@
                     <!-- Sem barra de rolagem, o cartão alinha com a borda direita do cartão das abas;
                          com barra, um respiro de 6 px para o cartão não encostar nela. -->
                     <ScrollViewer.Style>
-                        <Style TargetType="ScrollViewer">
+                        <Style TargetType="ScrollViewer" BasedOn="{StaticResource {x:Type ScrollViewer}}">
                             <Setter Property="Padding" Value="0" />
                             <Style.Triggers>
                                 <Trigger Property="ComputedVerticalScrollBarVisibility" Value="Visible">

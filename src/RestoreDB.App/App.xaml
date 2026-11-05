@@ -421,6 +421,116 @@
                 </Style.Triggers>
             </Style>
 
+            <!-- Barras de rolagem: o modelo padrão do Windows ignora o tema (trilho cinza claro no escuro).
+                 Trilho transparente, sem setas; o cursor engrossa ao passar o mouse. Clicar no trilho
+                 continua rolando uma página. -->
+            <Style x:Key="ScrollPageButton" TargetType="RepeatButton">
+                <Setter Property="Focusable" Value="False" />
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="RepeatButton">
+                            <Border Background="Transparent" />
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+            <Style x:Key="ScrollThumb" TargetType="Thumb">
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="Thumb">
+                            <Border x:Name="bd" Background="{DynamicResource ScrollThumbBrush}" CornerRadius="4" />
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter TargetName="bd" Property="Background" Value="{DynamicResource ScrollThumbHoverBrush}" />
+                                </Trigger>
+                                <Trigger Property="IsDragging" Value="True">
+                                    <Setter TargetName="bd" Property="Background" Value="{DynamicResource MutedTextBrush}" />
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+            <!-- Um só modelo para as duas orientações; na horizontal, inverte o sentido do trilho e
+                 troca os comandos de página para esquerda/direita. -->
+            <Style TargetType="ScrollBar">
+                <Setter Property="Cursor" Value="Arrow" />
+                <!-- Toque/caneta: segurar no trilho não vira "clique direito" nem gesto de navegação. -->
+                <Setter Property="Stylus.IsPressAndHoldEnabled" Value="False" />
+                <Setter Property="Stylus.IsFlicksEnabled" Value="False" />
+                <Setter Property="Width" Value="12" />
+                <Setter Property="MinWidth" Value="12" />
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="ScrollBar">
+                            <!-- Fundo transparente: a barra inteira (inclusive ao redor do cursor) recebe o mouse. -->
+                            <Border Background="Transparent">
+                                <Track x:Name="PART_Track" IsDirectionReversed="True">
+                                    <Track.DecreaseRepeatButton>
+                                        <RepeatButton x:Name="pageBack" Command="ScrollBar.PageUpCommand" Style="{StaticResource ScrollPageButton}" />
+                                    </Track.DecreaseRepeatButton>
+                                    <Track.IncreaseRepeatButton>
+                                        <RepeatButton x:Name="pageFwd" Command="ScrollBar.PageDownCommand" Style="{StaticResource ScrollPageButton}" />
+                                    </Track.IncreaseRepeatButton>
+                                    <Track.Thumb>
+                                        <Thumb x:Name="thumb" Style="{StaticResource ScrollThumb}" Margin="3" />
+                                    </Track.Thumb>
+                                </Track>
+                            </Border>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="Orientation" Value="Horizontal">
+                                    <Setter TargetName="PART_Track" Property="IsDirectionReversed" Value="False" />
+                                    <Setter TargetName="pageBack" Property="Command" Value="{x:Static ScrollBar.PageLeftCommand}" />
+                                    <Setter TargetName="pageFwd" Property="Command" Value="{x:Static ScrollBar.PageRightCommand}" />
+                                </Trigger>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter TargetName="thumb" Property="Margin" Value="2" />
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+                <Style.Triggers>
+                    <Trigger Property="Orientation" Value="Horizontal">
+                        <Setter Property="Width" Value="Auto" />
+                        <Setter Property="MinWidth" Value="0" />
+                        <Setter Property="Height" Value="12" />
+                        <Setter Property="MinHeight" Value="12" />
+                    </Trigger>
+                </Style.Triggers>
+            </Style>
+            <!-- Mesmo arranjo do modelo padrão, sem o quadrado cinza do sistema no canto entre as barras. -->
+            <Style TargetType="ScrollViewer">
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="ScrollViewer">
+                            <Grid Background="{TemplateBinding Background}">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition />
+                                    <RowDefinition Height="Auto" />
+                                </Grid.RowDefinitions>
+                                <ScrollContentPresenter x:Name="PART_ScrollContentPresenter" Margin="{TemplateBinding Padding}"
+                                                        CanContentScroll="{TemplateBinding CanContentScroll}" />
+                                <ScrollBar x:Name="PART_VerticalScrollBar" Grid.Column="1"
+                                           AutomationProperties.AutomationId="VerticalScrollBar"
+                                           Maximum="{TemplateBinding ScrollableHeight}" ViewportSize="{TemplateBinding ViewportHeight}"
+                                           Value="{Binding VerticalOffset, Mode=OneWay, RelativeSource={RelativeSource TemplatedParent}}"
+                                           Visibility="{TemplateBinding ComputedVerticalScrollBarVisibility}" />
+                                <ScrollBar x:Name="PART_HorizontalScrollBar" Grid.Row="1" Orientation="Horizontal"
+                                           AutomationProperties.AutomationId="HorizontalScrollBar"
+                                           Maximum="{TemplateBinding ScrollableWidth}" ViewportSize="{TemplateBinding ViewportWidth}"
+                                           Value="{Binding HorizontalOffset, Mode=OneWay, RelativeSource={RelativeSource TemplatedParent}}"
+                                           Visibility="{TemplateBinding ComputedHorizontalScrollBarVisibility}" />
+                            </Grid>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+
             <!-- Botão base -->
             <Style x:Key="FlatButton" TargetType="Button">
                 <Setter Property="Foreground" Value="White" />
